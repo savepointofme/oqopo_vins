@@ -47,6 +47,17 @@ using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
 
+// =============================================================================
+// [中文] 构造函数
+//  按顺序搭建整个 VIO 系统:
+//    1. 加载与打印配置
+//    2. 创建 State 并将调用者传入的外参/内参/IMU内参写入
+//    3. 根据 params.use_klt / params.use_aruco 创建前端跟踪器
+//    4. 创建 Propagator（传播）、InertialInitializer (初始化),
+//       各类更新器 (MSCKF / SLAM / ZUPT)
+//  注意构造完成后系统处于"等待初始化"状态, State 的核心变量 (q, p, v, b) 未被赋值,
+//  真正的初值在 try_to_initialize() 成功后才写入。
+// =============================================================================
 VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false), thread_init_success(false) {
 
   // Nice startup message
@@ -128,6 +139,8 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   // Let's make a feature extractor
   // NOTE: after we initialize we will increase the total number of feature tracks
   // NOTE: we will split the total number of features over all cameras uniformly
+  // [中文] 初始阶段将总特征数均匀地分配到每个相机上;
+  //        初始化完成后, State 内的 num_pts 会被调大为 params.num_pts (正常跟踪阶段)。
   int init_max_features = std::floor((double)params.init_options.init_max_features / (double)params.state_options.num_cameras);
   if (params.use_klt) {
     trackFEATS = std::shared_ptr<TrackBase>(new TrackKLT(state->_cam_intrinsics_cameras, init_max_features,
@@ -163,6 +176,15 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   }
 }
 
+// =============================================================================
+// [中文] IMU 消息入口
+//  - 未初始化时: oldest_time = 当前时刻减去初始化窗口, 保留窗内所有 IMU
+//  - 已初始化时: oldest_time = 最老克隆的时间（margtimestep）,
+//                    小于它的 IMU 已经被用掉, 可安全丢弃
+//  对下游计算的影响:
+//    - propagator 用其基本保证可拿到下次 propagate_and_clone 所需 IMU
+//    - initializer / ZUPT 在各自的窗口外丢弃旧测量
+// =============================================================================
 void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
 
   // The oldest time we need IMU with is the last clone
@@ -172,6 +194,7 @@ void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
     oldest_time = -1;
   }
   if (!is_initialized_vio) {
+    // [中文] -0.10 留了 100ms 宽容时间, 避免因相机/IMU 不同步把即将使用的 IMU 误删
     oldest_time = message.timestamp - params.init_options.init_window_time + state->_calib_dt_CAMtoIMU->value()(0) - 0.10;
   }
   propagator->feed_imu(message, oldest_time);
@@ -253,6 +276,14 @@ void VioManager::feed_measurement_simulation(double timestamp, const std::vector
   do_feature_propagate_update(message);
 }
 
+// =============================================================================
+// [中文] track_image_and_update
+//  相机帧的总分流器。两条主要分支:
+//    (A) 已初始化 -> 前端跟踪 -> 尝试 ZUPT -> 否则常规更新 (do_feature_propagate_update)
+//    (B) 未初始化 -> 前端跟踪 -> 调用 try_to_initialize
+//  注意两条分支都会先走前端跟踪, 这样初始化期间 FeatureDatabase 也能累积有视觉观测,
+//  供 DynamicInitializer 使用。
+// =============================================================================
 void VioManager::track_image_and_update(const ov_core::CameraData &message_const) {
 
   // Start timing
@@ -266,6 +297,7 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
   }
 
   // Downsample if we are downsampling
+  // [中文] 可选对每个相机图像+掩码做 1/2 下采样, 播冟在高分辨率设备上加速
   ov_core::CameraData message = message_const;
   for (size_t i = 0; i < message.sensor_ids.size() && params.downsample_cameras; i++) {
     cv::Mat img = message.images.at(i);
@@ -278,6 +310,7 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
   }
 
   // Perform our feature tracking!
+  // [中文] 视觉前端: KLT / Descriptor / SIM. 内部会更新 FeatureDatabase
   trackFEATS->feed_new_camera(message);
 
   // If the aruco tracker is available, the also pass to it
@@ -317,14 +350,30 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
   }
 
   // Call on our propagate and update function
+  // [中文] 进入完整的 EKF 流程 (传播 + 克隆 + MSCKF/SLAM/ZUPT 更新 + 边缘化)
   do_feature_propagate_update(message);
 }
 
+// =============================================================================
+// [中文] do_feature_propagate_update
+//  单帧完整的滤波主循环 (见 docs-cn/diagrams/03_vio_manager_flow.png):
+//    Step 1  propagate_and_clone : IMU 预测 + 增广一份新克隆
+//    Step 2  拉特征并分类:
+//              feats_lost       = 在当前时刻没有观测 -> MSCKF
+//              feats_marg       = 跳要随最老克隆一起消失 -> MSCKF/SLAM/DELAYED
+//              feats_maxtracks  = 轨迹太长的非 SLAM 特征   -> MSCKF
+//              feats_slam_UPDATE  = 已在状态里的 SLAM    -> SLAM update
+//              feats_slam_DELAYED = 新晔 SLAM 候选         -> SLAM delayed_init
+//    Step 3  调用三个更新器做 EKF
+//    Step 4  retriangulate + marginalize_old_clone 维持滑窗大小
+// =============================================================================
 void VioManager::do_feature_propagate_update(const ov_core::CameraData &message) {
 
   //===================================================================================
   // State propagation, and clone augmentation
   //===================================================================================
+  // [中文] Step 1。传播与克隆紧耦合: propagate_and_clone 把旧状态传到 message.timestamp,
+  //        同时在 _clones_IMU 里插入一个对当前位姿的克隆。
 
   // Return if the camera measurement is out of order
   if (state->_timestamp > message.timestamp) {
@@ -345,6 +394,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // If we have not reached max clones, we should just return...
   // This isn't super ideal, but it keeps the logic after this easier...
   // We can start processing things when we have at least 5 clones since we can start triangulating things...
+  // [中文] 三角化需要至少 2 个视角, 数值稳定则要求 ≥ 5 个克隆才开始走更新
   if ((int)state->_clones_IMU.size() < std::min(state->_options.max_clone_size, 5)) {
     PRINT_DEBUG("waiting for enough clone states (%d of %d)....\n", (int)state->_clones_IMU.size(),
                 std::min(state->_options.max_clone_size, 5));
@@ -362,6 +412,11 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   //===================================================================================
   // MSCKF features and KLT tracks that are SLAM features
   //===================================================================================
+  // [中文] Step 2。从 FeatureDatabase 挑选本帧需要参与更新的特征, 并按"去处"分类:
+  //   - feats_lost: 本帧没有观测的特征 (跟丢), 只能用作 MSCKF
+  //   - feats_marg: 含有最老克隆观测的特征, 若不立即用掉, 协方差块会被 marg_old_clone 删
+  //   - feats_maxtracks: 轨迹已经达到 max_clone_size 的非 SLAM 特征, 晋升 SLAM 的候选
+  //   - feats_slam: 已经是 SLAM 特征, 由 Aruco 或后续 delayed_init 贡献
 
   // Now, lets get all features that should be used for an update that are lost in the newest frame
   // We explicitly request features that have not been deleted (used) in another update step
@@ -502,6 +557,10 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   //===================================================================================
   // Now that we have a list of features, lets do the EKF update for MSCKF and SLAM!
   //===================================================================================
+  // [中文] Step 3。按顺序调用三类更新器:
+  //   updaterMSCKF->update        :  短轨迹特征, 左零空间投影 + 卡方 + QR 压缩 + EKF
+  //   updaterSLAM->update         :  已在状态里的 SLAM 特征 (可分批做 sequential update)
+  //   updaterSLAM->delayed_init   :  将 feats_slam_DELAYED 加入状态并初始化其协方差
 
   // Sort based on track length
   // TODO: we should have better selection logic here (i.e. even feature distribution in the FOV etc..)
@@ -572,6 +631,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   //===================================================================================
   // Cleanup, marginalize out what we don't need any more...
   //===================================================================================
+  // [中文] Step 4。数据库清理 + SLAM 锚点切换 + 最老克隆边缘化, 将滑窗重新限制回 max_clone_size。
 
   // Remove features that where used for the update from our extractors at the last timestep
   // This allows for measurements to be used in the future if they failed to be used this time

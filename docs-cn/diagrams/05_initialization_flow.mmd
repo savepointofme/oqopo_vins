@@ -1,0 +1,47 @@
+%%{init: {'theme':'default'}}%%
+flowchart TD
+    A([InertialInitializer::initialize]) --> B[从 FeatureDatabase 找 newest_cam_time<br/>oldest_time = newest - init_window_time]
+    B --> C[cleanup_measurements<br/>裁剪过旧 IMU / 特征]
+    C --> D{init_max_disparity &gt; 0?}
+    D -- 否 --> F[默认认为不动]
+    D -- 是 --> E[FeatureHelper::compute_disparity<br/>分别计算前半段与后半段平均视差]
+    E --> E1{视差 &gt; 阈值?}
+    E1 -- 前半段大 --> F1[disparity_detected_moving_1to0 = true]
+    E1 -- 后半段大 --> F2[disparity_detected_moving_2to1 = true]
+    E1 -- 都小 --> F[判为静止]
+
+    F --> G[StaticInitializer-&gt;initialize<br/>利用重力对齐估计 R_GtoI]
+    F1 --> H[DynamicInitializer-&gt;initialize]
+    F2 --> H
+    G --> G1{成功?}
+    H --> H1{成功?}
+
+    G1 -- 否 --> X([返回 false 等更多数据])
+    H1 -- 否 --> X
+    G1 -- 是 --> Y
+    H1 -- 是 --> Y
+
+    Y["输出:<br/>- timestamp<br/>- covariance<br/>- order Type 顺序<br/>- IMU 状态 q/p/v/bg/ba"]
+    Y --> Z([VioManager 用初值<br/>构建 State, 开始 EKF])
+
+    subgraph DYN [DynamicInitializer 细节]
+        D1[取一窗口内多帧特征 + IMU]
+        D1 --> D2[线性求解 R_CtoI, 重力方向]
+        D2 --> D3[Ceres 非线性优化<br/>refine 尺度/速度/Ba/Bg + 位姿 + 特征]
+        D3 --> D4[导出协方差]
+    end
+
+    subgraph STA [StaticInitializer 细节]
+        S1[窗口内 IMU 均值 = g_I_mean]
+        S1 --> S2[用 g_I_mean 对齐到 z 轴<br/>计算 R_GtoI]
+        S2 --> S3[v, bg, ba 设为 0 或均值]
+    end
+
+    classDef start fill:#C5E1A5,stroke:#33691E
+    classDef step fill:#BBDEFB,stroke:#0D47A1
+    classDef decision fill:#FFF59D,stroke:#F57F17
+    classDef endn fill:#F8BBD0,stroke:#880E4F
+    class A start
+    class B,C,E,F,F1,F2,G,H,Y step
+    class D,E1,G1,H1 decision
+    class X,Z endn

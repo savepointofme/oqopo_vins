@@ -55,6 +55,19 @@ UpdaterMSCKF::UpdaterMSCKF(UpdaterOptions &options, ov_core::FeatureInitializerO
   }
 }
 
+// =============================================================================
+// [中文] UpdaterMSCKF::update
+//  按上面 docs-cn/updater.md 的 7 步流程逐步实现:
+//    Step 0: 过滤无效特征
+//    Step 1: 构造所有 clone 相机位姿 (R_GtoCi, p_CioinG)
+//    Step 2: 三角化 + 高斯牛顿精化
+//    Step 3: 对每个特征调用 UpdaterHelper::get_feature_jacobian_full,
+//            然后 nullspace_project_inplace 消掉 H_f
+//    Step 4: 卡方检验 (chi2) 剔除异常
+//    Step 5: 对所有通过的特征拼大 H, 用 measurement_compress_inplace 再做 QR 压缩
+//    Step 6: StateHelper::EKFUpdate
+//    Step 7: 把 feature_vec 里用过的特征全部标 to_delete
+// =============================================================================
 void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_ptr<Feature>> &feature_vec) {
 
   // Return if no features
@@ -66,6 +79,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
   rT0 = boost::posix_time::microsec_clock::local_time();
 
   // 0. Get all timestamps our clones are at (and thus valid measurement times)
+  // [中文] 滑窗里每个 clone 的时间戳, 用作特征观测的"合法时刻"候选
   std::vector<double> clonetimes;
   for (const auto &clone_imu : state->_clones_IMU) {
     clonetimes.emplace_back(clone_imu.first);
@@ -95,6 +109,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
   rT1 = boost::posix_time::microsec_clock::local_time();
 
   // 2. Create vector of cloned *CAMERA* poses at each of our clone timesteps
+  // [中文] 每个相机都在滑窗里有 N 个克隆位姿 (R_GtoCi, p_CioinG), 传给三角化与 Jacobian
   std::unordered_map<size_t, std::unordered_map<double, FeatureInitializer::ClonePose>> clones_cam;
   for (const auto &clone_calib : state->_calib_IMUtoCAM) {
 
@@ -115,6 +130,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
   }
 
   // 3. Try to triangulate all MSCKF or new SLAM features that have measurements
+  // [中文] 依次三角化特征, 再可选地用高斯牛顿在多视角上精化 p_FinG
   auto it1 = feature_vec.begin();
   while (it1 != feature_vec.end()) {
 
@@ -166,6 +182,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
   size_t ct_meas = 0;
 
   // 4. Compute linear system for each feature, nullspace project, and reject
+  // [中文] 单特征线性系统 + 左零空间投影 + 卡方检验
   auto it2 = feature_vec.begin();
   while (it2 != feature_vec.end()) {
 
@@ -203,6 +220,8 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     UpdaterHelper::get_feature_jacobian_full(state, feat, H_f, H_x, res, Hx_order);
 
     // Nullspace project
+    // [中文] MSCKF 核心: 找到 H_f 的左零空间 N, 对 H_x 和 r 左乘 N^T, 这样 H_f 消失
+    //        后的线性系统只关系状态, 不用为特征状态开协方差列
     UpdaterHelper::nullspace_project_inplace(H_f, H_x, res);
 
     /// Chi2 distance check
@@ -272,6 +291,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
   Hx_big.conservativeResize(ct_meas, ct_jacob);
 
   // 5. Perform measurement compression
+  // [中文] 对拼好的大 Hx_big 做 QR 分解, 把观测压缩到 ≤ 状态维度, 避免 EKF 中的 N^3 开销
   UpdaterHelper::measurement_compress_inplace(Hx_big, res_big);
   if (Hx_big.rows() < 1) {
     return;
@@ -282,6 +302,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
   Eigen::MatrixXd R_big = _options.sigma_pix_sq * Eigen::MatrixXd::Identity(res_big.rows(), res_big.rows());
 
   // 6. With all good features update the state
+  // [中文] 标准 EKF 更新: K = PH^T (HPH^T + R)^-1, x <- x + K r, P <- (I-KH) P (I-KH)^T + K R K^T
   StateHelper::EKFUpdate(state, Hx_order_big, Hx_big, res_big, R_big);
   rT5 = boost::posix_time::microsec_clock::local_time();
 

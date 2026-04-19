@@ -1,0 +1,38 @@
+%%{init: {'theme':'default'}}%%
+flowchart TD
+    A([新相机帧到达<br/>feed_measurement_camera]) --> B[可选下采样<br/>cv::pyrDown]
+    B --> C[trackFEATS-&gt;feed_new_camera<br/>KLT/描述子跟踪]
+    C --> D{已初始化?}
+    D -- 否 --> E[try_to_initialize]
+    E --> E1{初始化成功?}
+    E1 -- 否 --> Z1([等待下一帧])
+    E1 -- 是 --> F
+
+    D -- 是 --> F{启用 ZUPT<br/>且静止?}
+    F -- 是 --> F1[UpdaterZeroVelocity-&gt;try_update]
+    F1 --> Z1
+
+    F -- 否 --> G[do_feature_propagate_update]
+
+    G --> G1[Propagator<br/>propagate_and_clone<br/>IMU 预测 + 克隆当前位姿]
+    G1 --> G2{克隆数 &ge; 5?}
+    G2 -- 否 --> Z1
+    G2 -- 是 --> H[从 FeatureDatabase 拉取<br/>feats_lost / feats_marg / feats_slam]
+
+    H --> I[分流:<br/>长度达上限 -&gt; feats_maxtracks<br/>已有 SLAM -&gt; feats_slam_UPDATE<br/>新 SLAM -&gt; feats_slam_DELAYED]
+    I --> J[StateHelper::marginalize_slam<br/>边缘化过期 SLAM]
+    J --> K[UpdaterMSCKF-&gt;update<br/>feats_lost + marg + maxtracks]
+    K --> L[UpdaterSLAM-&gt;update<br/>分批更新已存在 SLAM]
+    L --> M[UpdaterSLAM-&gt;delayed_init<br/>新 SLAM 延迟初始化]
+    M --> N[retriangulate_active_tracks<br/>重新三角化活跃特征]
+    N --> O[StateHelper::marginalize_old_clone<br/>丢掉最老克隆]
+    O --> P([发布 Odometry / 点云])
+
+    classDef start fill:#C5E1A5,stroke:#33691E
+    classDef wait fill:#FFE0B2,stroke:#E65100
+    classDef step fill:#BBDEFB,stroke:#0D47A1
+    classDef endn fill:#F8BBD0,stroke:#880E4F
+    class A start
+    class Z1 wait
+    class B,C,E,F1,G1,H,I,J,K,L,M,N,O step
+    class P endn

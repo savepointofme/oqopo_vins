@@ -19,6 +19,26 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+// =============================================================================
+// [中文注释] Propagator.h
+// -----------------------------------------------------------------------------
+// IMU 预测器：负责把状态从上一时刻传播到当前相机帧时刻, 并更新协方差。
+//
+// 工作流程:
+//   1. feed_imu               : 储存 IMU 并丢弃过旧的测量
+//   2. select_imu_readings    : 选出 [t_prev, t_curr] 之间可用的 IMU,
+//                                头尾做线性插值凑足边界
+//   3. predict_and_compute    : 对单个区间做 RK4 / 离散积分, 得到
+//                                状态传递矩阵 Phi 和噪声匡自矩阵 Qd
+//   4. propagate_and_clone    : 对整个时间段积分 + 新增一个克隆
+//   5. fast_state_propagate   : 用 cache 加速短时间内的单点预测 (非滤波)
+//
+// 数学细节: OpenVINS 采用"流形 EKF"实现, 状态在流形上更新,
+//   R{G-I} 用四元数表达, 其他量用欧几里得形式。
+//   更多请见 docs-cn/vio_manager.md 中“传播”节, 以及官方文档
+//   docs/propagation.md 里的推导。
+// =============================================================================
+
 #ifndef OV_MSCKF_STATE_PROPAGATOR_H
 #define OV_MSCKF_STATE_PROPAGATOR_H
 
@@ -40,6 +60,11 @@ class State;
  * We will first select what measurements we need to propagate with.
  * We then compute the state transition matrix at each step and update the state and covariance.
  * For derivations look at @ref propagation page which has detailed equations.
+ *
+ * [中文] IMU 传播器。
+ *  - 以对象形式封装所有与 IMU 有关的预测逻辑;
+ *  - 对外暴露 feed_imu (储存测量) 和 propagate_and_clone (执行传播) 两个主入口;
+ *  - 内部维护 imu_data (分范加锁) 和一份针对高频查询的缓存 cache_*。
  */
 class Propagator {
 public:
@@ -47,6 +72,9 @@ public:
    * @brief Default constructor
    * @param noises imu noise characteristics (continuous time)
    * @param gravity_mag Global gravity magnitude of the system (normally 9.81)
+   *
+   * [中文] 按照连续时间器件参数 (sigma_w / sigma_a / sigma_wb / sigma_ab)
+   *        预计算平方缓存, 避免每步都调用 pow。
    */
   Propagator(NoiseManager noises, double gravity_mag) : _noises(noises), cache_imu_valid(false) {
     _noises.sigma_w_2 = std::pow(_noises.sigma_w, 2);
@@ -61,6 +89,9 @@ public:
    * @brief Stores incoming inertial readings
    * @param message Contains our timestamp and inertial information
    * @param oldest_time Time that we can discard measurements before (in IMU clock)
+   *
+   * [中文] 并发安全地追加一条 IMU 并清理过旧测量。
+   *        oldest_time 再减去 0.10s 的種冲量, 是为了防止边界插值时缺数据。
    */
   void feed_imu(const ov_core::ImuData &message, double oldest_time = -1) {
 
@@ -106,6 +137,13 @@ public:
    *
    * @param state Pointer to state
    * @param timestamp Time to propagate to and clone at (CAM clock frame)
+   *
+   * [中文] 传播 + 克隆。这是 VioManager 在每帧相机到来时调用的“步未来时刻”入口:
+   *   1. 在 _calib_dt_CAMtoIMU 的补偿下, 把相机时间戳转化到 IMU 时钟
+   *   2. 从 imu_data 中选出 [t_prev, t_curr] 之间可用 IMU
+   *   3. 逐区间 predict_and_compute: 积分得到新的 IMU 状态, 同时累乘得到 Phi 和 Qd
+   *   4. 调用 StateHelper::EKFPropagation 把 Phi/Qd 加到全局协方差上
+   *   5. 调用 StateHelper::augment_clone 在 _clones_IMU 中插入一个当前位姿的克隆
    */
   void propagate_and_clone(std::shared_ptr<State> state, double timestamp);
 
@@ -122,6 +160,8 @@ public:
    * @param covariance The propagated covariance (q_GtoI, p_IinG, v_IinI, w_IinI)
    * @return True if we were able to propagate the state to the current timestep
    */
+  // [中文] 不改滤波状态的快速预测 (主要用于高频输出). 内部使用 cache_* 避免重复
+  //        从 imu_data 中查找区间, 调用频率可达 IMU 采样率。
   bool fast_state_propagate(std::shared_ptr<State> state, double timestamp, Eigen::Matrix<double, 13, 1> &state_plus,
                             Eigen::Matrix<double, 12, 12> &covariance);
 

@@ -30,6 +30,15 @@ using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
 
+// =============================================================================
+// [中文] propagate_and_clone
+//  核心流程:
+//   1. 计算 [time0, time1] 区间 (IMU 时钟), 从 imu_data 中挑出用于积分的样本
+//   2. 对每两个相邻 IMU 调用 predict_and_compute, 得到单步 Phi/Qd, 累乘得到整段的 Phi_summed/Qd_summed
+//   3. 调用 StateHelper::EKFPropagation 把 Phi/Qd 应用到 State 的协方差矩阵
+//   4. 调用 StateHelper::augment_clone 在 _clones_IMU 里新增一个克隆 (深拷贝当前 IMU 位姿)
+//  该函数每进一帧相机都会调用一次, 是 VioManager 主循环的关键入口。
+// =============================================================================
 void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timestamp) {
 
   // If the difference between the current update time and state is zero
@@ -266,6 +275,19 @@ bool Propagator::fast_state_propagate(std::shared_ptr<State> state, double times
   return true;
 }
 
+// =============================================================================
+// [中文] select_imu_readings
+//  从 imu_data 中挑出时间落在 [time0, time1] 的 IMU 并在两端用
+//  Propagator::interpolate_data 做线性插值凑齐边界, 以免 Riemann 累加少一段。
+//  分四种情况:
+//    CASE 1: IMU 区间跨越 time0     -> 插值得到 time0 点的 IMU
+//    CASE 2: IMU 位于 (time0, time1) 之间 -> 直接保留
+//    CASE 3: IMU 区间跨越 time1     -> 插值得到 time1 点的 IMU, 然后退出循环
+//    CASE 4: 只有最后一个 IMU 早于 time1   -> 用最后一个 IMU 外推到 time1
+//  返回的 vector 保证:
+//    prop_data.front().timestamp == time0
+//    prop_data.back().timestamp  == time1
+// =============================================================================
 std::vector<ov_core::ImuData> Propagator::select_imu_readings(const std::vector<ov_core::ImuData> &imu_data, double time0, double time1,
                                                               bool warn) {
 
@@ -392,6 +414,18 @@ std::vector<ov_core::ImuData> Propagator::select_imu_readings(const std::vector<
   return prop_data;
 }
 
+// =============================================================================
+// [中文] predict_and_compute
+//  对单个 IMU 区间 [data_minus, data_plus] 做预测, 输出:
+//    F  : 状态转移矩阵 (作用于 state 的 IMU + 内参子块)
+//    Qd : 离散时间的过程噪声协方差
+//  步骤:
+//    1. 用当前估计的 bias/比例矩阵 Dw/Da/Tg 对原始 IMU 做校正, 得到 a_hat, w_hat
+//    2. 根据 integration_method 选择均值预测: 解析 / RK4 / 离散
+//    3. 调用 compute_F_and_G_analytic 或 compute_F_and_G_discrete 构造 F/G
+//    4. Qd = G * Qc * G^T * dt
+//    5. 写回新的 IMU 均值 (state->_imu->set_value(...))
+// =============================================================================
 void Propagator::predict_and_compute(std::shared_ptr<State> state, const ov_core::ImuData &data_minus, const ov_core::ImuData &data_plus,
                                      Eigen::MatrixXd &F, Eigen::MatrixXd &Qd) {
 

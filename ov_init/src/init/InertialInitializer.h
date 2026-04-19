@@ -19,6 +19,21 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+// =============================================================================
+// [中文注释] InertialInitializer.h
+// -----------------------------------------------------------------------------
+// 视觉惯性系统初始化器的总入口。内部聚合两种策略:
+//   - StaticInitializer  : 假设系统静止, 用 IMU 方差判断、用均值给出初始姿态与 bias
+//   - DynamicInitializer : 动态初始化, 先解相机-IMU 旋转,
+//                          再解线性系统 (速度/重力/特征), 最后一次优化 (Ceres)
+//
+// initialize() 流程:
+//   1. 若 wait_for_jerk && 未探测到加速度阶跃 -> 等待
+//   2. 先试 init_dynamic->initialize(...)
+//   3. 失败且有已知相机外参, 再试 init_static->initialize(...)
+//   4. 返回 timestamp / covariance / order / IMU 初值
+// =============================================================================
+
 #ifndef OV_INIT_INERTIALINITIALIZER_H
 #define OV_INIT_INERTIALINITIALIZER_H
 
@@ -57,6 +72,8 @@ class DynamicInitializer;
  * Problem for Visual-Inertial Systems](https://ieeexplore.ieee.org/abstract/document/9462400) which has some detailed
  * experiments on scale recovery and the accelerometer bias.
  */
+// [中文] 对外统一的初始化入口。VioManager::try_to_initialize 只持有本类指针,
+//        具体采用静态或动态由本类内部自适应选择。
 class InertialInitializer {
 
 public:
@@ -71,6 +88,9 @@ public:
    * @brief Feed function for inertial data
    * @param message Contains our timestamp and inertial information
    * @param oldest_time Time that we can discard measurements before
+   *
+   * [中文] 向 imu_data 追加新的 IMU 并清理 oldest_time 之前的数据。
+   *        注意这里的 imu_data 和 Propagator::imu_data 是两个独立的副本。
    */
   void feed_imu(const ov_core::ImuData &message, double oldest_time = -1);
 
@@ -94,6 +114,9 @@ public:
    * @param wait_for_jerk If true we will wait for a "jerk"
    * @return True if we have successfully initialized our system
    */
+  // [中文] 罕次初始化入口；是一个串行、耗时可能到秒级的运算,
+  //   实际调用方 (VioManager::try_to_initialize) 会把它放在独立线程中执行,
+  //   所以这里的所有操作已经用 shared_ptr / 数据库拷贝保证线程安全。
   bool initialize(double &timestamp, Eigen::MatrixXd &covariance, std::vector<std::shared_ptr<ov_type::Type>> &order,
                   std::shared_ptr<ov_type::IMU> t_imu, bool wait_for_jerk = true);
 
