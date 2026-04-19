@@ -142,6 +142,19 @@ install(TARGETS run_simulation
         RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
+# ROS-free offline runner + OpenCV dashboard. Always built; self-contained
+# w.r.t. ROS so it also compiles under ENABLE_ROS=OFF.
+add_executable(run_serial_msckf_ros_free
+        src/run_serial_msckf_ros_free.cpp
+        src/ros_free/VizDashboard.cpp
+)
+target_link_libraries(run_serial_msckf_ros_free ov_msckf_lib ${thirdparty_libraries})
+install(TARGETS run_serial_msckf_ros_free
+        ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+        LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+        RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
 add_executable(test_sim_meas src/test_sim_meas.cpp)
 target_link_libraries(test_sim_meas ov_msckf_lib ${thirdparty_libraries})
 install(TARGETS test_sim_meas

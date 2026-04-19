@@ -1,0 +1,144 @@
+/*
+ * OpenVINS: An Open Platform for Visual-Inertial Research
+ * Copyright (C) 2018-2023 Patrick Geneva
+ * Copyright (C) 2018-2023 Guoquan Huang
+ * Copyright (C) 2018-2023 OpenVINS Contributors
+ * Copyright (C) 2018-2019 Kevin Eckenhoff
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#ifndef OV_MSCKF_ROS_FREE_VIZ_DASHBOARD_H
+#define OV_MSCKF_ROS_FREE_VIZ_DASHBOARD_H
+
+#include <Eigen/Dense>
+#include <deque>
+#include <mutex>
+#include <opencv2/opencv.hpp>
+#include <string>
+#include <vector>
+
+namespace ov_msckf {
+
+/**
+ * @brief ROS-free OpenCV 仪表板。
+ *
+ * [中文] 单窗口 1600x900 分四宫格:
+ *   - 左上 (800x500): 俯视轨迹图; 绿线 = GPS/GT, 蓝线 = VIO (对齐后),
+ *                     当前相机位姿用三角箭头表示朝向;
+ *                     红点 = SLAM 地图点, 白点 = MSCKF 临时点 (每帧覆盖, 自然"lost 后消失")
+ *   - 右上 (800x500): 最新相机帧 (带跟踪点叠加, 由 VioManager 提供)
+ *   - 左下 (800x400): 时序曲线 - ATE(m) + 速度范数(m/s) + VIO/GPS XYZ 差值 (dx,dy,dz)
+ *   - 右下 (800x400): 姿态曲线 - roll/pitch/yaw (deg) + 当前数值文字
+ *
+ * 设计为"push data, render on demand": 主循环每帧调用一次 update_* 后 render_and_show()。
+ * 支持可选的视频录制 (MP4 via cv::VideoWriter)。
+ */
+class VizDashboard {
+public:
+  struct Options {
+    int width = 1600;
+    int height = 900;
+    double traj_scale_margin = 1.2; ///< [中文] 轨迹框体扩边比例
+    size_t max_history = 20000;
+    size_t timeseries_max = 2000;
+    bool show_window = true;
+    std::string video_path; ///< [中文] 若非空则写 MP4
+    int video_fps = 20;
+  };
+
+  explicit VizDashboard(const Options &opts);
+  ~VizDashboard();
+
+  /// [中文] 当前 IMU/相机 最新位姿 (world=VIO frame)
+  void update_vio_pose(double t, const Eigen::Matrix3d &R_wi, const Eigen::Vector3d &p_wi,
+                       const Eigen::Vector3d &v_wi);
+  /// [中文] 将 VIO 轨迹用拟合出的 T_GV 投到 GT frame 下, 存入绘制历史
+  void set_alignment(const Eigen::Matrix3d &R_gv, const Eigen::Vector3d &t_gv, bool solved);
+
+  /// [中文] 最新的 GPS / GT 点 (GT frame). 若时间戳相近自动与 VIO 配对用于算 ATE。
+  void update_gt(double t, const Eigen::Vector3d &p_gt);
+
+  /// [中文] 最新相机图像 (由 VioManager::get_historical_viz_image() 返回, 已带跟踪叠加)
+  void update_image(double t, const cv::Mat &img);
+
+  /// [中文] 最新的 SLAM 地图点和 MSCKF 临时特征 (world=VIO frame)
+  void update_features(const std::vector<Eigen::Vector3d> &slam_pts,
+                       const std::vector<Eigen::Vector3d> &msckf_pts);
+
+  /// [中文] 渲染到内部画布, 可选写入视频, 可选 imshow. 返回 false 表示用户按了 q/ESC。
+  bool render_and_show(int wait_ms = 1);
+
+  /// [中文] 拿到最近一次渲染的画布 (方便保存最后一帧)
+  cv::Mat last_canvas() const { return canvas_.clone(); }
+
+private:
+  struct PoseEntry {
+    double t;
+    Eigen::Vector3d p;
+  };
+
+  void draw_trajectory(cv::Mat &roi);
+  void draw_camera_image(cv::Mat &roi);
+  void draw_errors(cv::Mat &roi);
+  void draw_attitude(cv::Mat &roi);
+
+  static void draw_grid(cv::Mat &img, cv::Scalar color, int step = 40);
+  static void draw_text(cv::Mat &img, const std::string &s, cv::Point p, cv::Scalar color,
+                        double scale = 0.5, int thickness = 1);
+  static void draw_curve(cv::Mat &roi, const std::deque<std::pair<double, double>> &pts,
+                         cv::Scalar color, double y_min, double y_max, double x_min, double x_max,
+                         int thickness = 1);
+  static Eigen::Vector3d quat_to_rpy(const Eigen::Matrix3d &R);
+
+  Options opts_;
+  cv::Mat canvas_;
+  cv::VideoWriter video_;
+
+  mutable std::mutex mu_;
+  std::deque<PoseEntry> vio_hist_;      // [中文] 原始 VIO (未对齐) 历史
+  std::deque<PoseEntry> gt_hist_;       // [中文] GT 历史 (GT frame)
+  Eigen::Matrix3d R_gv_ = Eigen::Matrix3d::Identity();
+  Eigen::Vector3d t_gv_ = Eigen::Vector3d::Zero();
+  bool aligned_ = false;
+
+  // latest state
+  double latest_t_ = -1;
+  Eigen::Matrix3d latest_R_wi_ = Eigen::Matrix3d::Identity();
+  Eigen::Vector3d latest_p_wi_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d latest_v_wi_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d latest_p_gt_ = Eigen::Vector3d::Zero();
+  bool has_gt_ = false;
+
+  cv::Mat latest_image_;
+  double latest_image_t_ = -1;
+
+  std::vector<Eigen::Vector3d> slam_pts_;
+  std::vector<Eigen::Vector3d> msckf_pts_;
+
+  // time series
+  std::deque<std::pair<double, double>> ts_ate_;
+  std::deque<std::pair<double, double>> ts_speed_;
+  std::deque<std::pair<double, double>> ts_dx_;
+  std::deque<std::pair<double, double>> ts_dy_;
+  std::deque<std::pair<double, double>> ts_dz_;
+  std::deque<std::pair<double, double>> ts_roll_;
+  std::deque<std::pair<double, double>> ts_pitch_;
+  std::deque<std::pair<double, double>> ts_yaw_;
+  double t_start_ = -1;
+};
+
+} // namespace ov_msckf
+
+#endif // OV_MSCKF_ROS_FREE_VIZ_DASHBOARD_H
