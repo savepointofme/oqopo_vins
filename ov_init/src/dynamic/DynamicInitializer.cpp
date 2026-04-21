@@ -45,6 +45,15 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
                                     std::shared_ptr<ov_type::IMU> &_imu, std::map<double, std::shared_ptr<ov_type::PoseJPL>> &_clones_IMU,
                                     std::unordered_map<size_t, std::shared_ptr<ov_type::Landmark>> &_features_SLAM) {
 
+  // ==========================================================================
+  // [中文] Stage 1 — 初始化窗口准备
+  //   从 FeatureDatabase 选出最新相机时间 newest_cam_time, 向前截 init_window_time 秒。
+  //   过期的 IMU/特征观测全删除, 剩下的用来確定初始化 "时间滚动窗口"。
+  //   Important: 库里的特征做浅拷贝, 异步跟踪添加的新观测不会干扰本次初始化。
+  //   失败条件:
+  //     - 特征数 < 0.75 * init_max_features (没够开锅)
+  //     - IMU 数 < 2 或无 "比最老特征时间还老" 的 IMU (说明文件多早过图像多早)
+  // ==========================================================================
   // Get the newest and oldest timestamps we will try to initialize between!
   auto rT1 = boost::posix_time::microsec_clock::local_time();
   double newest_cam_time = -1;
@@ -218,6 +227,16 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   //  }
   auto rT2 = boost::posix_time::microsec_clock::local_time();
 
+  // ==========================================================================
+  // [中文] Stage 2 — CPI 预积分 + 构造线性系统
+  //   这一大段对 map_camera_times 里每一个相机时刻, 做两条预积分:
+  //     (a) I0 → Ii   — 累积旋转/alpha/beta, 用于下面 Eq.(14) 线性系统。
+  //     (b) Ii → Ii+1 — 用于后续 Ceres MLE 中的 Factor_ImuCPIv1。
+  //   偏置线性化点: 默认用 (b_w, b_a) = (0, 0) 作为 lin-point; 若有 prior 可改。
+  //   值得注意: params.calib_camimu_dt 是相机↔IMU 时间偏移, 在选 IMU 片段时要加回。
+  //   失败条件: 某个相机时刻对应的 IMU 读数 < 2, 或起始/终止偏差 > 10 ms。
+  // ==========================================================================
+
   // ======================================================
   // ======================================================
 
@@ -383,6 +402,18 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   }
   auto rT3 = boost::posix_time::microsec_clock::local_time();
 
+  // ==========================================================================
+  // [中文] Stage 3/4 — |g|=const 线性系统约束求解
+  //   线性系统: A · [features; velocity; gravity] = b   (总维度 3N+3+3)
+  //   求解思路: 把 A 拆成 [A1 | A2], A2 是重力那 3 列。
+  //     - A1^T A1 可逆 → 子问题 x1 = -(A1^T A1)^{-1} A1^T (A2 g - b) 即关于 g 的线性形式。
+  //     - 代回 A 时残差^2 + ||g||^2 = g_mag^2 约束 → 关于 g 的二次优化 (Lagrangian).
+  //     - Lagrangian 最优条件 => 6 阶多项式特征值问题; companion 矩阵 → eigenvalues.
+  //   取 "实特征值中令 |g|-g_mag 最小 的那个" → lambda_min → 恢复重力。
+  //   这一步是动态初始化的 "最重要的 40 行", Dong-Si Eq.(24) 记住。
+  //   失败条件: companion matrix 不满秩 / 无实特征值 / ||g||不收敛 (>1e-3)。
+  // ==========================================================================
+
   // ======================================================
   // ======================================================
 
@@ -481,6 +512,17 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
              gravity_inI0.norm());
   auto rT4 = boost::posix_time::microsec_clock::local_time();
 
+  // ==========================================================================
+  // [中文] Stage 5 — 恢复位姿链与全局对齐
+  //   用线性系统解出的 v_I0 & g_I0, 结合 CPI 结果逐帧算:
+  //      p_Ik_in_I0 = v_I0 * DT - 0.5 * g_I0 * DT^2 + alpha_I0_to_Ik
+  //      v_Ik_in_I0 = v_I0 - g_I0 * DT + beta_I0_to_Ik
+  //      R_I0_to_Ik 由 CPI 直接给出。
+  //   特征 p_F_in_I0 从x_hat分出, 前面检查每一个相机帧内 z > 0 (不在相机后面)。
+  //   用 Gram-Schmidt 用 g_I0 构造 R_GtoI0: z 轴对齐重力方向, xy 由正交补全。
+  //   所有量左乘旋转乘到全局系 G, 后续 MLE 和滤波器都在 G 系工作。
+  // ==========================================================================
+
   // ======================================================
   // ======================================================
 
@@ -565,6 +607,20 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
   for (auto const &feat : features_inI0) {
     features_inG[feat.first] = R_GtoI0.transpose() * feat.second;
   }
+
+  // ==========================================================================
+  // [中文] Stage 6 — Ceres 大 MLE 优化 (恢复协方差的关键步)
+  //   变量: 每个相机时刻的 (q_GtoIi, p_IiinG, v_IiinG, bg, ba), + 每个特征 p_FinG,
+  //          + 外参 (q_ItoC, p_IinC), + 内参 (focal, center, distortion)。
+  //   因子:
+  //     - GenericPrior 在第 1 个位姿上: 锁住 4 自由度不可观 (yaw + p), 并给 bias 添加弱先验。
+  //     - Factor_ImuCPIv1: 将两相邻相机时刻的 15 维状态用 CPI 预积分结果约束。
+  //     - Factor_ImageReprojCalib: 对每一个特征 × 每个观测, 指向差 = uv_meas - projection(p_FinG, pose, calib)。
+  //     - State_JPLQuatLocal: 给 Ceres 提供 JPL 四元数的 local parameterization (Plus 用左乘扰动)。
+  //   标定固定: 如果 params.init_dyn_mle_opt_calib=false, 外参内参都 SetConstant。
+  //   优化后: 用 Covariance::GetCovarianceMatrixInTangentSpace 导出协方差分块, 按 order 组合。
+  //   失败条件: iterations > max_iter 且未收敛 / Ceres solver returned non-CONVERGENCE.
+  // ==========================================================================
 
   // ======================================================
   // ======================================================
@@ -905,6 +961,14 @@ bool DynamicInitializer::initialize(double &timestamp, Eigen::MatrixXd &covarian
     return false;
   }
   PRINT_DEBUG("[init-d]: %s\n", summary.message.c_str());
+
+  // ==========================================================================
+  // [中文] Stage 7 (收尾) — 把优化结果写回到 State 对象
+  //   _imu            : 设为最新相机时刻的 IMU 估计 (q,p,v,bg,ba), FEJ 同步初始化。
+  //   _clones_IMU     : 把中间所有滑窗位姿 (q,p) 添加为 PoseJPL 克隆。
+  //   _features_SLAM  : 满足条件的特征直接作为 SLAM landmark 进入滤波器。
+  //   order           : 协方差矩阵的行/列顺序 (后续 StateHelper 需要它从协方差取子块)。
+  // ==========================================================================
 
   //======================================================
   //======================================================

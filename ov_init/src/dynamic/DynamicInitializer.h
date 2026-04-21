@@ -48,6 +48,29 @@ namespace ov_init {
  * 2. Construct linear system with features to recover velocity (solve with |g| constraint)
  * 3. Perform a large MLE with all calibration and recover the covariance.
  *
+ * [中文] DynamicInitializer — 带运动的动态初始化 (系统并非静止)
+ *
+ *   论文: Dong-Si & Mourikis 2012 (IROS) + Eckenhoff et al. 预积分扩展。
+ *   适用场景: 无人机手投 / 背包启动 / 车辆起步等 "启动时就在运动" 的情况。
+ *
+ *   6 个 stage (见 .cpp 文件的 "==== " 分割线):
+ *     Stage 1 — 窗口准备: 根据 init_window_time 切一段数据, 拷贝 features 防止异步改写。
+ *     Stage 2 — CPI 预积分: 对每个相机时刻做两段预积分
+ *                  (a) I0 → Ii (用于线性系统中累积位移/速度)
+ *                  (b) Ii → Ii+1 (用于后续 MLE IMU 因子)
+ *     Stage 3 — 构造线性系统: Eq.(14), 状态 [features, velocity, gravity],
+ *                  用特征视差约束求解, 未知数为像素反推的位置残差。
+ *     Stage 4 — |g| 约束求解: 对重力 3D 向量加 ‖g‖ = 9.81 硬约束,
+ *                  化成 6 次多项式特征值问题, 取最小实特征值 → 求出 gravity & velocity。
+ *     Stage 5 — 坐标对齐: 通过 Gram-Schmidt 构造 R_GtoI0 使 G 系 z 轴对齐重力,
+ *                  所有特征、速度、位置均旋转到 G 系。
+ *     Stage 6 — Ceres MLE: 构造 Problem, 加入 IMU CPI factor + 每个特征 ImageReprojCalib factor
+ *                  + 第一位姿 GenericPrior (锁定 4 自由度不可观), 优化 → 恢复协方差。
+ *
+ *   输出: 最新 IMU 状态 + 所有位姿 clones + SLAM 特征 + 协方差矩阵 (按 order 排列)。
+ *
+ *   失败分支: 特征数不够 / CPI 积分缺 IMU / 多项式无实根 / 重力不收敛 / Ceres 不 converge.
+ *
  * Method is based on this work (see this [tech report](https://pgeneva.com/downloads/reports/tr_init.pdf) for a high level walk through):
  *
  * > Dong-Si, Tue-Cuong, and Anastasios I. Mourikis.

@@ -34,6 +34,21 @@ namespace ov_init {
  * But if performing marginalization, this can be non-zero. See the following paper Section 3.2 Eq. 25-35
  * https://journals.sagepub.com/doi/full/10.1177/0278364919835021
  *
+ * [中文] Factor_GenericPrior — 通用的 "带非零线性项" 状态先验因子
+ *
+ *   场景 1 (本仓用到的): DynamicInitializer 初始化时, 为了锁定 4 自由度不可观 (yaw + p_IiinG),
+ *     对第 1 帧的 (q_yaw, p, bg, ba) 提供一个信息矩阵非常大的先验, 让 Ceres 不会让它们随意漂。
+ *     此时 prior_grad = 0, 因为"在 x_lin 处刚好残差为 0"。
+ *
+ *   场景 2 (通用): 边缘化后会得到 (A, b), A^T A 是 prior information, A^T b 是 prior gradient。
+ *     此时 prior_grad 不为 0 (因为 x_lin 不是最优点了), 代入 cost 公式 ||A(x-x_lin)+b||^2 依然正确。
+ *
+ *   x_type 选项及含义 (会影响 Plus 操作):
+ *     - "quat"     : 4维 JPL 四元数, 误差 3 维, 左乘扰动 (同 State_JPLQuatLocal)。
+ *     - "quat_yaw" : 4维 JPL 四元数但只对 yaw 线性化 (用于锁 yaw 不可观)。
+ *     - "vec3"     : 3维普通向量 (位置/速度/偏置等), 纯加法。
+ *     - "vec8"     : 8维 (相机内参 fx,fy,cx,cy,k1,k2,p1,p2/k3,k4)。
+ *
  * We have the following minimization problem:
  * @f[
  * \textrm{argmin} ||A * (x - x_{lin}) + b||^2

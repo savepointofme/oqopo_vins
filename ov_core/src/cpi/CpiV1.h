@@ -48,6 +48,33 @@ namespace ov_core {
  * 1. call setLinearizationPoints() to set the bias/orientation linearization point
  * 2. call feed_IMU() will all IMU measurements you want to precompound over
  * 3. access public varibles, to get means, Jacobians, and measurement covariance
+ *
+ * [中文] CpiV1 — 连续预积分模型 1 (piecewise-constant 测量假设)
+ *
+ *   "预积分" 是把 [t_k, t_{k+1}] 内所有 IMU 测量 压缩成 3 个量:
+ *     q_breve (姿态积分), alpha_tau (位置积分), beta_tau (速度积分)
+ *   这样优化或滤波时不用每次迭代都重新积分一次 IMU, 只用线性修正。
+ *
+ *   Model 1 的关键假设: 在每段 (imu_i → imu_{i+1}) 内, 角速度 & 加速度视为 "分段常数"
+ *     (通常取起点测量; 如 imu_avg=true 则取两端均值)。
+ *     相比 "线性变化假设" (Model 2) 简单, 精度略低, 但雅可比闭式解更短。
+ *
+ *   用法:
+ *     1. setLinearizationPoints(b_w_lin, b_a_lin)   (CpiBase 里定义, 必须先调)
+ *     2. 循环: feed_IMU(t0, t1, w0, a0, w1, a1)     (把每对连续 IMU 读数喂进来)
+ *     3. 读取: DT, q_k2tau, alpha_tau, beta_tau,
+ *              J_q / J_a / J_b / H_a / H_b (bias 雅可比), P_meas (15x15 协方差)
+ *
+ *   重要字段 (在 CpiBase):
+ *     R_k2tau  = 从 t_k 时刻的 IMU 系到 t_tau 时刻的 IMU 系的旋转
+ *     alpha_tau = ∫∫ (R * (a_m - b_a)) dτ dτ            (位置分量)
+ *     beta_tau  = ∫  (R * (a_m - b_a)) dτ               (速度分量)
+ *     J_q       = d(q)/d(bg)      : 姿态对 bg 的一阶雅可比
+ *     J_a, H_a  = d(alpha)/d(bg), d(alpha)/d(ba)        (位置雅可比)
+ *     J_b, H_b  = d(beta)/d(bg),  d(beta)/d(ba)         (速度雅可比)
+ *
+ *   线性化点变化时修正: 如果当前优化中 b_w/b_a 偏离 _lin 的值,
+ *     可用 Δalpha = J_a * dbg + H_a * dba (一阶展开), 不用重新积分。
  */
 class CpiV1 : public CpiBase {
 
