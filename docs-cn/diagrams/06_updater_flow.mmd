@@ -1,0 +1,45 @@
+%%{init: {'theme':'default'}}%%
+flowchart TD
+    A([UpdaterMSCKF::update<br/>feature_vec]) --> B[收集所有克隆时间 clonetimes]
+    B --> C[feature-&gt;clean_old_measurements<br/>只保留有克隆对应的测量]
+    C --> C1{测量数 &ge; 2?}
+    C1 -- 否 --> C2[标记 to_delete 丢弃]
+    C1 -- 是 --> D[为每个相机构建 clones_cam<br/>R_GtoCi, p_CioinG]
+
+    D --> E[FeatureInitializer<br/>单应/DLT 初值 + 高斯牛顿优化<br/>单目 三角化特征]
+    E --> E1{成功且在视锥内?}
+    E1 -- 否 --> E2[丢弃]
+    E1 -- 是 --> F[对每个特征循环:<br/>UpdaterHelper::get_feature_jacobian_full]
+
+    F --> F1[构建 H_f, H_x, 残差 r, 测量噪声 R<br/>H_f: 对特征位置的 Jacobian<br/>H_x: 对状态克隆的 Jacobian]
+    F1 --> F2[Null-space projection<br/>左乘 N^T 使 N^T * H_f = 0<br/>消去特征, 保留 H_x, r, R]
+    F2 --> F3["卡方检验 chi2<br/>r^T * inv(H_x P H_x^T + R) * r"]
+    F3 --> F4{小于阈值?}
+    F4 -- 否 --> F5[外点, 跳过]
+    F4 -- 是 --> F6[加入系统 H_big, r_big, R_big]
+
+    F6 --> G[UpdaterHelper::measurement_compress<br/>QR 分解压缩残差维度]
+    G --> H["StateHelper::EKFUpdate<br/>K = P H^T * inv(H P H^T + R)<br/>dx = K r, 更新 state, P"]
+    H --> I[propagator-&gt;invalidate_cache]
+    I --> J([标记 feature-&gt;to_delete = true<br/>回到 VioManager])
+
+    subgraph SLAM [UpdaterSLAM 对比]
+        SA[已有 SLAM 特征:<br/>特征已在状态中<br/>-&gt; 直接计算 H_x 做 EKFUpdate]
+        SB[新 SLAM 特征 delayed_init:<br/>扩展状态增加 Landmark<br/>-&gt; 用首帧 inverse-depth 初值<br/>-&gt; EKF 一并更新]
+    end
+
+    subgraph ZUPT [UpdaterZeroVelocity]
+        ZA[检测方式:<br/>1. IMU 方差 &lt; 阈值<br/>2. 视差 &lt; 阈值]
+        ZA --> ZB[构造 H, r: v_I=0, w=bg<br/>EKFUpdate + 不做传播/克隆]
+    end
+
+    classDef start fill:#C5E1A5,stroke:#33691E
+    classDef step fill:#BBDEFB,stroke:#0D47A1
+    classDef decision fill:#FFF59D,stroke:#F57F17
+    classDef drop fill:#FFCDD2,stroke:#B71C1C
+    classDef endn fill:#F8BBD0,stroke:#880E4F
+    class A start
+    class B,C,D,E,F,F1,F2,F3,F6,G,H,I step
+    class C1,E1,F4 decision
+    class C2,E2,F5 drop
+    class J endn

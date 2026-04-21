@@ -1,0 +1,64 @@
+%%{init: {'theme':'default', 'flowchart': {'htmlLabels': true}}}%%
+flowchart LR
+    subgraph SENSORS [传感器输入]
+        IMU[IMU<br/>角速度/加速度]
+        CAM[Camera<br/>单目 或 双目 / 多目]
+    end
+
+    subgraph ROS [ROS1/ROS2 接口层]
+        SUB[订阅回调<br/>ROS1Visualizer / ROS2Visualizer]
+    end
+
+    subgraph OV_MSCKF [ov_msckf 滤波主体]
+        VM[VioManager<br/>总调度]
+        INIT[try_to_initialize<br/>尝试初始化]
+        PROP[Propagator<br/>propagate_and_clone]
+        MSCKF[UpdaterMSCKF<br/>短轨 EKF 更新]
+        SLAM[UpdaterSLAM<br/>长轨 SLAM 特征]
+        ZUPT[UpdaterZeroVelocity<br/>零速检测]
+        STATE[(State<br/>IMU + 克隆 + SLAM 特征)]
+    end
+
+    subgraph OV_CORE [ov_core 前端]
+        TRACK[TrackKLT / TrackDescriptor<br/>feed_new_camera]
+        DB[(FeatureDatabase)]
+    end
+
+    subgraph OV_INIT [ov_init]
+        INI[InertialInitializer<br/>Static or Dynamic]
+    end
+
+    subgraph OUT [输出]
+        ODOM[Odometry / Pose]
+        PC[Point Cloud<br/>active + slam 特征]
+        PATH[Trajectory]
+    end
+
+    IMU --> SUB --> VM
+    CAM --> SUB --> VM
+    VM -->|feed_measurement_imu| PROP
+    VM -->|feed_measurement_camera| TRACK
+    TRACK --> DB
+    VM -->|!is_initialized_vio| INIT
+    INIT --> INI
+    INI -- 使用 IMU+特征库 --> INI
+    INI -->|成功 -> 初值| STATE
+    VM --> ZUPT
+    ZUPT -->|静止 -> 零速 update| STATE
+    PROP -->|IMU 预测 + 克隆| STATE
+    DB -->|按时间取特征| MSCKF
+    DB --> SLAM
+    MSCKF -->|EKF 更新| STATE
+    SLAM -->|EKF 更新 & delayed_init| STATE
+    STATE -->|发布| ODOM
+    STATE --> PC
+    STATE --> PATH
+
+    classDef input fill:#E3F2FD,stroke:#1565C0
+    classDef filter fill:#FFF3E0,stroke:#E65100
+    classDef front fill:#E8F5E9,stroke:#2E7D32
+    classDef out fill:#FCE4EC,stroke:#AD1457
+    class IMU,CAM,SUB input
+    class VM,PROP,MSCKF,SLAM,ZUPT,STATE,INIT filter
+    class TRACK,DB,INI front
+    class ODOM,PC,PATH out

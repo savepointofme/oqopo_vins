@@ -1,0 +1,36 @@
+%%{init: {'theme':'default'}}%%
+flowchart TD
+    A([feed_new_camera 新图像]) --> B[按 cam_id 加锁<br/>直方图均衡 HIST / CLAHE]
+    B --> C[buildOpticalFlowPyramid<br/>构建金字塔]
+    C --> D{单目 or 双目?}
+
+    D -- 单目 --> M1[feed_monocular]
+    D -- 双目 --> S1[feed_stereo<br/>左/右可并行]
+
+    M1 --> M2{是否首帧?}
+    M2 -- 是 --> M3[Grider_FAST<br/>按网格提取 FAST 角点]
+    M3 --> M4[写入当前点集 pts_last]
+    M2 -- 否 --> M5[calcOpticalFlowPyrLK<br/>光流跟踪至当前帧]
+    M5 --> M6[perform_matching 后处理<br/>RANSAC/基础矩阵剔除外点]
+    M6 --> M7[检查像素距离 min_px_dist<br/>在空缺区补提 FAST 角点]
+
+    S1 --> S2{左右均首帧?}
+    S2 -- 是 --> S3[并行提取左右 FAST]
+    S3 --> S4[左-&gt;右 KLT + RANSAC<br/>建立立体匹配对]
+    S2 -- 否 --> S5["时间方向 KLT:<br/>左 (k-1) → 左 k 并<br/>右 (k-1) → 右 k"]
+    S5 --> S6["左 k → 右 k KLT 立体匹配"]
+
+    M7 --> Z[更新 pts_last / ids_last<br/>FeatureDatabase-&gt;update_feature]
+    S4 --> Z
+    S6 --> Z
+    Z --> Z2[draw_history 叠加可视化]
+    Z2 --> P([返回 / 等待下一帧])
+
+    classDef start fill:#C5E1A5,stroke:#33691E
+    classDef step fill:#BBDEFB,stroke:#0D47A1
+    classDef decision fill:#FFF59D,stroke:#F57F17
+    classDef endn fill:#F8BBD0,stroke:#880E4F
+    class A start
+    class B,C,M1,M3,M4,M5,M6,M7,S1,S3,S4,S5,S6,Z,Z2 step
+    class D,M2,S2 decision
+    class P endn

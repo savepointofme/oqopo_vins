@@ -1,0 +1,74 @@
+%%{init: {'theme':'default'}}%%
+classDiagram
+    class State {
+        +double _timestamp
+        +StateOptions _options
+        +shared_ptr~IMU~ _imu
+        +map~double, PoseJPL~ _clones_IMU
+        +map~size_t, Landmark~ _features_SLAM
+        +Vec _calib_dt_CAMtoIMU
+        +map~size_t, PoseJPL~ _calib_IMUtoCAM
+        +map~size_t, Vec~ _cam_intrinsics
+        +Vec _calib_imu_dw / _da / _tg
+        +Quat _calib_imu_GYROtoIMU / ACCtoIMU
+        +Eigen::MatrixXd _Cov
+        +margtimestep() double
+        +max_covariance_size() int
+    }
+
+    class IMU {
+        +Quat q_GtoI
+        +Vec p_IinG
+        +Vec v_IinG
+        +Vec bg (陀螺零偏)
+        +Vec ba (加计零偏)
+    }
+
+    class PoseJPL {
+        +Quat q
+        +Vec p
+    }
+
+    class Landmark {
+        +size_t _featid
+        +int _feat_representation
+        +Vec p_FinG 或 逆深度
+        +int _anchor_cam_id
+        +double _anchor_clone_timestamp
+    }
+
+    class Propagator {
+        +feed_imu()
+        +propagate_and_clone(state, ts)
+        -predict_and_compute()
+        -select_imu_readings()
+    }
+
+    class StateHelper {
+        +EKFUpdate()
+        +augment_clone()
+        +marginalize()
+        +marginalize_old_clone()
+        +marginalize_slam()
+        +initialize_invertible()
+    }
+
+    class UpdaterMSCKF
+    class UpdaterSLAM
+    class UpdaterZeroVelocity
+    class UpdaterHelper {
+        +get_feature_jacobian_full()
+        +nullspace_project_inplace()
+        +measurement_compress_inplace()
+    }
+
+    State "1" o-- "1" IMU
+    State "1" o-- "many" PoseJPL : _clones_IMU
+    State "1" o-- "many" Landmark : _features_SLAM
+    Propagator ..> State : 修改
+    StateHelper ..> State : 修改
+    UpdaterMSCKF ..> UpdaterHelper
+    UpdaterSLAM ..> UpdaterHelper
+    UpdaterZeroVelocity ..> StateHelper
+    UpdaterMSCKF ..> StateHelper
+    UpdaterSLAM ..> StateHelper

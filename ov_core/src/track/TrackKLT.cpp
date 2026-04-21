@@ -31,6 +31,14 @@
 
 using namespace ov_core;
 
+// =============================================================================
+// [中文] feed_new_camera
+//  请注意:
+//   - 这里用 message.sensor_ids.size() 来判断“单目 vs 双目”, 并不是 use_stereo。
+//     如果交付的图像有 N 帠则会并行调用 feed_monocular N 次
+//     (N 帠并行的总耗时 ≈ 1 帠的耗时, OpenMP 分发)；要做双目匹配必须 use_stereo=true。
+//   - feed_new_camera 自身**不修改全局成员**, 只调用 feed_* 做工作, 所以可并发。
+// =============================================================================
 void TrackKLT::feed_new_camera(const CameraData &message) {
 
   // Error check that we have all the data
@@ -93,6 +101,18 @@ void TrackKLT::feed_new_camera(const CameraData &message) {
   }
 }
 
+// =============================================================================
+// [中文] feed_monocular
+//  核心步骤 (单帧):
+//   Step 1  根据 histogram_method 做 NONE/HIST_EQ/CLAHE 预处理
+//   Step 2  buildOpticalFlowPyramid 高斯金字塔
+//   Step 3  若没有上一帧 → 直接调 perform_detection_monocular 拉 max_features 个点
+//   Step 4  否则 → calcOpticalFlowPyrLK 从上一帧 pyr_last 跟到当前 pyr_curr,
+//           联合 F-matrix RANSAC 过滤外点
+//   Step 5  再调 perform_detection_monocular 补充 max_features - tracked 个新点
+//   Step 6  将此帧观测写入 FeatureDatabase
+//   Step 7  swap pyr_last / img_last / pts_last / ids_last
+// =============================================================================
 void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
 
   // Lock this data feed for this camera
@@ -199,6 +219,14 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
   PRINT_ALL("[TIME-KLT]: %.4f seconds for total\n", (rT5 - rT1).total_microseconds() * 1e-6);
 }
 
+// =============================================================================
+// [中文] feed_stereo
+//  与单目类似, 但额外在左 ↔ 右相机的 KLT 建立立体对应:
+//   - 先把左帧的 pts_left_last 跟到当前左帧
+//   - 再把当前左帧新点 KLT 到当前右帧得立体匹配
+//   - 联合 F-matrix 或 fundamental matrix RANSAC 过滤外点
+//  同一个特征在左/右相机的观测会共享同一个 featid。
+// =============================================================================
 void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t msg_id_right) {
 
   // Lock this data feed for this camera
@@ -392,6 +420,13 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
   PRINT_ALL("[TIME-KLT]: %.4f seconds for total\n", (rT6 - rT1).total_microseconds() * 1e-6);
 }
 
+// =============================================================================
+// [中文] perform_detection_monocular
+//  在当前帧上补充新特征, 保持总特征数 ≤ num_features:
+//   1. 构造 occupancy mask: 把已有点周围 (min_px_dist 像素) 付成禁区
+//   2. 按 grid_x x grid_y 网格 FAST 检测, 每格里取分数最高点
+//   3. 汇聚新点, 匹配去重, 指派新 featid
+// =============================================================================
 void TrackKLT::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, const cv::Mat &mask0, std::vector<cv::KeyPoint> &pts0,
                                            std::vector<size_t> &ids0) {
 
@@ -527,6 +562,11 @@ void TrackKLT::perform_detection_monocular(const std::vector<cv::Mat> &img0pyr, 
   }
 }
 
+// =============================================================================
+// [中文] perform_detection_stereo
+//  与单目版本类似, 但在左帧 FAST 得到新点后用 KLT 光流跟到右帧,
+//  成功建立立体对应的点才会被注入 pts0/pts1 (共享同一 featid)。
+// =============================================================================
 void TrackKLT::perform_detection_stereo(const std::vector<cv::Mat> &img0pyr, const std::vector<cv::Mat> &img1pyr, const cv::Mat &mask0,
                                         const cv::Mat &mask1, size_t cam_id_left, size_t cam_id_right, std::vector<cv::KeyPoint> &pts0,
                                         std::vector<cv::KeyPoint> &pts1, std::vector<size_t> &ids0, std::vector<size_t> &ids1) {

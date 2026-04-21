@@ -1,0 +1,49 @@
+%%{init: {'theme':'default'}}%%
+mindmap
+  root((OpenVINS))
+    ov_core 前端与通用库
+      cam 相机模型
+        CamBase 抽象基类
+        CamRadtan 径向切向畸变
+        CamEqui 等距鱼眼
+      track 特征跟踪
+        TrackBase 抽象接口
+        TrackKLT 稀疏光流
+        TrackDescriptor ORB/BRISK
+        TrackAruco Aruco 码
+        TrackSIM 仿真
+        Grider_FAST/Grider_GRID 网格化角点
+      feat 特征管理
+        Feature 特征观测
+        FeatureDatabase 特征数据库
+        FeatureInitializer 三角化
+      types 状态类型系统
+        Vec / Quat / PoseJPL / IMU / Landmark
+      utils 通用工具
+        sensor_data / quat_ops / colors / print
+      sim 仿真器
+        Simulator 生成 IMU + 视觉
+    ov_init 初始化
+      InertialInitializer 入口
+      StaticInitializer 静止初始化
+      DynamicInitializer 动态初始化
+      ceres 非线性因子
+    ov_msckf 滤波主体
+      core
+        VioManager 总调度
+        VioManagerOptions 配置
+      state
+        State 状态+克隆
+        Propagator IMU 传播
+        StateHelper 边缘化/增广
+      update
+        UpdaterMSCKF 短轨特征更新
+        UpdaterSLAM 长轨 SLAM 特征
+        UpdaterZeroVelocity 零速更新
+        UpdaterHelper Jacobian/零空间
+      ros
+        ROS1/ROS2 订阅与可视化
+    ov_eval 评估与绘图
+      calc 误差计算
+      alignment 轨迹对齐
+      绘图脚本

@@ -19,6 +19,23 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+// =============================================================================
+// [中文注释] TrackKLT.h
+// -----------------------------------------------------------------------------
+// 基于 KLT 光流 + FAST 关键点的前端跟踪器。支持单目 / 双目,
+// 对每个跟踪上的特征记录 {id, u, v, t}, 输入特征数据库 FeatureDatabase
+// 以备 MSCKF/SLAM 更新使用。
+//
+// 关键步骤 (单帧):
+//   1. 直方图均衡 (NONE / HIST_EQ / CLAHE) + 高斯金字塔
+//   2. 用 calcOpticalFlowPyrLK 把上一帧点位跟到当前帧
+//   3. 双重 RANSAC (F-matrix + 内点过滤)
+//   4. 网格化 FAST 检测, 补充新点至 max_features
+//   5. 写入 FeatureDatabase
+//
+// 双目模式额外做左→右的 KLT 来建立立体对应, 参见 feed_stereo.
+// =============================================================================
+
 #ifndef OV_CORE_TRACK_KLT_H
 #define OV_CORE_TRACK_KLT_H
 
@@ -35,6 +52,10 @@ namespace ov_core {
  * to find the stereo correspondence information also.
  * This uses the [calcOpticalFlowPyrLK](https://github.com/opencv/opencv/blob/master/modules/video/src/lkpyramid.cpp)
  * OpenCV function to do the KLT tracking.
+ *
+ * [中文] TrackBase 的实现之一。每帧图像调用 feed_new_camera, 内部自动分发到
+ *        feed_monocular 或 feed_stereo。反复调用时能在跟踪器中维持 max_features
+ *        个活跃特征。
  */
 class TrackKLT : public TrackBase {
 
@@ -59,6 +80,9 @@ public:
   /**
    * @brief Process a new image
    * @param message Contains our timestamp, images, and camera ids
+   *
+   * [中文] 外部入口。根据 message.sensor_ids 的数量分发到单目或双目处理,
+   *        内部来维护 img_last / pts_last / ids_last 等满程变量以实现帧间传递。
    */
   void feed_new_camera(const CameraData &message) override;
 

@@ -189,6 +189,33 @@ void UpdaterHelper::get_feature_jacobian_representation(std::shared_ptr<State> s
   assert(false);
 }
 
+// =============================================================================
+// [中文] get_feature_jacobian_full
+//  为单个特征构造完整的测量系统 (res, H_x, H_f), 即:
+//      res    = uv_measured - π(p_FinCi)            每个观测 2 维
+//      H_x    = ∂res / ∂state    (clone δθ/δp, 相机外参/畸变, ...)
+//      H_f    = ∂res / ∂(feature_representation_params)
+//  步骤 (对该特征的每一帧观测 c = 0..M-1):
+//      1. 从 state 里收集所有要估的 Type (clones, calib_IMUtoCAM, cam_intrinsics, anchor)
+//         并记录它们在 H_x 的列起点 (map_hx)。
+//      2. 计算 p_FinG, p_FinA (可选 FEJ 分支锁线性化点)。
+//      3. 对每帧观测:
+//           p_FinIi = R_GtoIi (p_FinG - p_IiinG)
+//           p_FinCi = R_ItoC  p_FinIi + p_IinC
+//           uv_norm = p_FinCi[:2] / p_FinCi.z
+//           uv_dist = distort(uv_norm, intrinsics)
+//           res[c]  = uv_m - uv_dist
+//           dz_dzn, dz_dzeta = cam->compute_distort_jacobian(uv_norm)
+//           dzn_dpfc = ∂(uv_norm)/∂(p_FinCi)   (2×3)
+//           dpfc_dpfg = R_ItoC · R_GtoIi        (3×3)
+//           dz_dpfg   = dz_dzn · dzn_dpfc · dpfc_dpfg
+//           H_f[2c:2c+2] = dz_dpfg · dpfg_dlambda    (链式最后一段)
+//           对 clone δθ/δp: H_x 填 dz_dpfc · [R_ItoC·skew(p_FinIi)  -dpfc_dpfg]
+//           若开外参/内参标定, 在对应 H_x 列继续累加 Jacobian
+//  返回的 H_x 仍包含 H_f 的自由度, 下一步会在调用方用 nullspace_project_inplace 消掉 (MSCKF)
+//  或保留 H_f 作为状态扩维 (SLAM delayed init).
+//  详细推导与每一块对应公式: docs-cn/measurement_math.md §2。
+// =============================================================================
 void UpdaterHelper::get_feature_jacobian_full(std::shared_ptr<State> state, UpdaterHelperFeature &feature, Eigen::MatrixXd &H_f,
                                               Eigen::MatrixXd &H_x, Eigen::VectorXd &res, std::vector<std::shared_ptr<Type>> &x_order) {
 
@@ -429,6 +456,15 @@ void UpdaterHelper::nullspace_project_inplace(Eigen::MatrixXd &H_f, Eigen::Matri
   // Based on "Matrix Computations 4th Edition by Golub and Van Loan"
   // See page 252, Algorithm 5.2.4 for how these two loops work
   // They use "matlab" index notation, thus we need to subtract 1 from all index
+  // ---------------------------------------------------------------------------
+  // [中文] 左零空间投影 (MSCKF 核心): 找 N_L 使 N_L^T · H_f = 0, 然后左乘到 (H_x, res)
+  //        上, 消掉 H_f (即把特征自由度从 EKF 状态里剥离)。
+  //  数学上 N_L 是 H_f 的左零空间基, 这里用 Givens 旋转原地把 H_f 上三角化:
+  //    对每列 n (0..2), 从底往上对相邻行做 Givens, 让 H_f(m, n) 归零;
+  //    同一旋转同步作用到 H_x, res, 以保持等式成立。
+  //  最终 H_f 的前 `cols` 行被压缩成上三角 (可丢弃), 剩下的就是零空间投影后的观测。
+  //  详细推导: 参考 docs-cn/measurement_math.md §3 "左零空间投影 (MSCKF 的灵魂)"。
+  // ---------------------------------------------------------------------------
   Eigen::JacobiRotation<double> tempHo_GR;
   for (int n = 0; n < H_f.cols(); ++n) {
     for (int m = (int)H_f.rows() - 1; m > n; m--) {
@@ -463,6 +499,13 @@ void UpdaterHelper::measurement_compress_inplace(Eigen::MatrixXd &H_x, Eigen::Ve
   // Based on "Matrix Computations 4th Edition by Golub and Van Loan"
   // See page 252, Algorithm 5.2.4 for how these two loops work
   // They use "matlab" index notation, thus we need to subtract 1 from all index
+  // ---------------------------------------------------------------------------
+  // [中文] QR 测量压缩: H_x (m×n, m>>n) 通过正交变换 Q^T 变成 [R; 0] (上三角+零),
+  //        同时对 res 左乘 Q^T, 保留前 n 行即可; 噪声协方差在 Q^T 下不变 (各向同性).
+  //  目的: 把 EKF 更新里的 m×m 求逆降到 n×n, 把 O(m^3) 降到 O(n^3) — 见 docs-cn/measurement_math.md §4.
+  //  实现上也是 Givens 原地消元, 与上面 nullspace_project_inplace 同一套代码模板, 只是
+  //  这里要消的是 H_x 下方的"多余行"而不是 H_f 的列。
+  // ---------------------------------------------------------------------------
   Eigen::JacobiRotation<double> tempHo_GR;
   for (int n = 0; n < H_x.cols(); n++) {
     for (int m = (int)H_x.rows() - 1; m > n; m--) {

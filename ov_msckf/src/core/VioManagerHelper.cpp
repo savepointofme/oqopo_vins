@@ -75,6 +75,20 @@ void VioManager::initialize_with_gt(Eigen::Matrix<double, 17, 1> imustate) {
   PRINT_DEBUG(GREEN "[INIT]: position = %.4f, %.4f, %.4f\n" RESET, state->_imu->pos()(0), state->_imu->pos()(1), state->_imu->pos()(2));
 }
 
+// =============================================================================
+// [中文] try_to_initialize
+//  初始化全过程:
+//   1. 若初始化线程正在执行, 仅把当前相机时间戳记入 camera_queue_init 后返回 false
+//   2. 若线程已成功过, 返回 true
+//   3. 否则启动一个新线程, 在里面调用 initializer->initialize:
+//        - 有 ZUPT -> wait_for_jerk = false (可在静止时立即初始化)
+//        - 无 ZUPT -> wait_for_jerk = true  (必须观测到加速度阶跃)
+//   4. 若初始化成功:
+//        - 将初始协方差写入 State
+//        - 把初始化过程中积压的相机时间戳 (camera_queue_init) 重放,
+//          通过 propagate_and_clone + marginalize_old_clone 把状态推到最新时刻
+//   5. 函数返回的是 thread_init_success 的"上一轮"结果, 真正的就绪判断靠下次调用
+// =============================================================================
 bool VioManager::try_to_initialize(const ov_core::CameraData &message) {
 
   // Directly return if the initialization thread is running

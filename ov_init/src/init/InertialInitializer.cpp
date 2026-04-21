@@ -76,6 +76,19 @@ void InertialInitializer::feed_imu(const ov_core::ImuData &message, double oldes
   }
 }
 
+// =============================================================================
+// [中文] initialize
+//  判断该用静态还是动态初始化, 并调用对应实现:
+//    Step 1  从特征数据库求出最新帧时间, 计算初始化窗口 [oldest_time, newest]
+//    Step 2  清理旧观测/旧 IMU
+//    Step 3  用 FeatureHelper::compute_disparity 分别求早期与晚期的平均视差:
+//              早期小 + 晚期小 → 系统一直静止 (is_still)
+//              早期小 + 晚期大 → 出现阶跃   (has_jerk)
+//              其他               → 运动中
+//    Step 4  结合 wait_for_jerk 选则:
+//              (has_jerk && wait_for_jerk) || (is_still && !wait_for_jerk) → 静态初始化
+//              其他 (有动态且开启动态初始化)                     → DynamicInitializer
+// =============================================================================
 bool InertialInitializer::initialize(double &timestamp, Eigen::MatrixXd &covariance, std::vector<std::shared_ptr<ov_type::Type>> &order,
                                      std::shared_ptr<ov_type::IMU> t_imu, bool wait_for_jerk) {
 
@@ -133,6 +146,8 @@ bool InertialInitializer::initialize(double &timestamp, Eigen::MatrixXd &covaria
   // Use our static initializer!
   // CASE1: if our disparity says we were static in last window and have moved in the newest, we have a jerk
   // CASE2: if both disparities are below the threshold, then the platform has been stationary during both periods
+  // [中文] 在 wait_for_jerk=true 模式下, 等候 CASE1 出现才能启动静态初始化 (防止把静止期间的 bias 与
+  //        重力洗头给状态); 开启 ZUPT 后则可用 wait_for_jerk=false, 在 CASE2 的静止状态下也直接初始化。
   bool has_jerk = (!disparity_detected_moving_1to0 && disparity_detected_moving_2to1);
   bool is_still = (!disparity_detected_moving_1to0 && !disparity_detected_moving_2to1);
   if (((has_jerk && wait_for_jerk) || (is_still && !wait_for_jerk)) && params.init_imu_thresh > 0.0) {
