@@ -64,6 +64,29 @@
 
 #include <Eigen/Eigen>
 
+// =============================================================================
+// [中文] quat_ops.h — JPL 四元数 / SO(3) / SE(3) 常用运算工具库
+//
+// 本文件是整个 OpenVINS 的反射式反射之处: 所有与旋转有关的运算 (转化、变换、指数对数) 都在这里。
+// 注意事项:
+//  1) JPL 约定: 四元数存储为 [q1, q2, q3, q4], 其中 q4 是标量部分 (Eigen 默认第 4 个元素).
+//     Hamilton 一般是 [q_w, q_x, q_y, q_z] (标量在前), 此处不同 — 写自己代码对接时务必小心。
+//  2) 约定下面的旋转是消极子约定 (passive): R * v_G 是把 G 系里的向量坐标改为 I 系里的坐标,
+//     与 Hamilton 的主动约定差一个转置.
+//  3) 所有数值实现都在小角度 (≈ 0) 时切到 Taylor 展开, 避免 0/0 异常。
+//  4) 下面有几个常用函数的高层含义摘要:
+//       - rot_2_quat(R)        :  R → q   (Trawny Eq.74)
+//       - quat_2_Rot(q)        :  q → R   (Trawny Eq.62)
+//       - quat_multiply(q, p)  :  四元数乘法 (Trawny Eq.9), JPL 下为左乘矩阵
+//       - Omega(w)             :  四元数对时间的导数矩阵 (Trawny Eq.48), q̇ = 0.5 * Ω * q
+//       - exp_so3(w)           :  so(3) → SO(3) (Rodrigues)
+//       - log_so3(R)           :  SO(3) → so(3)
+//       - exp_se3 / log_se3    :  SE(3) 上的指数/对数
+//       - Jl_so3 / Jr_so3      :  SO(3) 左/右雅可比, 用于误差状态传播中
+//       - skew_x / vee         :  反对称矩阵 «» 向量
+//       - Inv(q) / Inv_se3(T)  :  解析逆
+// =============================================================================
+
 namespace ov_core {
 
 /**
@@ -85,6 +108,11 @@ namespace ov_core {
  * @param[in] rot 3x3 rotation matrix
  * @return 4x1 quaternion
  */
+// [中文] rot_2_quat: 旋转矩阵 R → JPL 四元数 q=[q1,q2,q3,q4]。
+//   算法思路: 根据 R 的对角线与迹 T, 找出 |q_i| 最大的那个分量先开根号 (避免除 0),
+//   再用非对角线元素满足批量关系解出其余三个分量。
+//   最后强制 q4≥0 (统一符号) 并归一化。
+//   对应 Trawny Eq.74, 在 `math_foundations.md §1` 有用 JPL 或 Hamilton 的对比例子。
 inline Eigen::Matrix<double, 4, 1> rot_2_quat(const Eigen::Matrix<double, 3, 3> &rot) {
   Eigen::Matrix<double, 4, 1> q;
   double T = rot.trace();
@@ -132,6 +160,10 @@ inline Eigen::Matrix<double, 4, 1> rot_2_quat(const Eigen::Matrix<double, 3, 3> 
  * @param[in] w 3x1 vector to be made a skew-symmetric
  * @return 3x3 skew-symmetric matrix
  */
+// [中文] skew_x: 把 3×1 向量 w 变为 3×3 反对称矩阵 [w]×。
+//   [w]× 满足: [w]× v = w × v (叉乘), 也写作 w^\wedge 或 hat(w)。
+//   在 VIO 里无处不在: 雅可比计算, R 对 w 的求导, 四元数乘法, Trawny Eq.(48)等。
+//   对应 Trawny Eq.6。
 inline Eigen::Matrix<double, 3, 3> skew_x(const Eigen::Matrix<double, 3, 1> &w) {
   Eigen::Matrix<double, 3, 3> w_x;
   w_x << 0, -w(2), w(1), w(2), 0, -w(0), -w(1), w(0), 0;
@@ -149,6 +181,10 @@ inline Eigen::Matrix<double, 3, 3> skew_x(const Eigen::Matrix<double, 3, 1> &w) 
  * @param[in] q JPL quaternion
  * @return 3x3 SO(3) rotation matrix
  */
+// [中文] quat_2_Rot: JPL 四元数 q → 旋转矩阵 R。
+//   公式: R = (2 q4² - 1) I - 2 q4 [q_v]× + 2 q_v q_v^T  (Trawny Eq.62)
+//   其中 q_v = [q1, q2, q3]^T 是矢量部分, q4 是标量部分。
+//   注意 JPL 下这里的 R 用的是 passive 约定 (R = R_{GtoI} * v_G 给出 v_I)。
 inline Eigen::Matrix<double, 3, 3> quat_2_Rot(const Eigen::Matrix<double, 4, 1> &q) {
   Eigen::Matrix<double, 3, 3> q_x = skew_x(q.block(0, 0, 3, 1));
   Eigen::MatrixXd Rot = (2 * std::pow(q(3, 0), 2) - 1) * Eigen::MatrixXd::Identity(3, 3) - 2 * q(3, 0) * q_x +
@@ -177,6 +213,10 @@ inline Eigen::Matrix<double, 3, 3> quat_2_Rot(const Eigen::Matrix<double, 4, 1> 
  * @param[in] p Second JPL quaternion
  * @return 4x1 resulting q*p quaternion
  */
+// [中文] quat_multiply: JPL 四元数乘法 q ⊗ p。
+//   JPL 下 q ⊗ p 的动作顺序: R(q⊗p) = R(q) * R(p) (左连接), 与 Hamilton 的 p ⊗ q 对应。
+//   实现是把 q 写成 4×4 的左乘矩阵 L(q), 然后 L(q) * p。
+//   最后强制 q4≥0 并归一化, 保证表示唯一。对应 Trawny Eq.9。
 inline Eigen::Matrix<double, 4, 1> quat_multiply(const Eigen::Matrix<double, 4, 1> &q, const Eigen::Matrix<double, 4, 1> &p) {
   Eigen::Matrix<double, 4, 1> q_t;
   Eigen::Matrix<double, 4, 4> Qm;
@@ -202,6 +242,8 @@ inline Eigen::Matrix<double, 4, 1> quat_multiply(const Eigen::Matrix<double, 4, 
  * @param[in] w_x skew-symmetric matrix
  * @return 3x1 vector portion of skew
  */
+// [中文] vee: 反对称矩阵→向量, 是 skew_x 的逆操作。
+//   直接从 [w]× 的三个非零位置 (2,1) (0,2) (1,0) 取出 w 的三个分量。
 inline Eigen::Matrix<double, 3, 1> vee(const Eigen::Matrix<double, 3, 3> &w_x) {
   Eigen::Matrix<double, 3, 1> w;
   w << w_x(2, 1), w_x(0, 2), w_x(1, 0);
@@ -228,6 +270,10 @@ inline Eigen::Matrix<double, 3, 1> vee(const Eigen::Matrix<double, 3, 3> &w_x) {
  * @param[in] w 3x1 vector in R(3) we will take the exponential of
  * @return SO(3) rotation matrix
  */
+// [中文] exp_so3: 指数映射 so(3) → SO(3) (Rodrigues 公式)。
+//   R = I + (sinθ/θ) [w]× + ((1-cosθ)/θ²) [w]×²,  θ = |w|
+//   用处: EKF 误差状态执行时把旋转误差 δθ 带回名义值: q←q⊗exp(δθ/2), R←exp(δθ)R。
+//   小角度 (θ<1e-7): A≈1, B≈0.5 避免 0/0。
 inline Eigen::Matrix<double, 3, 3> exp_so3(const Eigen::Matrix<double, 3, 1> &w) {
   // get theta
   Eigen::Matrix<double, 3, 3> w_x = skew_x(w);
@@ -270,6 +316,11 @@ inline Eigen::Matrix<double, 3, 3> exp_so3(const Eigen::Matrix<double, 3, 1> &w)
  * @param[in] R 3x3 SO(3) rotation matrix
  * @return 3x1 in the R(3) space [omegax, omegay, omegaz]
  */
+// [中文] log_so3: 对数映射 SO(3) → so(3)。
+//   正常情况: θ = arccos((tr(R)-1)/2),   [w]× = (θ / (2 sinθ)) (R - R^T)
+//   当 θ → 0: 用 Taylor 展开 magnitude ≈ 0.5 - (tr-3)/12, 代替除法。
+//   当 θ → π (tr → -1): 进入特殊分支 —— 此时 (R-R^T)/(2sinθ) 分母近 0, 改用角等于π的特殊公式
+//   跟 GTSAM 一致, 数值稳定。
 inline Eigen::Matrix<double, 3, 1> log_so3(const Eigen::Matrix<double, 3, 3> &R) {
 
   // note switch to base 1
@@ -329,6 +380,10 @@ inline Eigen::Matrix<double, 3, 1> log_so3(const Eigen::Matrix<double, 3, 3> &R)
  * @param vec 6x1 in the R(6) space [omega, u]
  * @return 4x4 SE(3) matrix
  */
+// [中文] exp_se3: se(3) → SE(3) 的指数映射。
+//   输入 [w, u] 是 6 维误差 (w 是旋转, u 是平移引导),
+//   输出 4×4 的 T = [[R, V*u], [0, 1]], 其中 R = exp(w), V = I + B[w]× + C[w]×²。
+//   V 也是 SO(3) 的左雅可比 Jl 的简化版本。
 inline Eigen::Matrix4d exp_se3(Eigen::Matrix<double, 6, 1> vec) {
 
   // Precompute our values
@@ -436,6 +491,8 @@ inline Eigen::Matrix4d hat_se3(const Eigen::Matrix<double, 6, 1> &vec) {
  * @param[in] T SE(3) matrix
  * @return inversed SE(3) matrix
  */
+// [中文] Inv_se3: SE(3) 解析逆, 比 .inverse() 数值更稳 (见 GitHub issue #12)。
+//   T = [R | p; 0 | 1]  ⇒  T^{-1} = [R^T | -R^T p; 0 | 1]。
 inline Eigen::Matrix4d Inv_se3(const Eigen::Matrix4d &T) {
   Eigen::Matrix4d Tinv = Eigen::Matrix4d::Identity();
   Tinv.block(0, 0, 3, 3) = T.block(0, 0, 3, 3).transpose();
@@ -454,6 +511,9 @@ inline Eigen::Matrix4d Inv_se3(const Eigen::Matrix4d &T) {
  * @param[in] q quaternion we want to change
  * @return inversed quaternion
  */
+// [中文] Inv: JPL 四元数逆 (矢量部分取反, 标量部分不变)。
+//   对于单位四元数 共轭 == 逆, 且 R(q^{-1}) = R(q)^T。
+//   对应 Trawny Eq.21。
 inline Eigen::Matrix<double, 4, 1> Inv(Eigen::Matrix<double, 4, 1> q) {
   Eigen::Matrix<double, 4, 1> qinv;
   qinv.block(0, 0, 3, 1) = -q.block(0, 0, 3, 1);
@@ -479,6 +539,10 @@ inline Eigen::Matrix<double, 4, 1> Inv(Eigen::Matrix<double, 4, 1> q) {
  * @param w Angular velocity
  * @return The matrix \f$\boldsymbol{\Omega}\f$
  */
+// [中文] Omega(w): 构造 4×4 四元数导数矩阵。
+//   JPL 约定下 q 的微分方程: q̇ = 0.5 * Ω(w) * q   (Trawny Eq.48)
+//   形式: Ω(w) = [[-[w]×, w]; [-w^T, 0]]
+//   Propagator 里用 Ω 构造矩阵指数 exp(0.5ΩΔt), 进而推进四元数。
 inline Eigen::Matrix<double, 4, 4> Omega(Eigen::Matrix<double, 3, 1> w) {
   Eigen::Matrix<double, 4, 4> mat;
   mat.block(0, 0, 3, 3) = -skew_x(w);
@@ -493,6 +557,8 @@ inline Eigen::Matrix<double, 4, 4> Omega(Eigen::Matrix<double, 3, 1> w) {
  * @param q_t Quaternion to normalized
  * @return Normalized quaterion
  */
+// [中文] quatnorm: 强制单位化 + 强制 q4≥0, 返回单位且唯一的 JPL 四元数。
+//   每次 propagate/update 后建议调用, 避免浮点累计误差导致 |q| 偏离 1。
 inline Eigen::Matrix<double, 4, 1> quatnorm(Eigen::Matrix<double, 4, 1> q_t) {
   if (q_t(3, 0) < 0) {
     q_t *= -1;
@@ -512,6 +578,9 @@ inline Eigen::Matrix<double, 4, 1> quatnorm(Eigen::Matrix<double, 4, 1> q_t) {
  * @param w axis-angle
  * @return The left Jacobian of SO(3)
  */
+// [中文] Jl_so3: SO(3) 的左雅可比 (left Jacobian), Barfoot Eq.(7.77b)。
+//   用处: EKF 系统将误差在状态切空间上传播时, 与指数映射一起出现; 在预积分中也用。
+//   小角度时退化到 I。
 inline Eigen::Matrix<double, 3, 3> Jl_so3(const Eigen::Matrix<double, 3, 1> &w) {
   double theta = w.norm();
   if (theta < 1e-6) {
@@ -534,6 +603,7 @@ inline Eigen::Matrix<double, 3, 3> Jl_so3(const Eigen::Matrix<double, 3, 1> &w) 
  * @param w axis-angle
  * @return The right Jacobian of SO(3)
  */
+// [中文] Jr_so3: SO(3) 右雅可比。恒等式 Jr(w) = Jl(-w).
 inline Eigen::Matrix<double, 3, 3> Jr_so3(const Eigen::Matrix<double, 3, 1> &w) { return Jl_so3(-w); }
 
 /**
@@ -546,6 +616,10 @@ inline Eigen::Matrix<double, 3, 3> Jr_so3(const Eigen::Matrix<double, 3, 1> &w) 
  * @param rot SO(3) rotation matrix
  * @return roll, pitch, yaw values (in that order)
  */
+// [中文] rot2rpy: 从 R 提取 roll, pitch, yaw (顺序 R = Rz(yaw)*Ry(pitch)*Rx(roll))。
+//   注意: 编号顺序, 返回值 (0,0)=roll, (1,0)=pitch, (2,0)=yaw。
+//   Gimbal lock (cos(pitch) ≈ 0) 时 yaw 强制设 0。
+//   一般只用于调试打印和可视化, 滤波内部不用 rpy。
 inline Eigen::Matrix<double, 3, 1> rot2rpy(const Eigen::Matrix<double, 3, 3> &rot) {
   Eigen::Matrix<double, 3, 1> rpy;
   rpy(1, 0) = atan2(-rot(2, 0), sqrt(rot(0, 0) * rot(0, 0) + rot(1, 0) * rot(1, 0)));

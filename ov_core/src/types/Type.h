@@ -34,6 +34,22 @@ namespace ov_type {
  * Each variable is defined by its error state size and its location in the covariance matrix.
  * We additionally require all sub-types to have a update procedure.
  */
+// =============================================================================
+// [中文] Type — 所有状态对象的抽象基类 (IMU / PoseJPL / JPLQuat / Vec / Landmark …)
+//
+// 核心字段:
+//   _value : 名义值 (如四元数 4维, 位置 3维), 存储于 Eigen 矩阵。
+//   _fej   : First-Estimate Jacobian 的锁值 —— 对每个可观性敏感的状态在第一次估计时的快照,
+//            EKF/MSCKF 计算雅可比时用 _fej (非 _value), 避免性 "假 info" 带入不可观方向。
+//   _id    : 在全局 _Cov 矩阵中的起始行/列索引, -1 表示对象不在当前滤波器状态中。
+//   _size  : 误差维度 (切空间维度). 对于四元数 _value=4 而 _size=3。
+//
+// 核心接口:
+//   update(dx)    : Boxplus 操作, 把误差 dx (维度=_size) 注入到名义值里。
+//   set_value/set_fej: 直接覆盖名义值或 FEJ 副本 (由初始化、克隆入口使用)。
+//   clone()       : 深拷贝, 用于 MSCKF 滑窗内克隆当前位姿。
+//   check_if_subvariable: 用于 StateHelper 检查 "某指针是不是我管理的子件"。
+// =============================================================================
 class Type {
 
 public:

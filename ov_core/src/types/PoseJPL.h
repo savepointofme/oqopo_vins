@@ -34,9 +34,22 @@ namespace ov_type {
  * Internally we use a JPLQuat quaternion representation for the orientation and 3D Vec position.
  * Please see JPLQuat for details on its update procedure and its left multiplicative error.
  */
+// =============================================================================
+// [中文] PoseJPL — 6 自由度刚体位姿对象 (q + p), IMU/克隆/外参等处都复用。
+//
+// 名义维度 (_value, 7): [q(4), p(3)]
+// 误差维度 (size=6):    [δθ(3), δp(3)]
+// 内部持有两个 Type 子变量:
+//   _q : JPLQuat  (4→3, 左乘扰动, JPL 约定)
+//   _p : Vec(3)   (3→3, 加法扰动)
+// 设 _id 时先给 q (_id..+3), 再给 p (_id+3..+6), 所以 _Cov 里对应 6×6 块连续存储。
+//
+// update 注入同 IMU::update 的前 6 行: δθ → 左乘四元数, δp → 位置相加。
+// =============================================================================
 class PoseJPL : public Type {
 
 public:
+  // [中文] 默认姿态 q=(0,0,0,1) (单位四元数), 位置 p=0; FEJ 同步初始化。
   PoseJPL() : Type(6) {
 
     // Initialize subvariables
