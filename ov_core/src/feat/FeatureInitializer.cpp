@@ -27,6 +27,18 @@
 
 using namespace ov_core;
 
+// =============================================================================
+// [中文] single_triangulation — 3D 线性三角化 (DLT / midpoint 变形)
+//   几何直觉: 对每个观测视角, "真实特征点 p" 应当落在该相机中心出发、沿 bearing b_i
+//   的射线上; 即 skew(b_i) · (p - C_i) = 0 (共线约束)。堆叠 N 个视角:
+//       min_p  Σᵢ || ⌊b_iᵀ · (p - C_i) ||²       (最小二乘)
+//         ↔   A · p = b, 其中 A = Σ (⌊b_i⌋ᵀ ⌊b_i⌋), b = Σ (⌊b_i⌋ᵀ ⌊b_i⌋) · C_i
+//   实现细节: 挑观测最多的相机/帧为 anchor {A}, 把其他视角的 R, t, bearing 都转到
+//   {A} 系下求解 — 数值稳定性更好 (远离全局原点时尤其重要)。
+//   失败判定: (1) A 的条件数 > max_cond_number → 基线太短;
+//              (2) p.z ∉ [min_dist, max_dist] → 深度异常。
+//   详细推导 + 1D/GN 变体: docs-cn/feature_triangulation.md §1。
+// =============================================================================
 bool FeatureInitializer::single_triangulation(std::shared_ptr<Feature> feat,
                                               std::unordered_map<size_t, std::unordered_map<double, ClonePose>> &clonesCAM) {
 

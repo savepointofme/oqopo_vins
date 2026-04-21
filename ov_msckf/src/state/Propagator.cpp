@@ -513,6 +513,15 @@ void Propagator::predict_and_compute(std::shared_ptr<State> state, const ov_core
   state->_imu->set_fej(imu_x);
 }
 
+// =============================================================================
+// [中文] predict_mean_discrete — 零阶 IMU 积分 (假设 dt 内 w, a 为常数)
+//  旋转: Trawny indirect TR Eq.(101)
+//      q(t+dt) = [cos(½|ω|dt)·I_4 + sin(½|ω|dt)/|ω| · Ω(ω)] · q(t)
+//      |ω| → 0 时退化为  I_4 + ½·dt·Ω(ω)                       Eq.(103)
+//  速度: v(t+dt) = v(t) + R_Gtoiᵀ·a·dt - g·dt
+//  位置: p(t+dt) = p(t) + v·dt + ½·R_Gtoiᵀ·a·dt² - ½·g·dt²
+//  详见 docs-cn/propagation_math.md §2.1-2.2。
+// =============================================================================
 void Propagator::predict_mean_discrete(std::shared_ptr<State> state, double dt, const Eigen::Vector3d &w_hat, const Eigen::Vector3d &a_hat,
                                        Eigen::Vector4d &new_q, Eigen::Vector3d &new_v, Eigen::Vector3d &new_p) {
 
@@ -526,6 +535,7 @@ void Propagator::predict_mean_discrete(std::shared_ptr<State> state, double dt, 
   if (w_norm > 1e-12) {
     bigO = cos(0.5 * w_norm * dt) * I_4x4 + 1 / w_norm * sin(0.5 * w_norm * dt) * Omega(w_hat);
   } else {
+    // [中文] 小角度退化 (|w|·dt 接近 0), 用一阶 Taylor 展开避免数值奇异 (0/0)。
     bigO = I_4x4 + 0.5 * dt * Omega(w_hat);
   }
   new_q = quatnorm(bigO * state->_imu->quat());
