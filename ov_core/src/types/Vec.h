@@ -29,6 +29,11 @@ namespace ov_type {
 /**
  * @brief Derived Type class that implements vector variables
  */
+// =============================================================================
+// [中文] Vec — 欧氏空间向量 (纯加法扰动), 是最简单的 Type 派生。
+//   用处: 速度、陀螺/加速度偏置、时间偏移、相机内参、特征 XYZ (Landmark) 等。
+//   _value 与 _size 相同, update(dx) 就是 v ← v + dx, FEJ 同形。
+// =============================================================================
 class Vec : public Type {
 
 public:

@@ -51,6 +51,21 @@ class Feature;
  * The feature trackers will continue to add features while you update, whose measurements can be used in the next update step!
  *
  */
+// =============================================================================
+// [中文] FeatureDatabase — 前端特征的库 (共享于所有跟踪器 / 滤波器)
+//
+// 定位: Frontend 插入 + Backend 查询/清理的中间层。
+//   - TrackBase (KLT / Descriptor / Aruco) 每帧进来调 update_feature 写入;
+//   - VioManager/Initializer 用 features_containing / features_not_containing_newer 等查询;
+//   - 更新后用 cleanup / cleanup_measurements 删除过期观测。
+//
+// 内部结构:
+//   features_idlookup : feat_id → shared_ptr<Feature>  (Feature 内部存多帧多相机的 uv/uv_norm)
+//   mtx               : 保护映射的互斥锁, 适应跟踪线程+滤波线程异步访问。
+//
+// 线程安全契约: 返回的 shared_ptr<Feature> 指向库里的原本。如果是异步使用, 一定要传 remove=true,
+// 这样库里引用移除, 后续 TrackBase 再 push 新观测也不会改写你手上的特征。
+// =============================================================================
 class FeatureDatabase {
 
 public:
@@ -113,6 +128,10 @@ public:
    * This function will return all features that have the specified time in them.
    * This would be used to get all features that occurred at a specific clone/state.
    */
+  // [中文] features_containing: 取所有 "在 timestamp 那一帧被观测到" 的特征。
+  //   用来建特定 clone 位姿的观测连接 (比如 MSCKF 对一个克隆的全特征更新)。
+  //   remove=true       会从库里引用移除该特征 (避免事后被跟踪线程改写)。
+  //   skip_deleted=true 则跳过已被标记删除的特征 (竞争下很颇重要)。
   std::vector<std::shared_ptr<Feature>> features_containing(double timestamp, bool remove = false, bool skip_deleted = false);
 
   /**
@@ -120,11 +139,17 @@ public:
    *
    * If a feature was unable to be used, it will still remain since it will not have a delete flag set
    */
+  // [中文] cleanup: 清理已标记 to_delete 的特征 (MSCKF 更新后的清扫)。
+  //   没被用到的特征不会动 — 等后续帧继续观测或变老后被 cleanup_measurements 清除。
   void cleanup();
 
   /**
    * @brief This function will delete all feature measurements that are older then the specified timestamp
    */
+  // [中文] cleanup_measurements: 清理在 timestamp 之前的所有观测记录。
+  //   用于滤波滑窗向前推进时, 丢掉 "不再在序列里" 的历史观测 (限制内存 + 避免旧数据干扰)。
+  //   注意: 只删某条特征内部的旧观测, 特征本身保留 (可能仍有新观测); 若特征观测列表清空才删除。
+  //   初始化中 InertialInitializer::initialize Step 2 会调用它, 保证窗口规范。
   void cleanup_measurements(double timestamp);
 
   /**
@@ -143,6 +168,8 @@ public:
   /**
    * @brief Returns the internal data (should not normally be used)
    */
+  // [中文] get_internal_data: 返回整个 feat_id→Feature 的映射的 "浅拷贝" (shared_ptr 拷贝)。
+  //   一般用在 InertialInitializer 里扫描最新相机帧时间, 不推荐热点路径上小调。
   std::unordered_map<size_t, std::shared_ptr<Feature>> get_internal_data() {
     std::lock_guard<std::mutex> lck(mtx);
     return features_idlookup;

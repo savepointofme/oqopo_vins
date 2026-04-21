@@ -32,6 +32,20 @@ namespace ov_init {
 
 /**
  * @brief JPL quaternion CERES state parameterization
+ *
+ * [中文] State_JPLQuatLocal — 把 JPL 单位四元数接入 Ceres 的 local parameterization / Manifold
+ *
+ *   背景: Ceres 默认把参数当作欧氏向量去优化, 所以 4 维四元数需要一个 "投影回单位球面" 的操作。
+ *         同时 ceres 对局部坐标的雅可比只关心 "3 维误差 → 4 维参数" 这一步。
+ *
+ *   Plus (x, delta, x_plus_delta):
+ *     q_new = norm([0.5 * delta; 1]) ⊗ q     // 左乘小扰动, 归一化
+ *
+ *   ComputeJacobian / PlusJacobian:
+ *     返回 4×3 的 [I_3; 0]^T (粗略思路: 我们用 "trick", 让 Evaluate 返回的 dr/d(local) 就是实际的局部雅可比,
+ *     所以 ceres 要求的 dr/d(global) * d(global)/d(local) 变成 dr/d(local) * I, 两边一致)
+ *
+ *   Minus / MinusJacobian (仅 Ceres >= 2.2): q2 ⊖ q1 = 2 * vec(q2 ⊗ q1^{-1}), 给 AutoDiff 反向使用。
  */
 #if CERES_VERSION_MAJOR == 2 && CERES_VERSION_MINOR >= 2
 class State_JPLQuatLocal : public ceres::Manifold {

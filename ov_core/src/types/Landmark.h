@@ -36,6 +36,29 @@ namespace ov_type {
  * Additionally if this is an anchored representation we store what clone timestamp this is anchored from and what camera.
  * If this features should be marginalized its flag can be set and during cleanup it will be removed.
  */
+// =============================================================================
+// [中文] Landmark — 持久化到滤波器里的 SLAM 特征点 (不同于 MSCKF 临时特征)
+//
+// 继承关系: Landmark → Vec → Type
+//
+// 关键字段:
+//   _featid                : 与前端跟踪器对应的全局特征 ID, 用来在观测帧之间关联。
+//   _unique_camera_id      : 这条 SLAM 特征最先是从哪个相机看到的 (立体/多相机时区分)。
+//   _anchor_cam_id         : 若使用锚点 (anchored) 表示, 此为锚相机 id; 默认 = 首次观测相机。
+//   _anchor_clone_timestamp: 锚点对应的位姿克隆时间戳 (状态里 _clones_IMU[t] 为锚位姿)。
+//   has_had_anchor_change  : 锚点是否被迁移过 (边缘化老锚时会切换)。
+//   should_marg            : 该特征是否即将被边缘化 (在 StateHelper 清理时删除)。
+//   update_fail_count      : 连续更新失败次数 (如卡方门限拒绝), 超过阈值直接 marg。
+//   uv_norm_zero(_fej)     : 首次观测时的归一化像素 (用于 1D-inverse-depth 表示)。
+//   _feat_representation   : 表示类型 (GLOBAL_3D / GLOBAL_INV / ANCHORED_3D / ANCHORED_INV / ...).
+//
+// 维度根据表示类型不同:
+//   - GLOBAL_3D / ANCHORED_3D      : _size = 3  (x, y, z)
+//   - GLOBAL_INVERSE_DEPTH         : _size = 3  (azimuth, elevation, 1/depth)  —— 用球坐标 + 逆深度
+//   - ANCHORED_INVERSE_DEPTH_SINGLE: _size = 1  (1/depth, 方向已固定)
+//
+// 锚点表示的好处: 将特征绑定在某个克隆位姿上, 这样全局线性化点不动 → 更好的可观性。
+// =============================================================================
 class Landmark : public Vec {
 
 public:

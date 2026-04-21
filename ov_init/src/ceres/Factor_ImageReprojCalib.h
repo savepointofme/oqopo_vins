@@ -37,6 +37,29 @@ namespace ov_init {
 
 /**
  * @brief Factor of feature bearing observation (raw) with calibration
+ *
+ * [中文] Factor_ImageReprojCalib — 带在线标定的像素重投影因子 (Ceres CostFunction)
+ *
+ *   残差: r = sqrtQ * (uv_meas - project_distort(q_ItoC, p_IinC, q_GtoIi, p_IiinG, p_FinG, intrinsics))
+ *
+ *   参数块顺序 (evaluate 时 parameters 的顺序):
+ *     [0] q_GtoIi    (JPL 四元数, 4-dim, 用 State_JPLQuatLocal 做 local param)
+ *     [1] p_IiinG    (3-dim)
+ *     [2] p_FinG     (3-dim, 特征在全局系的位置)
+ *     [3] q_ItoC     (JPL 四元数, 4-dim, 相机-IMU 外参旋转)
+ *     [4] p_IinC     (3-dim, 相机-IMU 外参平移, 注意方向是 IMU 在相机下)
+ *     [5] intrinsics (8-dim: fx,fy,cx,cy 加 4 个畸变系数)
+ *
+ *   雅可比链:
+ *     d(r)/d(pose)   : 通过投影 dpi/dpc 乘上 d(p_FinC)/d(pose)
+ *     d(r)/d(p_FinG) : 投影 dpi/dpc 乘上 R_ItoC * R_GtoIi
+ *     d(r)/d(calib)  : 外参部分类似, 内参直接对 fx/fy/cx/cy/distortion 求偏导
+ *
+ *   gate: 给每个残差一个 "开关" (0/1), 用于在 Ceres 运行中跳过坏观测而不重新构造 Problem。
+ *
+ *   is_fisheye: 决定内部用 CamRadtan 还是 CamEqui 做去/加畸变, 二者的雅可比公式不同。
+ *
+ *   sqrtQ: 测量噪声协方差的 Cholesky 因子 (1/pix_sigma * I 2x2), 用来把像素观测归一化成单位方差。
  */
 class Factor_ImageReprojCalib : public ceres::CostFunction {
 public:
