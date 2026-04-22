@@ -1,0 +1,38 @@
+%YAML:1.0
+
+# User drone fisheye stereo camera (bright = cam0, right = cam1).
+# Converted from: 2026-03-19-11-54-33-camchain-imucam.yaml (kalibr T_cam_imu)
+# OpenVINS wants T_imu_cam (R_CtoI + p_CinI), which kalibr gives as T_ic.
+# Values below are T_ic directly from the calibration report.
+
+cam0:
+  # R_CtoI | p_CinI  (cam0 = /fisheye/bright/image_raw/compressed)
+  T_imu_cam:
+    - [-0.01924043, -0.99971664, -0.01401617,  0.01886278]
+    - [-0.99974170,  0.01906751,  0.01236743, -0.04315308]
+    - [-0.01209667,  0.01425051, -0.99982528, -0.00998189]
+    - [ 0.0,         0.0,         0.0,         1.0       ]
+  cam_overlaps: [1]
+  camera_model: pinhole
+  distortion_coeffs: [-0.07259044130444889, 0.06119107735693106, -0.08956081206218665, 0.03968380613225426]
+  distortion_model: equidistant
+  intrinsics: [398.5485564814223, 395.7016118644858, 540.5956428728974, 445.40757866104366]
+  resolution: [1088, 880]
+  rostopic: /fisheye/bright/image_raw
+  timeshift_cam_imu: 0.013086867728169357
+
+cam1:
+  # R_CtoI | p_CinI  (cam1 = /fisheye/right/image_raw/compressed)
+  T_imu_cam:
+    - [-0.02233932, -0.99931644, -0.02945508,  0.02024096]
+    - [-0.99973831,  0.02247451, -0.00426646,  0.04675803]
+    - [ 0.00492553,  0.02935207, -0.99955700, -0.01030187]
+    - [ 0.0,         0.0,         0.0,         1.0       ]
+  cam_overlaps: [0]
+  camera_model: pinhole
+  distortion_coeffs: [-0.051251885718943395, -0.023814932705146844, 0.026973370858092642, -0.012491649683378861]
+  distortion_model: equidistant
+  intrinsics: [398.139517022003, 395.1082418498847, 540.1159447831735, 475.83093570466576]
+  resolution: [1088, 880]
+  rostopic: /fisheye/right/image_raw
+  timeshift_cam_imu: 0.013080436567075273

@@ -94,6 +94,13 @@ struct VioManagerOptions {
   /// If we should only use the zupt at the very beginning static initialization phase
   bool zupt_only_at_beginning = false;
 
+  /// Altitude threshold above which ZUPT is unconditionally rejected (default 0 = disabled).
+  /// Rationale: for down-facing fisheye on a drone doing slow vertical climb, optical flow
+  /// is nearly radial with very small disparity, so the disparity-based ZUPT gate mis-fires
+  /// and pegs velocity to 0, causing a ≈1/2 scale error on the whole trajectory.
+  /// Setting this to e.g. 1.0 m means "once the drone is definitely airborne, never ZUPT again".
+  double zupt_max_altitude = 0.0;
+
   /// If we should record the timing performance to file
   bool record_timing_information = false;
 
@@ -117,6 +124,7 @@ struct VioManagerOptions {
       parser->parse_config("zupt_noise_multiplier", zupt_noise_multiplier);
       parser->parse_config("zupt_max_disparity", zupt_max_disparity);
       parser->parse_config("zupt_only_at_beginning", zupt_only_at_beginning);
+      parser->parse_config("zupt_max_altitude", zupt_max_altitude, false);
       parser->parse_config("record_timing_information", record_timing_information);
       parser->parse_config("record_timing_filepath", record_timing_filepath);
     }
@@ -126,6 +134,7 @@ struct VioManagerOptions {
     PRINT_DEBUG("  - zupt_noise_multiplier: %.2f\n", zupt_noise_multiplier);
     PRINT_DEBUG("  - zupt_max_disparity: %.4f\n", zupt_max_disparity);
     PRINT_DEBUG("  - zupt_only_at_beginning?: %d\n", zupt_only_at_beginning);
+    PRINT_DEBUG("  - zupt_max_altitude: %.2f m (0=disabled)\n", zupt_max_altitude);
     PRINT_DEBUG("  - record timing?: %d\n", (int)record_timing_information);
     PRINT_DEBUG("  - record timing filepath: %s\n", record_timing_filepath.c_str());
   }

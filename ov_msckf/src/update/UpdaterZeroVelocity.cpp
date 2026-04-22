@@ -41,9 +41,9 @@ using namespace ov_msckf;
 
 UpdaterZeroVelocity::UpdaterZeroVelocity(UpdaterOptions &options, NoiseManager &noises, std::shared_ptr<ov_core::FeatureDatabase> db,
                                          std::shared_ptr<Propagator> prop, double gravity_mag, double zupt_max_velocity,
-                                         double zupt_noise_multiplier, double zupt_max_disparity)
+                                         double zupt_noise_multiplier, double zupt_max_disparity, double zupt_max_altitude)
     : _options(options), _noises(noises), _db(db), _prop(prop), _zupt_max_velocity(zupt_max_velocity),
-      _zupt_noise_multiplier(zupt_noise_multiplier), _zupt_max_disparity(zupt_max_disparity) {
+      _zupt_noise_multiplier(zupt_noise_multiplier), _zupt_max_disparity(zupt_max_disparity), _zupt_max_altitude(zupt_max_altitude) {
 
   // Gravity
   _gravity << 0.0, 0.0, gravity_mag;
@@ -74,6 +74,20 @@ bool UpdaterZeroVelocity::try_update(std::shared_ptr<State> state, double timest
   if (state->_timestamp == timestamp) {
     last_zupt_state_timestamp = 0.0;
     return false;
+  }
+
+  // Altitude gate: if configured, reject ZUPT when the drone is clearly airborne.
+  // For down-facing fisheye on slow vertical climb, disparity is near-radial and small,
+  // so the feature-disparity gate mis-fires and pegs velocity to 0 -> ~1/2 scale error.
+  // This gate unconditionally short-circuits that failure mode once altitude > threshold.
+  if (_zupt_max_altitude > 0.0) {
+    double altitude = state->_imu->pos()(2);
+    if (altitude > _zupt_max_altitude) {
+      PRINT_DEBUG(YELLOW "[ZUPT]: rejected by altitude gate (%.2f m > %.2f m)\n" RESET, altitude, _zupt_max_altitude);
+      last_zupt_state_timestamp = 0.0;
+      last_zupt_count = 0;
+      return false;
+    }
   }
 
   // Set the last time offset value if we have just started the system up

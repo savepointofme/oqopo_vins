@@ -159,7 +159,8 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   if (params.try_zupt) {
     updaterZUPT = std::make_shared<UpdaterZeroVelocity>(params.zupt_options, params.imu_noises, trackFEATS->get_feature_database(),
                                                         propagator, params.gravity_mag, params.zupt_max_velocity,
-                                                        params.zupt_noise_multiplier, params.zupt_max_disparity);
+                                                        params.zupt_noise_multiplier, params.zupt_max_disparity,
+                                                        params.zupt_max_altitude);
   }
 }
 
@@ -206,7 +207,8 @@ void VioManager::feed_measurement_simulation(double timestamp, const std::vector
     if (params.try_zupt) {
       updaterZUPT = std::make_shared<UpdaterZeroVelocity>(params.zupt_options, params.imu_noises, trackFEATS->get_feature_database(),
                                                           propagator, params.gravity_mag, params.zupt_max_velocity,
-                                                          params.zupt_noise_multiplier, params.zupt_max_disparity);
+                                                          params.zupt_noise_multiplier, params.zupt_max_disparity,
+                                                          params.zupt_max_altitude);
     }
     PRINT_WARNING(RED "[SIM]: casting our tracker to a TrackSIM object!\n" RESET);
   }
