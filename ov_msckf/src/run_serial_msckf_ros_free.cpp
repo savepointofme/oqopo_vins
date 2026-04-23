@@ -70,8 +70,16 @@ struct Args {
   std::string gt_path;
   std::string output_path = "traj_ros_free.txt";
   std::string video_path;
+  std::string video_cam_path;    // [中文] 仅相机 + 光流轨迹视频 (cam0/cam1 并排, 带 TrackBase 历史线)
+  int video_fps = 20;
   double align_seconds = 8.0;    // [中文] 初始化完成后收集多少秒数据再做 SE3 对齐
+  double start_time = 0.0;       // [中文] 跳过前 N 秒数据 (相对 bag 第一条 IMU), 用于复现 ROS bag_start 行为
   bool stereo = false;           // [中文] 使用 cam1 配对
+  bool gps_alt_update = false;   // [中文] 使用 GPS 高度作为 VIO EKF 1D 观测 (锁 z 漂移)
+  double gps_alt_sigma = 2.0;    // [中文] GPS 高度观测噪声 stddev (meters)
+  bool gps_pos_update = false;   // [中文] 使用 GPS 3D 位置 (xyz) 作为 EKF 观测 (真正稳 mono)
+  double gps_pos_sigma_xy = 2.0; // [中文] GPS 水平噪声 stddev
+  double gps_pos_sigma_z = 2.0;  // [中文] GPS 垂直噪声 stddev
   bool show = true;              // [中文] 显示窗口
   int dash_every = 1;            // [中文] 每 N 帧刷新仪表板
   bool verbose_timing = false;
@@ -87,9 +95,16 @@ void print_help() {
                "Optional:\n"
                "  --stereo              Use cam1 in addition to cam0 (must be in config as well)\n"
                "  --gps PATH            CSV: ts_ns, x, y, z  or  ts_ns, lat, lon, alt (WGS84)\n"
+               "  --gps-alt-update      Feed GPS altitude (z) as 1D EKF update (mono rescue)\n"
+               "  --gps-alt-sigma SIG   GPS altitude noise stddev meters (default 2.0)\n"
+               "  --gps-pos-update      Feed GPS 3D position (xyz) as EKF update (needs GPS-VIO align first)\n"
+               "  --gps-pos-sigma-xy S  GPS horizontal noise stddev meters (default 2.0)\n"
+               "  --gps-pos-sigma-z S   GPS vertical noise stddev meters (default 2.0)\n"
                "  --gt PATH             ASL 17-col ground truth CSV\n"
                "  --output PATH         Output TUM trajectory (default: traj_ros_free.txt)\n"
                "  --video PATH          Record dashboard to MP4\n"
+               "  --video-cam PATH      Record camera-only (cam0/cam1 w/ optical-flow tracks) to MP4\n"
+               "  --video-fps N         Video FPS (default 20)\n"
                "  --align-seconds X     Seconds of data to collect before SE3 align (default 8)\n"
                "  --no-display          Do not create a window (useful headless)\n"
                "  --dash-every N        Refresh dashboard every N camera frames (default 1)\n"
@@ -112,8 +127,16 @@ bool parse_args(int argc, char **argv, Args &a) {
     else if (s == "--gt") a.gt_path = next("--gt");
     else if (s == "--output") a.output_path = next("--output");
     else if (s == "--video") a.video_path = next("--video");
+    else if (s == "--video-cam") a.video_cam_path = next("--video-cam");
+    else if (s == "--video-fps") a.video_fps = std::atoi(next("--video-fps").c_str());
     else if (s == "--align-seconds") a.align_seconds = std::atof(next("--align-seconds").c_str());
+    else if (s == "--start-time") a.start_time = std::atof(next("--start-time").c_str());
     else if (s == "--stereo") a.stereo = true;
+    else if (s == "--gps-alt-update") a.gps_alt_update = true;
+    else if (s == "--gps-alt-sigma") a.gps_alt_sigma = std::atof(next("--gps-alt-sigma").c_str());
+    else if (s == "--gps-pos-update") a.gps_pos_update = true;
+    else if (s == "--gps-pos-sigma-xy") a.gps_pos_sigma_xy = std::atof(next("--gps-pos-sigma-xy").c_str());
+    else if (s == "--gps-pos-sigma-z") a.gps_pos_sigma_z = std::atof(next("--gps-pos-sigma-z").c_str());
     else if (s == "--no-display") a.show = false;
     else if (s == "--dash-every") a.dash_every = std::atoi(next("--dash-every").c_str());
     else if (s == "--verbose") a.verbose_timing = true;
@@ -183,6 +206,25 @@ int main(int argc, char **argv) {
   if (!args.gps_path.empty())
     DatasetReaderEuroc::load_gps(args.gps_path, gps);
 
+  // [中文] --start-time: 跳过前 N 秒的 IMU / cam0 / cam1 (相对 bag 第一条 IMU)
+  // 用于复现 ROS bag_start:=58 这种场景, 跳过放置静止段
+  if (args.start_time > 0.0 && !imu.empty()) {
+    double t0 = imu.front().timestamp;
+    double t_skip = t0 + args.start_time;
+    size_t imu_before = imu.size(), cam0_before = cam0.size(), cam1_before = cam1.size();
+    imu.erase(std::remove_if(imu.begin(), imu.end(),
+                              [t_skip](const DatasetReaderEuroc::ImuSample &s) { return s.timestamp < t_skip; }),
+               imu.end());
+    cam0.erase(std::remove_if(cam0.begin(), cam0.end(),
+                               [t_skip](const DatasetReaderEuroc::CamEntry &s) { return s.timestamp < t_skip; }),
+                cam0.end());
+    cam1.erase(std::remove_if(cam1.begin(), cam1.end(),
+                               [t_skip](const DatasetReaderEuroc::CamEntry &s) { return s.timestamp < t_skip; }),
+                cam1.end());
+    PRINT_INFO(CYAN "[ros-free] --start-time=%.1fs dropped imu=%zu cam0=%zu cam1=%zu entries\n" RESET,
+               args.start_time, imu_before - imu.size(), cam0_before - cam0.size(), cam1_before - cam1.size());
+  }
+
   // GT map keyed by time (VIO world = GT world approximately after align)
   std::map<double, Eigen::Vector3d> gt_pos_map;
   for (const auto &s : gt)
@@ -195,8 +237,15 @@ int main(int argc, char **argv) {
   VizDashboard::Options vo;
   vo.show_window = args.show;
   vo.video_path = args.video_path;
+  vo.video_fps = args.video_fps;
   VizDashboard dash(vo);
   TrajectoryAligner aligner;
+
+  // [中文] 可选: 额外录一个"纯相机 + 光流轨迹"视频 (cam0/cam1 并排, 由 VioManager
+  // 的 TrackBase::display_history 提供). 帧尺寸以第一帧为准.
+  cv::VideoWriter cam_writer;
+  cv::Size cam_video_size;
+  bool cam_writer_init = false;
 
   // -------------------- output file --------------------
   std::ofstream out(args.output_path);
@@ -207,16 +256,26 @@ int main(int argc, char **argv) {
   out << "# TUM traj (t x y z qx qy qz qw) in VIO (unaligned) frame\n";
   out << std::fixed << std::setprecision(9);
 
+  // [中文] debug: 记录每帧 ba/bg/|v| 到 side-file, 用于分析发散原因
+  std::ofstream debug_out(args.output_path + ".bias");
+  debug_out << "# t_cam vx vy vz bg_x bg_y bg_z ba_x ba_y ba_z\n";
+  debug_out << std::fixed << std::setprecision(6);
+
   // -------------------- timeline merge-sort --------------------
   // [中文] OpenVINS 滤波器完全由传感器时间戳驱动。我们把 IMU 样本和相机帧
   // 按时间戳合并排序后顺序喂入, 与 ROS 版本结果数值一致 (仅受初始化线程
   // 非确定性影响)。
-  size_t imu_i = 0, cam_i = 0, cam1_i = 0;
+  size_t imu_i = 0, cam_i = 0, cam1_i = 0, gps_i = 0;
   const double INF = std::numeric_limits<double>::infinity();
   double t_init_done = -1; // [中文] 滤波器完成初始化的时刻
   std::deque<std::pair<double, Eigen::Vector3d>> vio_for_align;
   int frame_idx = 0;
   int align_fit_count = 0;
+
+  // [中文] GPS 高度当 1D 观测量时: 用 VIO 初始化时刻附近的 GPS 高度作为参考零点,
+  // 后续全部减去它. 这样 VIO world frame (起飞点 z=0) 和 GPS alt 同基准.
+  double gps_alt_ref = std::numeric_limits<double>::quiet_NaN();
+  size_t gps_alt_feeds = 0, gps_alt_rejects = 0;
 
   auto maybe_align = [&](double t) {
     if (aligner.solved() || t_init_done < 0)
@@ -224,10 +283,14 @@ int main(int argc, char **argv) {
     if (t - t_init_done < args.align_seconds)
       return;
     std::vector<Eigen::Vector3d> pv, pg;
-    TrajectoryAligner::build_pairs(vio_for_align, gt_pos_map, 0.03, pv, pg);
+    // [中文] 先试 GT, 若没有则用 GPS (GPS 5Hz, 放宽容差到 0.15s)
+    const auto &align_map = gt_pos_map.empty() ? gps_pos_map : gt_pos_map;
+    double align_tol = gt_pos_map.empty() ? 0.15 : 0.03;
+    TrajectoryAligner::build_pairs(vio_for_align, align_map, align_tol, pv, pg);
     if (pv.size() >= 10) {
       if (aligner.solve(pv, pg)) {
-        PRINT_INFO(GREEN "[ros-free] SE3 alignment solved using %zu pairs\n" RESET, pv.size());
+        PRINT_INFO(GREEN "[ros-free] SE3 alignment solved using %zu pairs (%s)\n" RESET,
+                   pv.size(), gt_pos_map.empty() ? "GPS" : "GT");
         dash.set_alignment(aligner.R(), aligner.t(), true);
         align_fit_count = (int)pv.size();
       }
@@ -263,11 +326,14 @@ int main(int argc, char **argv) {
     msg.masks.push_back(cv::Mat::zeros(img0.size(), CV_8UC1));
 
     if (args.stereo && !cam1.empty()) {
-      // [中文] 找 cam1 中离 t_cam 最近的一帧
-      while (cam1_i + 1 < cam1.size() &&
-             std::fabs(cam1[cam1_i + 1].timestamp - t_cam) < std::fabs(cam1[cam1_i].timestamp - t_cam))
+      // [中文] Stereo 同步: ROS1 serial runner 策略 (ov_msckf/src/ros1_serial_msckf.cpp:
+      // 214-247). 向前搜索 cam1 直到时间戳 >= t_cam - 20ms, 若距离 < 20ms 就配对.
+      // 相比之前的 greedy 双向搜索, 这个单向 advance + lower_bound 对重复时间戳
+      // 鲁棒 (18r.bag 中 t≈95/164/199/262s 有 5 处重复 ts, 以前的 greedy 会永久
+      // 落后 1 帧导致 cam1 被全部丢弃).
+      while (cam1_i < cam1.size() && cam1[cam1_i].timestamp < t_cam - 0.02)
         cam1_i++;
-      if (std::fabs(cam1[cam1_i].timestamp - t_cam) < 0.01) {
+      if (cam1_i < cam1.size() && std::fabs(cam1[cam1_i].timestamp - t_cam) < 0.02) {
         cv::Mat img1 = cv::imread(cam1[cam1_i].image_path, cv::IMREAD_GRAYSCALE);
         if (!img1.empty()) {
           msg.sensor_ids.push_back(1);
@@ -285,6 +351,39 @@ int main(int argc, char **argv) {
     if (sys->initialized()) {
       if (t_init_done < 0)
         t_init_done = t_cam;
+
+      // [中文] GPS 高度 EKF 更新: 仅在 --gps-alt-update 开启且加载了 GPS 数据时
+      // 策略: 初始化后第一个靠近 t_cam 的 GPS 采样 -> 设为 gps_alt_ref.
+      // 之后每帧 cam update 后, 把 (最近一条 GPS alt - gps_alt_ref) 馈入滤波器.
+      if ((args.gps_alt_update || args.gps_pos_update) && !gps.empty()) {
+        // advance gps_i 到 <= t_cam 的最新一条
+        while (gps_i + 1 < gps.size() && gps[gps_i + 1].timestamp <= t_cam)
+          gps_i++;
+        double t_gps = gps[gps_i].timestamp;
+        Eigen::Vector3d xyz_raw = gps[gps_i].xyz;
+        if (std::fabs(t_gps - t_cam) < 0.10) {
+          // [中文] ALT-only 模式: 取 z 分量, 第一次记下参考点, 之后相对 feed
+          if (args.gps_alt_update && !args.gps_pos_update) {
+            if (std::isnan(gps_alt_ref)) {
+              gps_alt_ref = xyz_raw(2);
+              PRINT_INFO(GREEN "[GPS-ALT]: set reference alt=%.2fm at t=%.3f (VIO world z=0 -> GPS alt)\n" RESET,
+                         gps_alt_ref, t_gps);
+            }
+            double alt_z = xyz_raw(2) - gps_alt_ref;
+            sys->feed_measurement_gps_altitude(t_gps, alt_z, args.gps_alt_sigma);
+            gps_alt_feeds++;
+          }
+          // [中文] 3D pose 模式: 需要先等 SE3 对齐. 对齐后把 GPS xyz (ENU) 通过
+          // aligner 的 (R, t) 逆变换到 VIO world frame 再喂给 EKF.
+          // aligner: gt = R*vio + t => vio = R^T (gt - t)
+          if (args.gps_pos_update && aligner.solved()) {
+            Eigen::Vector3d gps_in_vio = aligner.R().transpose() * (xyz_raw - aligner.t());
+            Eigen::Vector3d sig(args.gps_pos_sigma_xy, args.gps_pos_sigma_xy, args.gps_pos_sigma_z);
+            sys->feed_measurement_gps_position(t_gps, gps_in_vio, sig);
+            gps_alt_feeds++;
+          }
+        }
+      }
       auto state = sys->get_state();
       Eigen::Matrix3d R_wi = state->_imu->Rot().transpose(); // [中文] _imu->Rot() 是 R_ItoG^T = R_GtoI
       // OpenVINS 约定: _imu->Rot() 返回 R_GtoI (global->imu). 作图要 R_ItoG = R_GtoI^T
@@ -302,6 +401,13 @@ int main(int argc, char **argv) {
       Eigen::Quaterniond q(Rwi);
       out << t_cam << ' ' << p_wi.x() << ' ' << p_wi.y() << ' ' << p_wi.z() << ' ' << q.x() << ' '
           << q.y() << ' ' << q.z() << ' ' << q.w() << '\n';
+
+      // [中文] bias debug log
+      Eigen::Vector3d bg = state->_imu->bias_g();
+      Eigen::Vector3d ba = state->_imu->bias_a();
+      debug_out << t_cam << ' ' << v_wi.x() << ' ' << v_wi.y() << ' ' << v_wi.z() << ' '
+                << bg.x() << ' ' << bg.y() << ' ' << bg.z() << ' '
+                << ba.x() << ' ' << ba.y() << ' ' << ba.z() << '\n';
 
       // dashboard data
       dash.update_vio_pose(t_cam, R_wi, p_wi, v_wi);
@@ -347,6 +453,48 @@ int main(int argc, char **argv) {
     else
       dash.update_image(t_cam, img0);
 
+    // [中文] cam-only 视频: 拿 VioManager 的历史 viz 图 (stereo panel + TrackBase
+    // 历史轨迹叠加), 加一行时间戳文字, 写入 MP4. 帧尺寸在首帧固化.
+    if (!args.video_cam_path.empty() && !hist.empty()) {
+      cv::Mat cam_frame;
+      if (hist.channels() == 1)
+        cv::cvtColor(hist, cam_frame, cv::COLOR_GRAY2BGR);
+      else
+        cam_frame = hist.clone();
+      // 顶部状态条
+      std::ostringstream os;
+      os << "t=" << std::fixed << std::setprecision(2) << t_cam;
+      if (sys->initialized()) {
+        auto st = sys->get_state();
+        os << "  alt=" << std::fixed << std::setprecision(1) << st->_imu->pos()(2) << "m"
+           << "  |v|=" << std::fixed << std::setprecision(2) << st->_imu->vel().norm() << "m/s";
+        os << "  init=ok";
+      } else {
+        os << "  init=waiting";
+      }
+      cv::putText(cam_frame, os.str(), cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.8,
+                  cv::Scalar(0, 255, 255), 2, cv::LINE_AA);
+      if (!cam_writer_init) {
+        cam_video_size = cam_frame.size();
+        int fourcc = cv::VideoWriter::fourcc('m', 'p', '4', 'v');
+        cam_writer.open(args.video_cam_path, fourcc, args.video_fps, cam_video_size, true);
+        if (!cam_writer.isOpened()) {
+          PRINT_WARNING(YELLOW "[ros-free] failed to open cam video writer: %s\n" RESET,
+                        args.video_cam_path.c_str());
+        } else {
+          PRINT_INFO(GREEN "[ros-free] writing cam video to %s @ %d fps, size %dx%d\n" RESET,
+                     args.video_cam_path.c_str(), args.video_fps, cam_video_size.width,
+                     cam_video_size.height);
+        }
+        cam_writer_init = true;
+      }
+      if (cam_writer.isOpened()) {
+        if (cam_frame.size() != cam_video_size)
+          cv::resize(cam_frame, cam_frame, cam_video_size);
+        cam_writer.write(cam_frame);
+      }
+    }
+
     frame_idx++;
     if (frame_idx % std::max(1, args.dash_every) == 0) {
       if (!dash.render_and_show(1)) {
@@ -363,6 +511,8 @@ int main(int argc, char **argv) {
   }
 
   out.close();
+  if (cam_writer.isOpened())
+    cam_writer.release();
   PRINT_INFO(GREEN "[ros-free] done. trajectory written to %s (frames=%d, aligned_pairs=%d)\n" RESET,
              args.output_path.c_str(), frame_idx, align_fit_count);
 

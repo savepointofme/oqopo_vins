@@ -189,6 +189,96 @@ void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
   }
 }
 
+void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude_z, double sigma) {
+
+  // 需要先初始化完成
+  if (!is_initialized_vio) {
+    return;
+  }
+
+  // [中文] 时间差容忍放宽到 200ms. GPS 5Hz 间隔 200ms, cam 20Hz 间隔 50ms.
+  // 调用方已经在最近的 cam 帧触发, 所以差值通常 < 100ms.
+  if (state->_timestamp < timestamp - 0.2 || state->_timestamp > timestamp + 0.2) {
+    PRINT_DEBUG(YELLOW "[GPS-ALT]: skip dt=%.3fs (state=%.3f meas=%.3f)\n" RESET,
+                state->_timestamp - timestamp, state->_timestamp, timestamp);
+    return;
+  }
+
+  // Measurement model: h(x) = p_IinG[2]
+  // Residual = z_meas - z_pred
+  // Jacobian H = [0, 0, 1] (w.r.t. position error state)
+  Eigen::Vector3d p_IinG = state->_imu->pos();
+  double z_pred = p_IinG(2);
+  double res_scalar = altitude_z - z_pred;
+
+  // H = 1 x 3, 只对 p 的 z 分量有偏导
+  Eigen::MatrixXd H = Eigen::MatrixXd::Zero(1, 3);
+  H(0, 2) = 1.0;
+
+  // R = 1 x 1
+  Eigen::MatrixXd R = Eigen::MatrixXd::Zero(1, 1);
+  R(0, 0) = std::pow(sigma, 2);
+
+  // residual vector
+  Eigen::VectorXd res = Eigen::VectorXd::Zero(1);
+  res(0) = res_scalar;
+
+  // H_order: 只更新 IMU 位置子状态
+  std::vector<std::shared_ptr<Type>> Hx_order;
+  Hx_order.push_back(state->_imu->p());
+
+  // [中文] Chi^2 gate. 用一个宽松的门 (chi2 < 10000) 只拒绝极端 spike (例如 GPS
+  // 时间偏错产生 100m 级残差). 我们不希望 VIO 已经错了、chi2 过严把所有正确的
+  // GPS 更新全拒掉 — 那样 GPS 高度永远不会把 VIO 拉回来.
+  Eigen::MatrixXd P = StateHelper::get_marginal_covariance(state, Hx_order);
+  double S = (H * P * H.transpose())(0, 0) + R(0, 0);
+  double chi2 = res_scalar * res_scalar / S;
+  if (chi2 > 10000.0) {
+    PRINT_INFO(YELLOW "[GPS-ALT]: REJECT res=%.2fm chi2=%.1f (P_zz=%.2f sigma_meas=%.2f)\n" RESET,
+               res_scalar, chi2, P(2, 2), std::sqrt(R(0, 0)));
+    return;
+  }
+
+  StateHelper::EKFUpdate(state, Hx_order, H, res, R);
+  PRINT_INFO(CYAN "[GPS-ALT]: t=%.3f meas=%.2fm pred=%.2fm res=%+.2fm chi2=%.1f P_zz=%.2f\n" RESET,
+             timestamp, altitude_z, z_pred, res_scalar, chi2, P(2, 2));
+}
+
+void VioManager::feed_measurement_gps_position(double timestamp, const Eigen::Vector3d &pos_in_VIO,
+                                               const Eigen::Vector3d &sigma_xyz) {
+  if (!is_initialized_vio)
+    return;
+  if (state->_timestamp < timestamp - 0.2 || state->_timestamp > timestamp + 0.2) {
+    PRINT_DEBUG(YELLOW "[GPS-3D]: skip dt=%.3fs\n" RESET, state->_timestamp - timestamp);
+    return;
+  }
+
+  Eigen::Vector3d p_pred = state->_imu->pos();
+  Eigen::Vector3d res_vec = pos_in_VIO - p_pred;
+
+  // H = [I_3]  (对 position error state 的偏导)
+  Eigen::MatrixXd H = Eigen::MatrixXd::Identity(3, 3);
+  Eigen::MatrixXd R = Eigen::MatrixXd::Zero(3, 3);
+  R(0, 0) = sigma_xyz(0) * sigma_xyz(0);
+  R(1, 1) = sigma_xyz(1) * sigma_xyz(1);
+  R(2, 2) = sigma_xyz(2) * sigma_xyz(2);
+
+  Eigen::VectorXd res = res_vec;
+  std::vector<std::shared_ptr<Type>> Hx_order;
+  Hx_order.push_back(state->_imu->p());
+
+  Eigen::MatrixXd P = StateHelper::get_marginal_covariance(state, Hx_order);
+  Eigen::MatrixXd S = H * P * H.transpose() + R;
+  double chi2 = res.transpose() * S.llt().solve(res);
+  if (chi2 > 30000.0) {
+    PRINT_INFO(YELLOW "[GPS-3D]: REJECT |res|=%.1fm chi2=%.1f\n" RESET, res.norm(), chi2);
+    return;
+  }
+  StateHelper::EKFUpdate(state, Hx_order, H, res, R);
+  PRINT_INFO(CYAN "[GPS-3D]: t=%.3f res=(%+.2f,%+.2f,%+.2f)m |res|=%.2f chi2=%.1f\n" RESET,
+             timestamp, res_vec(0), res_vec(1), res_vec(2), res_vec.norm(), chi2);
+}
+
 void VioManager::feed_measurement_simulation(double timestamp, const std::vector<int> &camids,
                                              const std::vector<std::vector<std::pair<size_t, Eigen::VectorXf>>> &feats) {
 

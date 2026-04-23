@@ -95,6 +95,36 @@ public:
    */
   void initialize_with_gt(Eigen::Matrix<double, 17, 1> imustate);
 
+  /**
+   * @brief Feed a scalar GPS altitude (world Z) measurement, performs a 1D EKF
+   *        update on the IMU position z component.
+   *
+   * 用途: mono VIO 下 accelerometer bias 不可观测导致 z 漂移. 把 GPS 高度当
+   * 单维观测量锁住 z 轴, 间接稳住 ba_y/ba_z 的估计.
+   *
+   * @param timestamp  Time (sec) of the GPS altitude sample (sensor-clock).
+   * @param altitude_z Altitude in VIO world frame (meters, ENU-up compatible).
+   *                   Caller must align to VIO origin (subtract init altitude).
+   * @param sigma      Measurement stddev (meters), e.g. 1.0-5.0 for RTK/GNSS.
+   */
+  void feed_measurement_gps_altitude(double timestamp, double altitude_z, double sigma);
+
+  /**
+   * @brief Feed a 3D GPS position measurement expressed in the VIO world frame.
+   *
+   * 前提: 调用方已经把 ENU 坐标通过 SE3 对齐旋转到 VIO world frame (即与
+   * state->_imu->pos() 同坐标系).
+   *
+   * 用途: mono VIO 下 ba_x/ba_y 不可观测 -> xy 必然漂移. GPS 高度仅锁 z, 要想
+   * 完全稳定 mono VIO 就必须把 GPS 全 3D 位置喂给 EKF.
+   *
+   * @param timestamp   Sensor-clock time (sec).
+   * @param pos_in_VIO  [x, y, z] meters, already rotated into VIO world frame.
+   * @param sigma_xyz   Per-axis stddev (meters). 典型 RTK 1m / 标准 GNSS 5m.
+   */
+  void feed_measurement_gps_position(double timestamp, const Eigen::Vector3d &pos_in_VIO,
+                                     const Eigen::Vector3d &sigma_xyz);
+
   /// If we are initialized or not
   bool initialized() { return is_initialized_vio && timelastupdate != -1; }
 
