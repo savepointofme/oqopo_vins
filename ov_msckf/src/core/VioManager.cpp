@@ -189,7 +189,9 @@ void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
   }
 }
 
-void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude_z, double sigma) {
+void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude_z, double sigma,
+                                               double chi2_gate, bool use_schmidt,
+                                               bool also_update_vz, bool range_mode) {
 
   // 需要先初始化完成
   if (!is_initialized_vio) {
@@ -204,28 +206,78 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
     return;
   }
 
-  // Measurement model: h(x) = p_IinG[2]
-  // Residual = z_meas - z_pred
-  // Jacobian H = [0, 0, 1] (w.r.t. position error state)
   Eigen::Vector3d p_IinG = state->_imu->pos();
-  double z_pred = p_IinG(2);
+  Eigen::Matrix3d R_GtoI = state->_imu->Rot();
+  // body z-axis expressed in world = R_ItoG * e_z = 3rd row of R_GtoI as column
+  const double r22 = R_GtoI(2, 2);   // cos(tilt) for a downward LRF pointing along -body_z
+
+  // H_order: active state variables included in the Jacobian
+  std::vector<std::shared_ptr<Type>> Hx_order;
+  Eigen::MatrixXd H;
+  double z_pred;
+
+  if (range_mode) {
+    // [C-mode] Range model: measurement = body-frame downward range to flat ground.
+    //   h(x) = (p_z - z_ground) / R_GtoI(2,2)
+    //   Bootstrap z_ground once from the first accepted sample so that any
+    //   VIO / altimeter origin mismatch is absorbed into z_ground (and NOT
+    //   into a large residual that would corrupt ba through cross-cov).
+    // For a non-tilted drone R_GtoI(2,2)≈1 and this reduces to (p_z - z0).
+    if (!gps_alt_bootstrapped_) {
+      // bootstrap: make predicted range match measured range at first sample
+      gps_alt_z_ground_ = p_IinG(2) - altitude_z * r22;
+      gps_alt_bootstrapped_ = true;
+      PRINT_INFO(CYAN "[GPS-ALT-C]: bootstrap z_ground=%.3fm (p_z=%.3f, meas=%.3f, r22=%.3f)\n" RESET,
+                 gps_alt_z_ground_, p_IinG(2), altitude_z, r22);
+    }
+
+    if (std::abs(r22) < 0.3) {
+      // severely tilted (>72deg) - skip, model unreliable
+      PRINT_WARNING(YELLOW "[GPS-ALT-C]: skip, r22=%.3f too small (drone tilted)\n" RESET, r22);
+      return;
+    }
+
+    z_pred = (p_IinG(2) - gps_alt_z_ground_) / r22;
+
+    // Jacobian: d h / d p_z = 1/r22
+    //           d h / d theta_imu (world-frame err.state, left-mult on R_GtoI):
+    //     R_GtoI'(2,2) = R_GtoI(2,2) + [R_GtoI(1,2)*dtheta_x - R_GtoI(0,2)*dtheta_y]
+    //     so d r22 / d theta = [R(1,2), -R(0,2), 0]
+    //     d h / d theta = -(p_z - z0)/r22^2 * [R(1,2), -R(0,2), 0]
+    Hx_order.push_back(state->_imu->q());   // 3 (orientation)
+    Hx_order.push_back(state->_imu->p());   // 3 (position)
+    if (also_update_vz) {
+      Hx_order.push_back(state->_imu->v()); // 3 (velocity)
+    }
+    int ncol = 3 * Hx_order.size();
+    H = Eigen::MatrixXd::Zero(1, ncol);
+    double coef = -(p_IinG(2) - gps_alt_z_ground_) / (r22 * r22);
+    H(0, 0) = coef * R_GtoI(1, 2);   // d/d theta_x
+    H(0, 1) = coef * (-R_GtoI(0, 2)); // d/d theta_y
+    H(0, 2) = 0.0;                    // d/d theta_z (yaw around g has no effect on r22)
+    H(0, 3 + 2) = 1.0 / r22;          // d/d p_z
+    // velocity columns (if included) default 0
+  } else {
+    // Legacy measurement model: h(x) = p_IinG[2]  (altitude directly in world)
+    z_pred = p_IinG(2);
+    Hx_order.push_back(state->_imu->p());
+    if (also_update_vz) {
+      Hx_order.push_back(state->_imu->v());
+      H = Eigen::MatrixXd::Zero(1, 6);
+      H(0, 2) = 1.0;
+    } else {
+      H = Eigen::MatrixXd::Zero(1, 3);
+      H(0, 2) = 1.0;
+    }
+  }
+
   double res_scalar = altitude_z - z_pred;
 
-  // H = 1 x 3, 只对 p 的 z 分量有偏导
-  Eigen::MatrixXd H = Eigen::MatrixXd::Zero(1, 3);
-  H(0, 2) = 1.0;
-
-  // R = 1 x 1
   Eigen::MatrixXd R = Eigen::MatrixXd::Zero(1, 1);
   R(0, 0) = std::pow(sigma, 2);
 
-  // residual vector
   Eigen::VectorXd res = Eigen::VectorXd::Zero(1);
   res(0) = res_scalar;
-
-  // H_order: 只更新 IMU 位置子状态
-  std::vector<std::shared_ptr<Type>> Hx_order;
-  Hx_order.push_back(state->_imu->p());
 
   // [中文] Chi^2 gate. 用一个宽松的门 (chi2 < 10000) 只拒绝极端 spike (例如 GPS
   // 时间偏错产生 100m 级残差). 我们不希望 VIO 已经错了、chi2 过严把所有正确的
@@ -233,50 +285,24 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
   Eigen::MatrixXd P = StateHelper::get_marginal_covariance(state, Hx_order);
   double S = (H * P * H.transpose())(0, 0) + R(0, 0);
   double chi2 = res_scalar * res_scalar / S;
-  if (chi2 > 10000.0) {
-    PRINT_INFO(YELLOW "[GPS-ALT]: REJECT res=%.2fm chi2=%.1f (P_zz=%.2f sigma_meas=%.2f)\n" RESET,
-               res_scalar, chi2, P(2, 2), std::sqrt(R(0, 0)));
+  // find p_z index in the stacked order (q first -> offset 3; otherwise 0) + 2
+  int pz_idx = range_mode ? (3 + 2) : 2;
+  double P_pz = P(pz_idx, pz_idx);
+  if (chi2 > chi2_gate) {
+    PRINT_INFO(YELLOW "[GPS-ALT]: REJECT res=%.2fm chi2=%.1f>gate=%.1f (P_zz=%.2f sigma=%.2f)\n" RESET,
+               res_scalar, chi2, chi2_gate, P_pz, std::sqrt(R(0, 0)));
     return;
   }
 
-  StateHelper::EKFUpdate(state, Hx_order, H, res, R);
-  PRINT_INFO(CYAN "[GPS-ALT]: t=%.3f meas=%.2fm pred=%.2fm res=%+.2fm chi2=%.1f P_zz=%.2f\n" RESET,
-             timestamp, altitude_z, z_pred, res_scalar, chi2, P(2, 2));
-}
-
-void VioManager::feed_measurement_gps_position(double timestamp, const Eigen::Vector3d &pos_in_VIO,
-                                               const Eigen::Vector3d &sigma_xyz) {
-  if (!is_initialized_vio)
-    return;
-  if (state->_timestamp < timestamp - 0.2 || state->_timestamp > timestamp + 0.2) {
-    PRINT_DEBUG(YELLOW "[GPS-3D]: skip dt=%.3fs\n" RESET, state->_timestamp - timestamp);
-    return;
+  if (use_schmidt) {
+    StateHelper::EKFUpdateSchmidt(state, Hx_order, H, res, R);
+  } else {
+    StateHelper::EKFUpdate(state, Hx_order, H, res, R);
   }
-
-  Eigen::Vector3d p_pred = state->_imu->pos();
-  Eigen::Vector3d res_vec = pos_in_VIO - p_pred;
-
-  // H = [I_3]  (对 position error state 的偏导)
-  Eigen::MatrixXd H = Eigen::MatrixXd::Identity(3, 3);
-  Eigen::MatrixXd R = Eigen::MatrixXd::Zero(3, 3);
-  R(0, 0) = sigma_xyz(0) * sigma_xyz(0);
-  R(1, 1) = sigma_xyz(1) * sigma_xyz(1);
-  R(2, 2) = sigma_xyz(2) * sigma_xyz(2);
-
-  Eigen::VectorXd res = res_vec;
-  std::vector<std::shared_ptr<Type>> Hx_order;
-  Hx_order.push_back(state->_imu->p());
-
-  Eigen::MatrixXd P = StateHelper::get_marginal_covariance(state, Hx_order);
-  Eigen::MatrixXd S = H * P * H.transpose() + R;
-  double chi2 = res.transpose() * S.llt().solve(res);
-  if (chi2 > 30000.0) {
-    PRINT_INFO(YELLOW "[GPS-3D]: REJECT |res|=%.1fm chi2=%.1f\n" RESET, res.norm(), chi2);
-    return;
-  }
-  StateHelper::EKFUpdate(state, Hx_order, H, res, R);
-  PRINT_INFO(CYAN "[GPS-3D]: t=%.3f res=(%+.2f,%+.2f,%+.2f)m |res|=%.2f chi2=%.1f\n" RESET,
-             timestamp, res_vec(0), res_vec(1), res_vec(2), res_vec.norm(), chi2);
+  PRINT_INFO(CYAN "[GPS-ALT%s%s]: t=%.3f meas=%.2fm pred=%.2fm res=%+.2fm chi2=%.1f P_zz=%.2f r22=%.3f%s\n" RESET,
+             range_mode ? "-C" : "", use_schmidt ? "-S" : "",
+             timestamp, altitude_z, z_pred, res_scalar, chi2, P_pz, r22,
+             also_update_vz ? " (p+v)" : "");
 }
 
 void VioManager::feed_measurement_simulation(double timestamp, const std::vector<int> &camids,

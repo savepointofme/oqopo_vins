@@ -77,9 +77,12 @@ struct Args {
   bool stereo = false;           // [中文] 使用 cam1 配对
   bool gps_alt_update = false;   // [中文] 使用 GPS 高度作为 VIO EKF 1D 观测 (锁 z 漂移)
   double gps_alt_sigma = 2.0;    // [中文] GPS 高度观测噪声 stddev (meters)
-  bool gps_pos_update = false;   // [中文] 使用 GPS 3D 位置 (xyz) 作为 EKF 观测 (真正稳 mono)
-  double gps_pos_sigma_xy = 2.0; // [中文] GPS 水平噪声 stddev
-  double gps_pos_sigma_z = 2.0;  // [中文] GPS 垂直噪声 stddev
+  double gps_alt_chi2 = 10000.0; // [中文] GPS 高度 chi^2 门 (默认宽松不拒绝, 调小可防大残差污染 ba)
+  bool gps_alt_schmidt = false;  // [中文] 使用 Schmidt consider-filter 避免 ba/bg 被 z 残差污染
+  bool gps_alt_also_vz = false;  // [中文] active 集合加入 v(), 让 v_z 随 z 一起被 update
+  bool gps_alt_range_mode = false; // [中文] C-mode: range model h=(p_z-z_ground)/r22, z_ground 首帧 bootstrap
+  double gps_cutoff_time = -1.0; // [中文] Hold-out 评估: 超过 t_cam > cutoff 后不再 feed GPS, 看 VIO 裸跑
+  double gps_feed_every = 1.0;   // [中文] GPS 喂入比例 1.0=全部, 0.2=每 5 个采样用 1 个 (验证降采样)
   bool show = true;              // [中文] 显示窗口
   int dash_every = 1;            // [中文] 每 N 帧刷新仪表板
   bool verbose_timing = false;
@@ -97,9 +100,8 @@ void print_help() {
                "  --gps PATH            CSV: ts_ns, x, y, z  or  ts_ns, lat, lon, alt (WGS84)\n"
                "  --gps-alt-update      Feed GPS altitude (z) as 1D EKF update (mono rescue)\n"
                "  --gps-alt-sigma SIG   GPS altitude noise stddev meters (default 2.0)\n"
-               "  --gps-pos-update      Feed GPS 3D position (xyz) as EKF update (needs GPS-VIO align first)\n"
-               "  --gps-pos-sigma-xy S  GPS horizontal noise stddev meters (default 2.0)\n"
-               "  --gps-pos-sigma-z S   GPS vertical noise stddev meters (default 2.0)\n"
+               "  --gps-cutoff-time T   Stop feeding GPS after t_cam > T (hold-out test)\n"
+               "  --gps-feed-every F    Feed 1/F of GPS samples (e.g. 0.2 = 1-in-5, validation set)\n"
                "  --gt PATH             ASL 17-col ground truth CSV\n"
                "  --output PATH         Output TUM trajectory (default: traj_ros_free.txt)\n"
                "  --video PATH          Record dashboard to MP4\n"
@@ -134,9 +136,12 @@ bool parse_args(int argc, char **argv, Args &a) {
     else if (s == "--stereo") a.stereo = true;
     else if (s == "--gps-alt-update") a.gps_alt_update = true;
     else if (s == "--gps-alt-sigma") a.gps_alt_sigma = std::atof(next("--gps-alt-sigma").c_str());
-    else if (s == "--gps-pos-update") a.gps_pos_update = true;
-    else if (s == "--gps-pos-sigma-xy") a.gps_pos_sigma_xy = std::atof(next("--gps-pos-sigma-xy").c_str());
-    else if (s == "--gps-pos-sigma-z") a.gps_pos_sigma_z = std::atof(next("--gps-pos-sigma-z").c_str());
+    else if (s == "--gps-alt-chi2") a.gps_alt_chi2 = std::atof(next("--gps-alt-chi2").c_str());
+    else if (s == "--gps-alt-schmidt") a.gps_alt_schmidt = true;
+    else if (s == "--gps-alt-also-vz") a.gps_alt_also_vz = true;
+    else if (s == "--gps-alt-range-mode") a.gps_alt_range_mode = true;
+    else if (s == "--gps-cutoff-time") a.gps_cutoff_time = std::atof(next("--gps-cutoff-time").c_str());
+    else if (s == "--gps-feed-every") a.gps_feed_every = std::atof(next("--gps-feed-every").c_str());
     else if (s == "--no-display") a.show = false;
     else if (s == "--dash-every") a.dash_every = std::atoi(next("--dash-every").c_str());
     else if (s == "--verbose") a.verbose_timing = true;
@@ -355,33 +360,33 @@ int main(int argc, char **argv) {
       // [中文] GPS 高度 EKF 更新: 仅在 --gps-alt-update 开启且加载了 GPS 数据时
       // 策略: 初始化后第一个靠近 t_cam 的 GPS 采样 -> 设为 gps_alt_ref.
       // 之后每帧 cam update 后, 把 (最近一条 GPS alt - gps_alt_ref) 馈入滤波器.
-      if ((args.gps_alt_update || args.gps_pos_update) && !gps.empty()) {
+      if (args.gps_alt_update && !gps.empty()) {
         // advance gps_i 到 <= t_cam 的最新一条
         while (gps_i + 1 < gps.size() && gps[gps_i + 1].timestamp <= t_cam)
           gps_i++;
         double t_gps = gps[gps_i].timestamp;
         Eigen::Vector3d xyz_raw = gps[gps_i].xyz;
-        if (std::fabs(t_gps - t_cam) < 0.10) {
-          // [中文] ALT-only 模式: 取 z 分量, 第一次记下参考点, 之后相对 feed
-          if (args.gps_alt_update && !args.gps_pos_update) {
-            if (std::isnan(gps_alt_ref)) {
-              gps_alt_ref = xyz_raw(2);
-              PRINT_INFO(GREEN "[GPS-ALT]: set reference alt=%.2fm at t=%.3f (VIO world z=0 -> GPS alt)\n" RESET,
-                         gps_alt_ref, t_gps);
-            }
-            double alt_z = xyz_raw(2) - gps_alt_ref;
-            sys->feed_measurement_gps_altitude(t_gps, alt_z, args.gps_alt_sigma);
-            gps_alt_feeds++;
+        // [中文] Hold-out: 超过 cutoff 之后不再 feed (验证 VIO 是否真的被 GPS 纠正过 bias/scale)
+        bool cutoff_reached = (args.gps_cutoff_time > 0.0 && t_cam > args.gps_cutoff_time);
+        // [中文] Feed-every 降采样 (对齐之后使用): 只每 1/gps_feed_every 个采样 feed 一次
+        bool feed_this_sample = true;
+        if (args.gps_feed_every < 1.0 && args.gps_feed_every > 0.0) {
+          int stride = static_cast<int>(std::round(1.0 / args.gps_feed_every));
+          feed_this_sample = (static_cast<int>(gps_i) % stride == 0);
+        }
+        if (std::fabs(t_gps - t_cam) < 0.10 && !cutoff_reached && feed_this_sample) {
+          // [中文] ALT-only 模式: 取 z 分量, 第一次记下参考点 (= VIO 原点高度),
+          // 之后相对 feed. 这样 init 瞬间残差=0, 避免 cross-cov 把 offset 打进 ba.
+          if (std::isnan(gps_alt_ref)) {
+            gps_alt_ref = xyz_raw(2);
+            PRINT_INFO(GREEN "[GPS-ALT]: set reference alt=%.2fm at t=%.3f (VIO world z=0 -> GPS alt)\n" RESET,
+                       gps_alt_ref, t_gps);
           }
-          // [中文] 3D pose 模式: 需要先等 SE3 对齐. 对齐后把 GPS xyz (ENU) 通过
-          // aligner 的 (R, t) 逆变换到 VIO world frame 再喂给 EKF.
-          // aligner: gt = R*vio + t => vio = R^T (gt - t)
-          if (args.gps_pos_update && aligner.solved()) {
-            Eigen::Vector3d gps_in_vio = aligner.R().transpose() * (xyz_raw - aligner.t());
-            Eigen::Vector3d sig(args.gps_pos_sigma_xy, args.gps_pos_sigma_xy, args.gps_pos_sigma_z);
-            sys->feed_measurement_gps_position(t_gps, gps_in_vio, sig);
-            gps_alt_feeds++;
-          }
+          double alt_z = xyz_raw(2) - gps_alt_ref;
+          sys->feed_measurement_gps_altitude(t_gps, alt_z, args.gps_alt_sigma, args.gps_alt_chi2,
+                                             args.gps_alt_schmidt, args.gps_alt_also_vz,
+                                             args.gps_alt_range_mode);
+          gps_alt_feeds++;
         }
       }
       auto state = sys->get_state();

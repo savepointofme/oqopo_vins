@@ -107,23 +107,16 @@ public:
    *                   Caller must align to VIO origin (subtract init altitude).
    * @param sigma      Measurement stddev (meters), e.g. 1.0-5.0 for RTK/GNSS.
    */
-  void feed_measurement_gps_altitude(double timestamp, double altitude_z, double sigma);
+  void feed_measurement_gps_altitude(double timestamp, double altitude_z, double sigma,
+                                     double chi2_gate = 10000.0, bool use_schmidt = false,
+                                     bool also_update_vz = false,
+                                     bool range_mode = false);
 
-  /**
-   * @brief Feed a 3D GPS position measurement expressed in the VIO world frame.
-   *
-   * 前提: 调用方已经把 ENU 坐标通过 SE3 对齐旋转到 VIO world frame (即与
-   * state->_imu->pos() 同坐标系).
-   *
-   * 用途: mono VIO 下 ba_x/ba_y 不可观测 -> xy 必然漂移. GPS 高度仅锁 z, 要想
-   * 完全稳定 mono VIO 就必须把 GPS 全 3D 位置喂给 EKF.
-   *
-   * @param timestamp   Sensor-clock time (sec).
-   * @param pos_in_VIO  [x, y, z] meters, already rotated into VIO world frame.
-   * @param sigma_xyz   Per-axis stddev (meters). 典型 RTK 1m / 标准 GNSS 5m.
-   */
-  void feed_measurement_gps_position(double timestamp, const Eigen::Vector3d &pos_in_VIO,
-                                     const Eigen::Vector3d &sigma_xyz);
+  /// Reset C-mode bootstrap (for testing). Call between runs if reusing the VioManager.
+  void reset_gps_altitude_bootstrap() {
+    gps_alt_bootstrapped_ = false;
+    gps_alt_z_ground_ = 0.0;
+  }
 
   /// If we are initialized or not
   bool initialized() { return is_initialized_vio && timelastupdate != -1; }
@@ -258,6 +251,10 @@ protected:
   // If we did a zero velocity update
   bool did_zupt_update = false;
   bool has_moved_since_zupt = false;
+
+  // [C-mode] GPS altitude / range bootstrap: z_ground estimated once from first measurement
+  bool gps_alt_bootstrapped_ = false;
+  double gps_alt_z_ground_ = 0.0;
 
   // Good features that where used in the last update (used in visualization)
   std::vector<Eigen::Vector3d> good_features_MSCKF;

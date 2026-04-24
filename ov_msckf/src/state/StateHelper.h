@@ -89,6 +89,41 @@ public:
                         const Eigen::VectorXd &res, const Eigen::MatrixXd &R);
 
   /**
+   * @brief Consider-Filter (Schmidt-KF) update.
+   *
+   * 在 Bierman 1977 的 "consider filter" 变体里, 状态分两块:
+   *   - active:    出现在 H_order 里的变量, 正常被 K*res 修改 mean, 正常降协方差
+   *   - nuisance:  其余所有状态变量, **mean 保持不变**, 只通过 cross-covariance
+   *                降低 (active, nuisance) 的相关性. P_NN (nuisance 自相关) **不变**.
+   *
+   * 用途: 当外部观测 (如激光测距) 精度很高但只观测少量状态 (如 p_z) 时,
+   * 标准 EKF 会通过 P_XP 把 residual 反传到 ba/bg 等弱可观测的状态, 在 mono VIO
+   * 场景下往往越拉越偏. Schmidt filter 只让 active 拿到测量的修正, 把其他状态
+   * 当 "未知常量" 保持原样 — 不乱改, 等 VIO 自己的视觉约束慢慢观测它们.
+   *
+   * 注意: 这是次优 (sub-optimal) 滤波 (与标准 EKF 相比), 但 mean 更健壮,
+   *       协方差稍微保守 (P_NN 不减小 -> 后续 update 有更大的 cross-gain).
+   *
+   * 数学:
+   *   S    = H * P_SS * H^T + R         (只用 active 块, 不用全 P)
+   *   K_S  = P_SS * H^T * S^{-1}        (active-only gain)
+   *   x_S <- x_S + K_S * res            (nuisance mean 不动)
+   *   P_SS <- P_SS - K_S * H * P_SS
+   *   P_SN <- P_SN - K_S * H * P_SN     (对每个 nuisance 块 N, 更新与 active 的 cross)
+   *   P_NN <- unchanged
+   *
+   * @param state   状态指针
+   * @param H_order 被 H 显式观测到的 active 变量序列
+   * @param H       compressed Jacobian (行=观测数, 列=sum(H_order.size()))
+   * @param res     观测残差
+   * @param R       观测噪声协方差
+   */
+  static void EKFUpdateSchmidt(std::shared_ptr<State> state,
+                               const std::vector<std::shared_ptr<ov_type::Type>> &H_order,
+                               const Eigen::MatrixXd &H, const Eigen::VectorXd &res,
+                               const Eigen::MatrixXd &R);
+
+  /**
    * @brief This will set the initial covaraince of the specified state elements.
    * Will also ensure that proper cross-covariances are inserted.
    * @param state Pointer to state
