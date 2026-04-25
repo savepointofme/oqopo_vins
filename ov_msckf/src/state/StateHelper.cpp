@@ -28,6 +28,7 @@
 #include "utils/print.h"
 
 #include <boost/math/distributions/chi_squared.hpp>
+#include <set>
 
 using namespace ov_core;
 using namespace ov_type;
@@ -193,6 +194,78 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
     for (auto const &calib : state->_cam_intrinsics) {
       state->_cam_intrinsics_cameras.at(calib.first)->set_value(calib.second->value());
     }
+  }
+}
+
+void StateHelper::EKFUpdateSchmidt(std::shared_ptr<State> state,
+                                   const std::vector<std::shared_ptr<Type>> &H_order,
+                                   const Eigen::MatrixXd &H, const Eigen::VectorXd &res,
+                                   const Eigen::MatrixXd &R) {
+
+  assert(res.rows() == R.rows());
+  assert(H.rows() == res.rows());
+
+  // [中文] Bar-Shalom "consider filter" / sub-optimal Schmidt (consistent form).
+  // 流程:
+  //   1. 和标准 EKF 一样计算 full-state Kalman gain (保证 cov 更新 PSD safe).
+  //   2. cov 按标准 EKF 更新: P <- P - K * S * K^T.
+  //   3. mean 只更新 active (H_order) 变量; 其他 ("nuisance") 的 mean 保持不变.
+  // 这样协方差是全状态协同更新 (不会违反 Schur-PSD), 但 bias/attitude 等易被
+  // cross-cov 错误拉偏的状态的 mean 被保护住了.
+
+  // ---- M_a = P * H^T (按标准 EKFUpdate 的方式计算, active 列由 H_order 决定) ----
+  Eigen::MatrixXd M_a = Eigen::MatrixXd::Zero(state->_Cov.rows(), res.rows());
+  int cur_it = 0;
+  std::vector<int> H_id;
+  for (const auto &meas_var : H_order) {
+    H_id.push_back(cur_it);
+    cur_it += meas_var->size();
+  }
+  for (const auto &var : state->_variables) {
+    Eigen::MatrixXd M_i = Eigen::MatrixXd::Zero(var->size(), res.rows());
+    for (size_t i = 0; i < H_order.size(); i++) {
+      auto meas_var = H_order[i];
+      M_i.noalias() += state->_Cov.block(var->id(), meas_var->id(), var->size(), meas_var->size()) *
+                       H.block(0, H_id[i], H.rows(), meas_var->size()).transpose();
+    }
+    M_a.block(var->id(), 0, var->size(), res.rows()) = M_i;
+  }
+
+  // S = H P_SS H^T + R (P_SS 是 active marginal)
+  Eigen::MatrixXd P_SS = StateHelper::get_marginal_covariance(state, H_order);
+  Eigen::MatrixXd S = H * P_SS * H.transpose() + R;
+  Eigen::MatrixXd Sinv = Eigen::MatrixXd::Identity(R.rows(), R.rows());
+  S.selfadjointView<Eigen::Upper>().llt().solveInPlace(Sinv);
+
+  // K_full = M_a * Sinv  (N_state x m)
+  Eigen::MatrixXd K_full = M_a * Sinv.selfadjointView<Eigen::Upper>();
+
+  // Cov 更新 (standard): P -= K * M_a^T
+  state->_Cov.triangularView<Eigen::Upper>() -= K_full * M_a.transpose();
+  state->_Cov = state->_Cov.selfadjointView<Eigen::Upper>();
+
+  // Mean 更新: 只对 active 变量 (H_order) 应用 dx = K * res, 其他全部保留
+  Eigen::VectorXd dx = K_full * res;
+  std::set<int> active_ids;
+  for (const auto &v : H_order)
+    active_ids.insert(v->id());
+  for (const auto &var : state->_variables) {
+    if (active_ids.count(var->id()) == 0)
+      continue;
+    var->update(dx.block(var->id(), 0, var->size(), 1));
+  }
+
+  // Robustness check
+  Eigen::VectorXd diags = state->_Cov.diagonal();
+  bool found_neg = false;
+  for (int i = 0; i < diags.rows(); i++) {
+    if (diags(i) < 0.0) {
+      PRINT_WARNING(RED "EKFUpdateSchmidt() - diag at %d = %.2f\n" RESET, i, diags(i));
+      found_neg = true;
+    }
+  }
+  if (found_neg) {
+    std::exit(EXIT_FAILURE);
   }
 }
 

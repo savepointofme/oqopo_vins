@@ -150,6 +150,29 @@ public:
    */
   void initialize_with_gt(Eigen::Matrix<double, 17, 1> imustate);
 
+  /**
+   * @brief Feed a scalar GPS altitude (world Z) measurement, performs a 1D EKF
+   *        update on the IMU position z component.
+   *
+   * 用途: mono VIO 下 accelerometer bias 不可观测导致 z 漂移. 把 GPS 高度当
+   * 单维观测量锁住 z 轴, 间接稳住 ba_y/ba_z 的估计.
+   *
+   * @param timestamp  Time (sec) of the GPS altitude sample (sensor-clock).
+   * @param altitude_z Altitude in VIO world frame (meters, ENU-up compatible).
+   *                   Caller must align to VIO origin (subtract init altitude).
+   * @param sigma      Measurement stddev (meters), e.g. 1.0-5.0 for RTK/GNSS.
+   */
+  void feed_measurement_gps_altitude(double timestamp, double altitude_z, double sigma,
+                                     double chi2_gate = 10000.0, bool use_schmidt = false,
+                                     bool also_update_vz = false,
+                                     bool range_mode = false);
+
+  /// Reset C-mode bootstrap (for testing). Call between runs if reusing the VioManager.
+  void reset_gps_altitude_bootstrap() {
+    gps_alt_bootstrapped_ = false;
+    gps_alt_z_ground_ = 0.0;
+  }
+
   /// If we are initialized or not
   /// [中文] 判断系统是否已初始化: 必须既完成初始化又至少做过一次更新。
   bool initialized() { return is_initialized_vio && timelastupdate != -1; }
@@ -327,6 +350,10 @@ protected:
   // If we did a zero velocity update
   bool did_zupt_update = false;
   bool has_moved_since_zupt = false;
+
+  // [C-mode] GPS altitude / range bootstrap: z_ground estimated once from first measurement
+  bool gps_alt_bootstrapped_ = false;
+  double gps_alt_z_ground_ = 0.0;
 
   // Good features that where used in the last update (used in visualization)
   std::vector<Eigen::Vector3d> good_features_MSCKF;

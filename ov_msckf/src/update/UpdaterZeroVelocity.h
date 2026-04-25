@@ -64,10 +64,11 @@ public:
    * @param zupt_max_velocity Max velocity we should consider to do a update with
    * @param zupt_noise_multiplier Multiplier of our IMU noise matrix (default should be 1.0)
    * @param zupt_max_disparity Max disparity we should consider to do a update with
+   * @param zupt_max_altitude Altitude threshold (m) above which ZUPT is unconditionally rejected (0 = disabled)
    */
   UpdaterZeroVelocity(UpdaterOptions &options, NoiseManager &noises, std::shared_ptr<ov_core::FeatureDatabase> db,
                       std::shared_ptr<Propagator> prop, double gravity_mag, double zupt_max_velocity, double zupt_noise_multiplier,
-                      double zupt_max_disparity);
+                      double zupt_max_disparity, double zupt_max_altitude = 0.0);
 
   /**
    * @brief Feed function for inertial data
@@ -138,6 +139,9 @@ protected:
 
   /// Max disparity (pixels) that we should consider a zupt with
   double _zupt_max_disparity = 1.0;
+
+  /// Altitude (m) above which ZUPT is unconditionally rejected (0 = disabled, backward-compatible)
+  double _zupt_max_altitude = 0.0;
 
   /// Chi squared 95th percentile table (lookup would be size of residual)
   std::map<int, double> chi_squared_table;
