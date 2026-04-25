@@ -83,6 +83,8 @@ struct Args {
   bool gps_alt_range_mode = false; // [中文] C-mode: range model h=(p_z-z_ground)/r22, z_ground 首帧 bootstrap
   double gps_cutoff_time = -1.0; // [中文] Hold-out 评估: 超过 t_cam > cutoff 后不再 feed GPS, 看 VIO 裸跑
   double gps_feed_every = 1.0;   // [中文] GPS 喂入比例 1.0=全部, 0.2=每 5 个采样用 1 个 (验证降采样)
+  // [中文] CLI 覆盖 yaml 里的 gps_time_offset; NaN = 不覆盖, 用 yaml/默认值
+  double gps_time_offset_cli = std::numeric_limits<double>::quiet_NaN();
   bool show = true;              // [中文] 显示窗口
   int dash_every = 1;            // [中文] 每 N 帧刷新仪表板
   bool verbose_timing = false;
@@ -102,6 +104,8 @@ void print_help() {
                "  --gps-alt-sigma SIG   GPS altitude noise stddev meters (default 2.0)\n"
                "  --gps-cutoff-time T   Stop feeding GPS after t_cam > T (hold-out test)\n"
                "  --gps-feed-every F    Feed 1/F of GPS samples (e.g. 0.2 = 1-in-5, validation set)\n"
+               "  --gps-time-offset SEC Override yaml gps_time_offset (sec). Adds to gps timestamps.\n"
+               "                         For jc82 18r.bag: ~+36.19s (physics) or +39s (empirical opt)\n"
                "  --gt PATH             ASL 17-col ground truth CSV\n"
                "  --output PATH         Output TUM trajectory (default: traj_ros_free.txt)\n"
                "  --video PATH          Record dashboard to MP4\n"
@@ -142,6 +146,7 @@ bool parse_args(int argc, char **argv, Args &a) {
     else if (s == "--gps-alt-range-mode") a.gps_alt_range_mode = true;
     else if (s == "--gps-cutoff-time") a.gps_cutoff_time = std::atof(next("--gps-cutoff-time").c_str());
     else if (s == "--gps-feed-every") a.gps_feed_every = std::atof(next("--gps-feed-every").c_str());
+    else if (s == "--gps-time-offset") a.gps_time_offset_cli = std::atof(next("--gps-time-offset").c_str());
     else if (s == "--no-display") a.show = false;
     else if (s == "--dash-every") a.dash_every = std::atoi(next("--dash-every").c_str());
     else if (s == "--verbose") a.verbose_timing = true;
@@ -179,6 +184,14 @@ int main(int argc, char **argv) {
   // [中文] 离线回放: 禁用 VioManager 内部的异步队列, 我们自己严格按时间序喂
   params.use_multi_threading_subs = false;
 
+  // [中文] CLI --gps-time-offset 覆盖 yaml 里 gps_time_offset.
+  // 用法示例: --gps-time-offset 36.19 (jc82 18r.bag 锚点修正, 物理推导值)
+  if (!std::isnan(args.gps_time_offset_cli)) {
+    params.gps_time_offset = args.gps_time_offset_cli;
+    PRINT_INFO(CYAN "[ros-free] CLI override: gps_time_offset=%+.3fs\n" RESET,
+               params.gps_time_offset);
+  }
+
   if (!parser->successful()) {
     PRINT_ERROR(RED "[ros-free] failed to parse config %s\n" RESET, args.config_path.c_str());
     return EXIT_FAILURE;
@@ -210,6 +223,17 @@ int main(int argc, char **argv) {
     DatasetReaderEuroc::load_gt((root / "state_groundtruth_estimate0" / "data.csv").string(), gt);
   if (!args.gps_path.empty())
     DatasetReaderEuroc::load_gps(args.gps_path, gps);
+
+  // [中文] 应用 GPS 时间偏移 (config: gps_time_offset, 单位秒, 默认 0).
+  // 用于数据集 GPS 时间戳与 IMU 不对齐的情况 (例如 jc82 18r.bag,
+  // GPS 来自单独 ArduPilot DataFlash log, 锚点偏 +36s).
+  // 一次性应用于全部样本, 之后下游 (load_gps 派生 map / feed loop) 不再感知.
+  if (!gps.empty() && std::fabs(params.gps_time_offset) > 1e-9) {
+    for (auto &s : gps)
+      s.timestamp += params.gps_time_offset;
+    PRINT_INFO(CYAN "[ros-free] applied gps_time_offset=%+.3fs to %zu GPS samples\n" RESET,
+               params.gps_time_offset, gps.size());
+  }
 
   // [中文] --start-time: 跳过前 N 秒的 IMU / cam0 / cam1 (相对 bag 第一条 IMU)
   // 用于复现 ROS bag_start:=58 这种场景, 跳过放置静止段

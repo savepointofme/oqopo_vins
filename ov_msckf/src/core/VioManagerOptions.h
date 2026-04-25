@@ -101,6 +101,15 @@ struct VioManagerOptions {
   /// Setting this to e.g. 1.0 m means "once the drone is definitely airborne, never ZUPT again".
   double zupt_max_altitude = 0.0;
 
+  /// [中文] GPS 时间戳相对 IMU 时钟的常量偏移 (秒).
+  /// t_gps_corrected = t_gps_raw + gps_time_offset.
+  /// 用于数据集 GPS 与 IMU 录制时存在常量同步误差的情况
+  /// (例如 jc82 18r.bag: GPS 来自单独 ArduPilot DataFlash log, gps0/data.csv
+  /// 时间锚点与 IMU bag 起始相差约 +36s, 经验最优 +39s).
+  /// 默认 0 = 不修正, 向后兼容. 该值由 runner 在加载 GPS 后一次性应用到所有
+  /// GPS 样本的 timestamp, 之后流水线下游不再感知这个偏移.
+  double gps_time_offset = 0.0;
+
   /// If we should record the timing performance to file
   bool record_timing_information = false;
 
@@ -125,6 +134,7 @@ struct VioManagerOptions {
       parser->parse_config("zupt_max_disparity", zupt_max_disparity);
       parser->parse_config("zupt_only_at_beginning", zupt_only_at_beginning);
       parser->parse_config("zupt_max_altitude", zupt_max_altitude, false);
+      parser->parse_config("gps_time_offset", gps_time_offset, false);
       parser->parse_config("record_timing_information", record_timing_information);
       parser->parse_config("record_timing_filepath", record_timing_filepath);
     }
@@ -135,6 +145,7 @@ struct VioManagerOptions {
     PRINT_DEBUG("  - zupt_max_disparity: %.4f\n", zupt_max_disparity);
     PRINT_DEBUG("  - zupt_only_at_beginning?: %d\n", zupt_only_at_beginning);
     PRINT_DEBUG("  - zupt_max_altitude: %.2f m (0=disabled)\n", zupt_max_altitude);
+    PRINT_DEBUG("  - gps_time_offset: %+.3f s (0=disabled)\n", gps_time_offset);
     PRINT_DEBUG("  - record timing?: %d\n", (int)record_timing_information);
     PRINT_DEBUG("  - record timing filepath: %s\n", record_timing_filepath.c_str());
   }

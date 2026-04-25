@@ -294,15 +294,44 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
     return;
   }
 
+  // === [DIAG] dump state BEFORE update ===
+  Eigen::Vector3d ba_pre = state->_imu->bias_a();
+  Eigen::Vector3d bg_pre = state->_imu->bias_g();
+  Eigen::Vector3d v_pre = state->_imu->vel();
+  Eigen::Vector3d p_pre = state->_imu->pos();
+  Eigen::Matrix3d R_GtoI_pre = state->_imu->Rot();
+
   if (use_schmidt) {
     StateHelper::EKFUpdateSchmidt(state, Hx_order, H, res, R);
   } else {
     StateHelper::EKFUpdate(state, Hx_order, H, res, R);
   }
+
+  // === [DIAG] dump state AFTER update ===
+  Eigen::Vector3d ba_post = state->_imu->bias_a();
+  Eigen::Vector3d bg_post = state->_imu->bias_g();
+  Eigen::Vector3d v_post = state->_imu->vel();
+  Eigen::Vector3d p_post = state->_imu->pos();
+  Eigen::Matrix3d R_GtoI_post = state->_imu->Rot();
+  Eigen::Vector3d dba = ba_post - ba_pre;
+  Eigen::Vector3d dbg = bg_post - bg_pre;
+  Eigen::Vector3d dv = v_post - v_pre;
+  Eigen::Vector3d dp = p_post - p_pre;
+  // pre/post tilt as roll-pitch from R_GtoI (yaw not relevant here)
+  double tilt_pre = std::acos(std::min(1.0, std::max(-1.0, R_GtoI_pre(2, 2)))) * 180.0 / M_PI;
+  double tilt_post = std::acos(std::min(1.0, std::max(-1.0, R_GtoI_post(2, 2)))) * 180.0 / M_PI;
+
   PRINT_INFO(CYAN "[GPS-ALT%s%s]: t=%.3f meas=%.2fm pred=%.2fm res=%+.2fm chi2=%.1f P_zz=%.2f r22=%.3f%s\n" RESET,
              range_mode ? "-C" : "", use_schmidt ? "-S" : "",
              timestamp, altitude_z, z_pred, res_scalar, chi2, P_pz, r22,
              also_update_vz ? " (p+v)" : "");
+  PRINT_INFO(MAGENTA "[GPS-ALT-DIAG]: t=%.3f | p_pre=[%.2f %.2f %.2f] dp=[%+.3f %+.3f %+.3f] | v_pre=[%.2f %.2f %.2f] dv=[%+.3f %+.3f %+.3f] | tilt %.2f->%.2f deg | ba_pre=[%+.3f %+.3f %+.3f] dba=[%+.4f %+.4f %+.4f] | bg_pre=[%+.4f %+.4f %+.4f] dbg=[%+.5f %+.5f %+.5f]\n" RESET,
+             timestamp,
+             p_pre(0), p_pre(1), p_pre(2), dp(0), dp(1), dp(2),
+             v_pre(0), v_pre(1), v_pre(2), dv(0), dv(1), dv(2),
+             tilt_pre, tilt_post,
+             ba_pre(0), ba_pre(1), ba_pre(2), dba(0), dba(1), dba(2),
+             bg_pre(0), bg_pre(1), bg_pre(2), dbg(0), dbg(1), dbg(2));
 }
 
 void VioManager::feed_measurement_simulation(double timestamp, const std::vector<int> &camids,
