@@ -102,6 +102,20 @@ num_aruco: 1024
 downsize_aruco: true
 
 fi_max_dist: 300.0
+# [中] fi_max_baseline: FeatureInitializer 三角化通过率门限。判定式
+#       || p_FinA || / max_baseline_in_window  >  fi_max_baseline   →   reject
+#   p_FinA           : 特征点在 anchor 相机系下的位置 (≈ 飞行高度 ~70m)
+#   max_baseline     : MSCKF 滑窗内所有相机位姿两两距离的最大值 (含 cam0+cam1)
+#
+# OpenVINS 默认值 40 是面向中低速、近景 (≤30m) 标定的。本数据集 jc82
+# 处于 70m 高空鱼眼下视, ground feature 深度 ≈ 70m, 而 KLT 短窗口 +
+# 立体基线 0.16m 给出的 max_baseline_in_window ≈ 0.5–2m. 比值常态
+# 35–140, 远超默认 40 → 几乎所有立体三角化点被拒绝, EKF 退化为单目
+# + IMU, 这是高空 stereo 比 mono 更差 (84.5m vs 29.8m RMSE) 的根因。
+# 实测: 40 → 84.51m, 100 → 10.15m (8.3× 提升, 已超过参考 stereo
+# 14m baseline), 150 → 16.28m, ≥200 几何病态导致发散 21000m+. 选 100.
+# (注: 该参数对单目相反, mono 在 b≥80 即发散, 故 mono yaml 保持默认.)
+fi_max_baseline: 100.0
 # ==================================================================
 # ==================================================================
 
