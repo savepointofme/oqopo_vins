@@ -377,6 +377,7 @@ int main(int argc, char **argv) {
     double dt_ms = 1000.0 * (cv::getTickCount() / cv::getTickFrequency() - t0);
 
     // ------ query latest state ------
+    dash.set_initialized(sys->initialized());
     if (sys->initialized()) {
       if (t_init_done < 0)
         t_init_done = t_cam;
