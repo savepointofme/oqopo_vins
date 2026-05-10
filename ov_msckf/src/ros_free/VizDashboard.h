@@ -34,25 +34,31 @@ namespace ov_msckf {
 /**
  * @brief ROS-free OpenCV 仪表板。
  *
- * [中文] 单窗口 1600x900 分四宫格:
- *   - 左上 (800x500): 俯视轨迹图; 绿线 = GPS/GT, 蓝线 = VIO (对齐后),
- *                     当前相机位姿用三角箭头表示朝向;
- *                     红点 = SLAM 地图点, 白点 = MSCKF 临时点 (每帧覆盖, 自然"lost 后消失")
- *   - 右上 (800x500): 最新相机帧 (带跟踪点叠加, 由 VioManager 提供)
- *   - 左下 (800x400): 时序曲线 - ATE(m) + 速度范数(m/s) + VIO/GPS XYZ 差值 (dx,dy,dz)
- *   - 右下 (800x400): 姿态曲线 - roll/pitch/yaw (deg) + 当前数值文字
+ * [中文] 单窗口 1920x1080, 9 子面板 3 行 3 列:
+ *   行1 (h=540):
+ *     - 3D iso (640x540): 等距 3D 视角 (azim 45°, elev -30°), GT 绿 / VIO 蓝 / 当前位姿三角
+ *     - TOP-DOWN XY (640x540): 顶视 2D 轨迹 + SLAM 红 + MSCKF 白点
+ *     - CAM (640x540): 最新相机帧 (含跟踪点叠加)
+ *   行2 (h=270):
+ *     - ATE (m): 实时 ATE 时序
+ *     - Speed (m/s): VIO 速度范数 (蓝) + GT 速度 (绿, 若有)
+ *     - Altitude Z (m): VIO z (蓝) + GT z (绿)
+ *   行3 (h=270):
+ *     - Roll (deg)
+ *     - Pitch (deg)
+ *     - Yaw (deg)
  *
- * 设计为"push data, render on demand": 主循环每帧调用一次 update_* 后 render_and_show()。
- * 支持可选的视频录制 (MP4 via cv::VideoWriter)。
+ * 设计为"push data, render on demand": 主循环每帧调用 update_* 后 render_and_show().
+ * 支持可选视频录制 (MP4 via cv::VideoWriter).
  */
 class VizDashboard {
 public:
   struct Options {
-    int width = 1600;
-    int height = 900;
+    int width = 1920;
+    int height = 1080;
     double traj_scale_margin = 1.2; ///< [中文] 轨迹框体扩边比例
     size_t max_history = 20000;
-    size_t timeseries_max = 2000;
+    size_t timeseries_max = 5000;
     bool show_window = true;
     std::string video_path; ///< [中文] 若非空则写 MP4
     int video_fps = 20;
@@ -77,6 +83,9 @@ public:
   void update_features(const std::vector<Eigen::Vector3d> &slam_pts,
                        const std::vector<Eigen::Vector3d> &msckf_pts);
 
+  /// [中文] 设置 VIO 是否已初始化, 用于在面板上显示 "waiting init" 占位
+  void set_initialized(bool initialized);
+
   /// [中文] 渲染到内部画布, 可选写入视频, 可选 imshow. 返回 false 表示用户按了 q/ESC。
   bool render_and_show(int wait_ms = 1);
 
@@ -89,10 +98,13 @@ private:
     Eigen::Vector3d p;
   };
 
-  void draw_trajectory(cv::Mat &roi);
+  void draw_trajectory_topdown(cv::Mat &roi);
+  void draw_trajectory_iso(cv::Mat &roi);
   void draw_camera_image(cv::Mat &roi);
-  void draw_errors(cv::Mat &roi);
-  void draw_attitude(cv::Mat &roi);
+  void draw_panel_xy(cv::Mat &roi, const std::string &title,
+                     const std::vector<std::pair<std::deque<std::pair<double, double>> *, cv::Scalar>> &series,
+                     const std::vector<std::string> &labels, bool symmetric_y = false);
+  void draw_waiting_init(cv::Mat &roi, const std::string &title);
 
   static void draw_grid(cv::Mat &img, cv::Scalar color, int step = 40);
   static void draw_text(cv::Mat &img, const std::string &s, cv::Point p, cv::Scalar color,
@@ -112,6 +124,7 @@ private:
   Eigen::Matrix3d R_gv_ = Eigen::Matrix3d::Identity();
   Eigen::Vector3d t_gv_ = Eigen::Vector3d::Zero();
   bool aligned_ = false;
+  bool initialized_ = false;
 
   // latest state
   double latest_t_ = -1;
@@ -127,12 +140,11 @@ private:
   std::vector<Eigen::Vector3d> slam_pts_;
   std::vector<Eigen::Vector3d> msckf_pts_;
 
-  // time series
+  // time series (all keyed on dt = t - t_start_)
   std::deque<std::pair<double, double>> ts_ate_;
   std::deque<std::pair<double, double>> ts_speed_;
-  std::deque<std::pair<double, double>> ts_dx_;
-  std::deque<std::pair<double, double>> ts_dy_;
-  std::deque<std::pair<double, double>> ts_dz_;
+  std::deque<std::pair<double, double>> ts_z_vio_;
+  std::deque<std::pair<double, double>> ts_z_gt_;
   std::deque<std::pair<double, double>> ts_roll_;
   std::deque<std::pair<double, double>> ts_pitch_;
   std::deque<std::pair<double, double>> ts_yaw_;
