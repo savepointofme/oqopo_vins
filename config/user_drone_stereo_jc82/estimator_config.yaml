@@ -91,6 +91,7 @@ grid_y: 10 # extraction sub-grid count for vertical direction (uniform tracking)
 min_px_dist: 20 # distance between features (features near each other provide less information)
 knn_ratio: 0.70 # descriptor knn threshold for the top two descriptor matches
 track_frequency: 10.0 # frequency we will perform feature tracking at (in frames per second / hertz)
+use_gyro_aided_klt: true # warp KLT initial guess with IMU-derived inter-frame rotation (better tracking through turns)
 downsample_cameras: false # will downsample image in half if true
 num_opencv_threads: 4 # -1: auto, 0-1: serial, >1: number of threads
 histogram_method: "NONE" # NONE, HISTOGRAM, CLAHE

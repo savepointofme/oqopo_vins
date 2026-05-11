@@ -1058,3 +1058,35 @@ Eigen::MatrixXd Propagator::compute_H_Tg(std::shared_ptr<State> state, const Eig
   H_Tg << a_1 * I_3x3, a_2 * I_3x3, a_3 * I_3x3;
   return H_Tg;
 }
+bool Propagator::compute_relative_rotation(double time0, double time1, const Eigen::Vector3d &bg, Eigen::Matrix3d &R_I0_to_I1) {
+
+  // Sanity: require a non-degenerate forward interval.
+  if (!(time1 > time0))
+    return false;
+
+  // Grab readings that bracket [time0, time1]. select_imu_readings()
+  // already handles linear interpolation at the endpoints so the returned
+  // vector spans the exact requested interval (when enough data exists).
+  std::vector<ov_core::ImuData> readings;
+  {
+    std::lock_guard<std::mutex> lck(imu_data_mtx);
+    readings = Propagator::select_imu_readings(imu_data, time0, time1, false);
+  }
+  if (readings.size() < 2)
+    return false;
+
+  // Bias-corrected, dt-weighted sum of angular velocity (trapezoidal rule).
+  // theta = integral_{t0}^{t1} (w - bg) dt
+  Eigen::Vector3d theta = Eigen::Vector3d::Zero();
+  for (size_t k = 0; k < readings.size() - 1; k++) {
+    double dt = readings[k + 1].timestamp - readings[k].timestamp;
+    if (dt <= 0.0)
+      continue;
+    Eigen::Vector3d w_avg = 0.5 * (readings[k].wm + readings[k + 1].wm) - bg;
+    theta += w_avg * dt;
+  }
+
+  // Passive (coordinate-frame) rotation: v_I1 = exp([-theta]_x) * v_I0
+  R_I0_to_I1 = ov_core::exp_so3(-theta);
+  return true;
+}

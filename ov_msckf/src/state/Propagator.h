@@ -182,6 +182,34 @@ public:
                                                            bool warn = true);
 
   /**
+   * @brief Compute a relative (passive) rotation between two timestamps from the gyro buffer.
+   *
+   * Integrates the gyroscope readings in (time0, time1] using a simple
+   * trapezoidal rule (per-sample dt-weighted sum of bias-corrected angular
+   * velocity), then converts the resulting incremental rotation vector to a
+   * passive rotation matrix via Rodrigues:
+   *
+   *    theta = sum_i ( (w_i - bg) * dt_i )
+   *    R_I0_to_I1 = exp([-theta]_x)
+   *
+   * Here R_I0_to_I1 transforms a direction expressed in the IMU frame at
+   * time0 to its representation in the IMU frame at time1 (i.e. a passive /
+   * coordinate-frame rotation). For a vector at infinity that is fixed in
+   * the world:  v_I1 = R_I0_to_I1 * v_I0.
+   *
+   * This is intentionally cheap — we deliberately do *not* propagate the
+   * filter state for this query; the prediction is consumed by the visual
+   * front-end (gyro-aided KLT) and never enters the EKF.
+   *
+   * @param time0 Start timestamp (IMU clock)
+   * @param time1 End timestamp (IMU clock)
+   * @param bg Current best estimate of the gyro bias (IMU frame)
+   * @param[out] R_I0_to_I1 Resulting passive rotation
+   * @return True iff at least two IMU samples were available in the window
+   */
+  bool compute_relative_rotation(double time0, double time1, const Eigen::Vector3d &bg, Eigen::Matrix3d &R_I0_to_I1);
+
+  /**
    * @brief Nice helper function that will linearly interpolate between two imu messages.
    *
    * This should be used instead of just "cutting" imu messages that bound the camera times

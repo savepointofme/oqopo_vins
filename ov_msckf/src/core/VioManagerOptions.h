@@ -461,6 +461,21 @@ struct VioManagerOptions {
   /// Frequency we want to track images at (higher freq ones will be dropped)
   double track_frequency = 20.0;
 
+  /**
+   * @brief Enable gyro-aided KLT (predict feature locations via IMU-derived
+   * inter-frame rotation) for the temporal LK tracker.
+   *
+   * When true (default), VioManager integrates the gyroscope between
+   * consecutive image timestamps (bias-corrected with the current state
+   * estimate) and pushes a per-camera rotation prediction into the
+   * TrackKLT front-end. KLT then warps the previous feature pixels by
+   * H = K * R_prev_to_curr * K^-1 before invoking calcOpticalFlowPyrLK,
+   * which significantly improves tracking robustness during fast camera
+   * rotations (e.g. yaw turns) where the legacy zero-motion seed often
+   * falls outside the LK convergence basin.
+   */
+  bool use_gyro_aided_klt = true;
+
   /// Parameters used by our feature initialize / triangulator
   ov_core::FeatureInitializerOptions featinit_options;
 
@@ -502,6 +517,7 @@ struct VioManagerOptions {
       }
       parser->parse_config("knn_ratio", knn_ratio);
       parser->parse_config("track_frequency", track_frequency);
+      parser->parse_config("use_gyro_aided_klt", use_gyro_aided_klt, false);
     }
     PRINT_DEBUG("FEATURE TRACKING PARAMETERS:\n");
     PRINT_DEBUG("  - use_stereo: %d\n", use_stereo);
@@ -519,6 +535,7 @@ struct VioManagerOptions {
     PRINT_DEBUG("  - hist method: %d\n", (int)histogram_method);
     PRINT_DEBUG("  - knn ratio: %.3f\n", knn_ratio);
     PRINT_DEBUG("  - track frequency: %.1f\n", track_frequency);
+    PRINT_DEBUG("  - use gyro-aided KLT: %d\n", use_gyro_aided_klt);
     featinit_options.print(parser);
   }
 

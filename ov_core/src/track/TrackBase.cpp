@@ -246,3 +246,22 @@ void TrackBase::change_feat_id(size_t id_old, size_t id_new) {
     }
   }
 }
+
+void TrackBase::set_predicted_rotation(size_t cam_id, const cv::Matx33d &R_prev_to_curr) {
+  std::lock_guard<std::mutex> lck(mtx_predicted_rotation);
+  predicted_rotation_per_cam[cam_id] = R_prev_to_curr;
+}
+
+void TrackBase::clear_predicted_rotations() {
+  std::lock_guard<std::mutex> lck(mtx_predicted_rotation);
+  predicted_rotation_per_cam.clear();
+}
+
+bool TrackBase::get_predicted_rotation(size_t cam_id, cv::Matx33d &R_out) {
+  std::lock_guard<std::mutex> lck(mtx_predicted_rotation);
+  auto it = predicted_rotation_per_cam.find(cam_id);
+  if (it == predicted_rotation_per_cam.end())
+    return false;
+  R_out = it->second;
+  return true;
+}

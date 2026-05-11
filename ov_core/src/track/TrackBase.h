@@ -151,6 +151,45 @@ public:
   /// Setter method for number of active features
   void set_num_features(int _num_features) { num_features = _num_features; }
 
+  /**
+   * @brief Set the predicted inter-frame rotation in camera frame.
+   *
+   * The caller (estimator) should integrate gyroscope readings between the
+   * previous and current image timestamps (with current best gyro-bias
+   * estimate subtracted) to obtain a relative rotation, expressed in the
+   * camera coordinate frame, that maps a normalized direction observed at the
+   * previous image to its predicted direction at the current image:
+   *
+   *    p_C_curr = R_prev_to_curr * p_C_prev  (for a point at infinity)
+   *
+   * Equivalently, the homography for any finite-depth point under pure
+   * rotation is H = K * R_prev_to_curr * K^{-1}, where K is the camera
+   * intrinsics. KLT will use H to warp the previous feature pixel locations
+   * into a much better initial guess for the LK solver than the standard
+   * "zero motion / use previous pixel" assumption.
+   *
+   * This must be called BEFORE feed_new_camera() for the matching frame, on
+   * a per-camera basis. After feed_new_camera() consumes the prediction, the
+   * tracker clears the entry for that camera id so a stale rotation is never
+   * applied to a later frame.
+   *
+   * If no rotation is set for a camera, the tracker falls back to the legacy
+   * behaviour (identity rotation, i.e. previous pixel as the LK seed).
+   *
+   * @param cam_id Camera id (same as in CameraData::sensor_ids)
+   * @param R_prev_to_curr Rotation from previous frame (cam_id) to current
+   *                       frame (cam_id), expressed in camera coordinates.
+   */
+  void set_predicted_rotation(size_t cam_id, const cv::Matx33d &R_prev_to_curr);
+
+  /// Clear all predicted rotations. Called automatically after each
+  /// feed_new_camera() so the prediction is consumed exactly once.
+  void clear_predicted_rotations();
+
+  /// Convenience accessor: returns true if a rotation has been set for the
+  /// given camera id, and writes it into @p R_out.
+  bool get_predicted_rotation(size_t cam_id, cv::Matx33d &R_out);
+
 protected:
   /// Camera object which has all calibration in it
   std::unordered_map<size_t, std::shared_ptr<CamBase>> camera_calib;
@@ -193,6 +232,11 @@ protected:
 
   // Timing variables (most children use these...)
   boost::posix_time::ptime rT1, rT2, rT3, rT4, rT5, rT6, rT7;
+
+  /// Per-camera predicted inter-frame rotation (set by the estimator before
+  /// each feed_new_camera; consumed once and cleared by the tracker).
+  std::mutex mtx_predicted_rotation;
+  std::unordered_map<size_t, cv::Matx33d> predicted_rotation_per_cam;
 };
 
 } // namespace ov_core

@@ -456,9 +456,56 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
     message.masks.at(i) = mask_temp;
   }
 
+  // [Gyro-aided KLT] Push a per-camera predicted inter-frame rotation into
+  // the tracker before consuming the new image. This dramatically helps the
+  // LK solver during fast camera rotations (e.g. turns), where the legacy
+  // "previous-pixel" initial guess often falls outside the LK convergence
+  // basin. We only do this once VIO is initialised (so we have a real gyro
+  // bias estimate and IMU-to-camera extrinsics) and KLT is the active
+  // front-end. The prediction is consumed exactly once and cleared after
+  // feed_new_camera() so no stale rotation can leak to a later frame.
+  if (params.use_gyro_aided_klt && params.use_klt && is_initialized_vio && propagator != nullptr) {
+    double t_off = state->_calib_dt_CAMtoIMU->value()(0);
+    double t_curr_imu = message.timestamp + t_off;
+    Eigen::Vector3d bg = state->_imu->bias_g();
+    for (size_t i = 0; i < message.sensor_ids.size(); i++) {
+      size_t cam_id = message.sensor_ids.at(i);
+      auto it_prev = last_track_image_time_.find(cam_id);
+      if (it_prev == last_track_image_time_.end() || !(it_prev->second > 0.0)) {
+        continue;
+      }
+      double t_prev_imu = it_prev->second + t_off;
+      Eigen::Matrix3d R_I0_to_I1;
+      if (!propagator->compute_relative_rotation(t_prev_imu, t_curr_imu, bg, R_I0_to_I1)) {
+        continue;
+      }
+      // Map the body-frame relative rotation into the camera frame via the
+      // (current best estimate of the) IMU-to-camera extrinsic:
+      //   R_C0_to_C1 = R_ItoC * R_I0_to_I1 * R_ItoC^T
+      // Both R_ItoC and the bias estimate are time-varying when online
+      // calibration is enabled; for a short inter-frame interval this is
+      // accurate enough for an LK seed.
+      Eigen::Matrix3d R_ItoC = state->_calib_IMUtoCAM.at(cam_id)->Rot();
+      Eigen::Matrix3d R_C0_to_C1 = R_ItoC * R_I0_to_I1 * R_ItoC.transpose();
+      // Convert Eigen (column-major) to cv::Matx33d (row-major) explicitly.
+      cv::Matx33d R_cv(R_C0_to_C1(0, 0), R_C0_to_C1(0, 1), R_C0_to_C1(0, 2),
+                       R_C0_to_C1(1, 0), R_C0_to_C1(1, 1), R_C0_to_C1(1, 2),
+                       R_C0_to_C1(2, 0), R_C0_to_C1(2, 1), R_C0_to_C1(2, 2));
+      trackFEATS->set_predicted_rotation(cam_id, R_cv);
+    }
+  }
+
   // Perform our feature tracking!
   // [中文] 视觉前端: KLT / Descriptor / SIM. 内部会更新 FeatureDatabase
   trackFEATS->feed_new_camera(message);
+
+  // Consume the prediction so a later frame can't reuse a stale rotation.
+  trackFEATS->clear_predicted_rotations();
+
+  // Remember the latest image time per camera id for the next call.
+  for (size_t i = 0; i < message.sensor_ids.size(); i++) {
+    last_track_image_time_[message.sensor_ids.at(i)] = message.timestamp;
+  }
 
   // If the aruco tracker is available, the also pass to it
   // NOTE: binocular tracking for aruco doesn't make sense as we by default have the ids

@@ -891,6 +891,36 @@ void TrackKLT::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::
     return;
   }
 
+  // [Gyro-aided KLT] If the estimator has set a predicted inter-frame
+  // rotation for this temporal pair (id0 == id1), warp pts0 by the
+  // rotation-only homography H = K1 * R_prev_to_curr * K0^{-1} to obtain a
+  // much better LK seed than "previous pixel location". This dramatically
+  // improves tracking during fast camera rotations (e.g. turns) where the
+  // identity initial guess often falls outside the LK convergence basin.
+  //
+  // We deliberately only do this for the temporal case (id0 == id1). For
+  // stereo left-right tracking (id0 != id1) the relative rotation is
+  // dominated by the static extrinsic, which can also be warped here in a
+  // future change but is intentionally left out of this initial gyro-aided
+  // KLT patch.
+  cv::Matx33d R_prev_to_curr;
+  if (id0 == id1 && get_predicted_rotation(id0, R_prev_to_curr)) {
+    cv::Matx33d K0 = camera_calib.at(id0)->get_K();
+    cv::Matx33d K1 = camera_calib.at(id1)->get_K();
+    cv::Matx33d H = K1 * R_prev_to_curr * K0.inv();
+    for (size_t i = 0; i < pts0.size(); i++) {
+      cv::Vec3d p1_h(pts0[i].x, pts0[i].y, 1.0);
+      cv::Vec3d p2_h = H * p1_h;
+      if (std::abs(p2_h(2)) > 1e-9) {
+        float pu = static_cast<float>(p2_h(0) / p2_h(2));
+        float pv = static_cast<float>(p2_h(1) / p2_h(2));
+        if (std::isfinite(pu) && std::isfinite(pv)) {
+          pts1[i] = cv::Point2f(pu, pv);
+        }
+      }
+    }
+  }
+
   // Now do KLT tracking to get the valid new points
   std::vector<uchar> mask_klt;
   std::vector<float> error;

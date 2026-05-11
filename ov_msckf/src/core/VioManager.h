@@ -355,6 +355,11 @@ protected:
   bool gps_alt_bootstrapped_ = false;
   double gps_alt_z_ground_ = 0.0;
 
+  // [Gyro-aided KLT] Per-camera last image timestamp used for inter-frame
+  // gyro integration. Initialised to -1 (no previous image) so the first
+  // frame falls back to the identity rotation.
+  std::unordered_map<size_t, double> last_track_image_time_;
+
   // Good features that where used in the last update (used in visualization)
   std::vector<Eigen::Vector3d> good_features_MSCKF;
 
