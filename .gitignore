@@ -1,6 +1,7 @@
 cmake-build-*
 build
 Build
+build_ov_msckf/
 *.*~
 .idea
 doxgen_generated
@@ -8,3 +9,18 @@ doxgen_generated
 *.swo
 doc
 .vscode
+__pycache__/
+*.bag
+*.tar.gz
+
+# Per-fly trajectory + log artifacts (large, regenerable via run_*.sh scripts):
+20260509_fly*/result/**/*.log
+20260509_fly*/result/**/*.txt
+20260509_fly*/result/**/*.txt.bias
+20260509_fly*/result/**/orchestrator*.log
+# Keep the orchestrator scripts, analysis scripts and small metrics text:
+!20260509_fly*/result/**/run_*.sh
+!20260509_fly*/result/**/analyze_*.py
+!20260509_fly*/result/**/metrics_*.txt
+# Local Claude scratchpad
+.claude/

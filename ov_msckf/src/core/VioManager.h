@@ -58,12 +58,14 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <deque>
 
 #include "VioManagerOptions.h"
 
 namespace ov_core {
 struct ImuData;
 struct CameraData;
+struct TrackerWarpVizPacket;
 class TrackBase;
 class FeatureInitializer;
 } // namespace ov_core
@@ -78,6 +80,8 @@ class StateHelper;
 class UpdaterMSCKF;
 class UpdaterSLAM;
 class UpdaterZeroVelocity;
+class UpdaterGroundPlaneRange;
+class UpdaterGroundPlaneFeature;
 class Propagator;
 
 /**
@@ -167,11 +171,95 @@ public:
                                      bool also_update_vz = false,
                                      bool range_mode = false);
 
-  /// Reset C-mode bootstrap (for testing). Call between runs if reusing the VioManager.
+  /// Feed GPS altitude with VioManager-managed relative reference.
+  /// On first call, captures gps_ref and vio_ref, then uses:
+  ///   res = (altitude_z - gps_ref) - (p_z - vio_ref)
+  /// Caller must pass raw GPS ENU z (without pre-subtracting a reference).
+  void feed_measurement_gps_altitude_relative(double timestamp, double altitude_z, double sigma,
+                                               double chi2_gate = 10000.0, bool use_schmidt = false,
+                                               bool also_update_vz = false);
+
+  /// Set min P_zz floor to prevent covariance collapse (0 = disabled).
+  /// Floor is applied BEFORE the EKF update so K_pz stays non-degenerate,
+  /// and again AFTER the update so the next call also benefits.
+  void set_gps_alt_min_pzz(double v) { gps_alt_min_pzz_ = v; }
+  /// Delay GPS altitude / ground-plane updates by this many seconds after
+  /// VIO init.  This prevents the z_ground bootstrap from anchoring to
+  /// transient (un-settled) monocular scale.
+  void set_gps_alt_min_t_after_init(double v) { gps_alt_min_t_after_init_ = v; }
+
+  /// Enable Z-only GPS altitude update mode.
+  /// When enabled, only the IMU position-z correction is applied (all other
+  /// state components: px, py, attitude, velocity, biases, clones are zeroed).
+  /// Covariance: only P_zz is reduced; cross-terms are NOT updated.
+  void set_gps_alt_zonly_update(bool v) { gps_alt_zonly_update_ = v; }
+
+  /// Set innovation rejection gate (meters). Updates with |residual| > threshold
+  /// are skipped entirely (no EKF update). Default = 1e9 (off).
+  void set_gps_alt_max_res_gate(double v) { gps_alt_max_res_gate_ = v; }
+
+  /// Set cross-covariance guard thresholds (0 = disabled).
+  /// Reject GPS update if single-update XY position correction norm exceeds this (meters).
+  void set_gps_alt_guard_dxy_max(double v) { gps_alt_guard_dxy_max_ = v; }
+  /// Reject if norm(K_xy) / abs(K_pz) exceeds this (dimensionless gain ratio).
+  void set_gps_alt_guard_kxy_ratio_max(double v) { gps_alt_guard_kxy_ratio_max_ = v; }
+  /// Reject if bias correction norm (acc or gyro) exceeds this.
+  void set_gps_alt_guard_dbias_max(double v) { gps_alt_guard_dbias_max_ = v; }
+
+  /// Per-call diagnostic snapshot populated by every GPS altitude update.
+  struct GpsAltLastUpdate {
+    double t = -1.0;
+    double gps_z = 0.0;    ///< GPS altitude fed (after reference subtraction by caller)
+    double vio_z = 0.0;    ///< VIO p_z BEFORE update
+    double residual = 0.0; ///< raw residual (GPS - VIO) before rejection gate
+    double pzz = 0.0;      ///< P_zz BEFORE EKF update (after floor injection)
+    double kpz = 0.0;      ///< Kalman gain for p_z
+    double kpx = 0.0;      ///< Kalman gain for p_x
+    double kpy = 0.0;      ///< Kalman gain for p_y
+    double kxy_norm = 0.0; ///< norm(K_xy) = sqrt(K_px^2 + K_py^2)
+    double dx = 0.0;       ///< predicted dx correction (m)
+    double dy = 0.0;       ///< predicted dy correction (m)
+    double dz = 0.0;       ///< predicted dz correction (m)
+    double dtheta_norm = 0.0; ///< predicted orientation correction norm
+    double dba_norm = 0.0;    ///< predicted accel bias correction norm
+    double dbg_norm = 0.0;    ///< predicted gyro bias correction norm
+    double chi2 = 0.0;
+    bool clipped = false;  ///< always false (rejection gate replaces clip)
+    bool zonly = false; ///< Z-only mode was used for this update
+    std::string decision = "NONE"; ///< APPLY / REJECT_BY_DXY / REJECT_BY_GAIN_RATIO / REJECT_BY_BIAS / ZONLY
+  };
+  const GpsAltLastUpdate &get_last_gps_alt_update() const { return gps_alt_last_; }
+
+  /// Reset GPS altitude bootstrap state (for all modes). Call between runs.
   void reset_gps_altitude_bootstrap() {
     gps_alt_bootstrapped_ = false;
     gps_alt_z_ground_ = 0.0;
+    gps_alt_rel_bootstrapped_ = false;
+    gps_alt_rel_gps_ref_ = 0.0;
+    gps_alt_rel_vio_ref_ = 0.0;
   }
+
+  /// Print final GPS altitude fusion statistics summary.
+  void print_gps_alt_final_summary();
+
+  /// Feed GPS altitude as pseudo slant-range to a local ground plane.
+  /// Uses UpdaterGroundPlaneRange internally.  z_ground is bootstrapped
+  /// on first call.  Use zonly=true to only correct p_z (recommended).
+  bool feed_measurement_gps_ground_plane(double timestamp, double z_gps,
+                                          double sigma_range = 0.3,
+                                          bool zonly = true);
+
+  /// Access the ground-plane range updater for diagnostics.
+  std::shared_ptr<UpdaterGroundPlaneRange> get_updater_gplane_range() { return updaterGPlaneRange; }
+
+  /// Enable Stage B (ground-plane feature update).  z_ground is taken from the
+  /// Stage A bootstrap (must be enabled and bootstrapped for Stage B to fire).
+  void enable_gplane_feature(double sigma_pixel = 3.0, int max_features = 5,
+                             double center_frac = 0.8, double min_cos_tilt = 0.85,
+                             double max_residual_px = 5.0);
+
+  /// Access the ground-plane feature updater for diagnostics.
+  std::shared_ptr<UpdaterGroundPlaneFeature> get_updater_gplane_feature() { return updaterGPlaneFeature; }
 
   /// If we are initialized or not
   /// [中文] 判断系统是否已初始化: 必须既完成初始化又至少做过一次更新。
@@ -188,6 +276,11 @@ public:
 
   /// Accessor to get the current propagator
   std::shared_ptr<Propagator> get_propagator() { return propagator; }
+
+  /// Forward the latest per-camera warp visualization packet from the tracker.
+  bool get_warp_viz_packet(size_t cam_id, ov_core::TrackerWarpVizPacket &packet) {
+    return trackFEATS->get_warp_viz_packet(cam_id, packet);
+  }
 
   /// Get a nice visualization image of what tracks we have
   cv::Mat get_historical_viz_image();
@@ -323,6 +416,13 @@ protected:
   /// [中文] 零速更新器, 仅在静止时触发
   std::shared_ptr<UpdaterZeroVelocity> updaterZUPT;
 
+  /// Ground-plane pseudo-rangefinder updater
+  /// [中文] 地面平面伪测距更新器
+  std::shared_ptr<UpdaterGroundPlaneRange> updaterGPlaneRange;
+
+  /// Stage B — ground-plane feature updater (optional, off by default)
+  std::shared_ptr<UpdaterGroundPlaneFeature> updaterGPlaneFeature;
+
   /// This is the queue of measurement times that have come in since we starting doing initialization
   /// After we initialize, we will want to prop & update to the latest timestamp quickly
   /// [中文] 初始化期间稯积的相机帧时间戳队列; 初始化成功后会快速重放这些时刻
@@ -355,10 +455,75 @@ protected:
   bool gps_alt_bootstrapped_ = false;
   double gps_alt_z_ground_ = 0.0;
 
+  // [Relative mode] GPS altitude relative reference bootstrap
+  bool gps_alt_rel_bootstrapped_ = false;
+  double gps_alt_rel_gps_ref_ = 0.0;
+  double gps_alt_rel_vio_ref_ = 0.0;
+
+  // [P_zz floor] Minimum P_zz to prevent Kalman gain collapse (0 = disabled)
+  double gps_alt_min_pzz_ = 0.0;
+  double gps_alt_min_t_after_init_ = 0.0; // delay z_ground bootstrap (s)
+
+  // [Innovation gate] Max |residual| before rejecting update entirely (1e9 = disabled)
+  double gps_alt_max_res_gate_ = 1e9;
+
+  // [Cross-covariance guard] Reject update if predicted XY correction norm > this (m). 0=off.
+  double gps_alt_guard_dxy_max_ = 0.0;
+  // [Cross-covariance guard] Reject if norm(K_xy)/abs(K_pz) > this. 0=off.
+  double gps_alt_guard_kxy_ratio_max_ = 0.0;
+  // [Cross-covariance guard] Reject if bias correction norm > this. 0=off.
+  double gps_alt_guard_dbias_max_ = 0.0;
+
+  // [Z-only mode] Only apply IMU p_z correction; zero all other corrections.
+  // Covariance: only reduce P_zz, do not update cross-terms.
+  bool gps_alt_zonly_update_ = false;
+
+public:
+  /// Per-evaluation statistics for GPS altitude fusion diagnostics.
+  struct GpsAltStats {
+    size_t n_called = 0;
+    size_t n_skipped = 0;      // time-alignment skip (|dt| > 0.2s)
+    size_t n_rejected = 0;     // residual gate rejection
+    size_t n_rejected_dxy = 0; // guard: XY correction too large
+    size_t n_rejected_kxy = 0; // guard: K_xy/K_pz ratio too large
+    size_t n_rejected_bias = 0;// guard: bias correction too large
+    size_t n_accepted = 0;     // EKF update applied
+    double sum_K_pz = 0.0;
+    double sum_K_xy_norm = 0.0;
+    double sum_dxy_norm = 0.0;
+    double sum_dtheta_norm = 0.0;
+    double sum_dba_norm = 0.0;
+    double sum_dbg_norm = 0.0;
+    double sum_P_zz = 0.0;
+    double sum_abs_res = 0.0;
+    double sum_abs_dpz = 0.0;
+    double last_summary_time = -1.0;
+    double first_eval_time = -1.0;
+    double last_eval_time = -1.0;
+  };
+  const GpsAltStats &get_gps_alt_stats() const { return gps_alt_stats_; }
+
+private:
+  GpsAltStats gps_alt_stats_;
+  GpsAltLastUpdate gps_alt_last_;
+
   // [Gyro-aided KLT] Per-camera last image timestamp used for inter-frame
   // gyro integration. Initialised to -1 (no previous image) so the first
   // frame falls back to the identity rotation.
   std::unordered_map<size_t, double> last_track_image_time_;
+
+  // [Ground-parallel warp] Stores the PREVIOUS frame's R_GtoC per camera.
+  // R_comp = R_GtoC_curr * R_GtoC_prev^T (frame-to-frame) is passed to TrackKLT.
+  // Updated to R_GtoC_curr each frame after the warp is computed.
+  bool gravity_warp_ref_set_ = false;
+  std::unordered_map<size_t, Eigen::Matrix3d> gravity_warp_R_ref_;
+
+  /// [Landing watch] rolling (t, n_slam) for drop-rate detection
+  std::deque<std::pair<double, int>> slam_count_history_;
+  /// [Landing gate] latched once altitude drops below threshold (with hysteresis)
+  bool landing_update_halted_ = false;
+  /// [Landing gate] one-shot to avoid log spam
+  bool landing_halt_msg_emitted_ = false;
 
   // Good features that where used in the last update (used in visualization)
   std::vector<Eigen::Vector3d> good_features_MSCKF;

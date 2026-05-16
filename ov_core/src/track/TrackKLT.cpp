@@ -31,6 +31,19 @@
 
 using namespace ov_core;
 
+namespace {
+// Apply a 3x3 homography (cv::Matx33d) in-place to a vector of KeyPoints.
+// Points that map to near-zero z are left unchanged.
+static void apply_H_kp(std::vector<cv::KeyPoint> &kps, const cv::Matx33d &H) {
+  for (auto &kp : kps) {
+    cv::Vec3d ph(kp.pt.x, kp.pt.y, 1.0);
+    cv::Vec3d pw = H * ph;
+    if (std::abs(pw(2)) > 1e-9)
+      kp.pt = cv::Point2f(static_cast<float>(pw(0) / pw(2)), static_cast<float>(pw(1) / pw(2)));
+  }
+}
+} // anonymous namespace
+
 // =============================================================================
 // [中文] feed_new_camera
 //  请注意:
@@ -154,8 +167,54 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
   std::vector<uchar> mask_ll;
   std::vector<cv::KeyPoint> pts_left_new = pts_left_old;
 
-  // Lets track temporally
-  perform_matching(img_pyramid_last[cam_id], imgpyr, pts_left_old, pts_left_new, cam_id, cam_id, mask_ll);
+  // [Ground-parallel warp — tracking path, FRAME-TO-FRAME]
+  //
+  // VioManager sets R_comp = R_GtoC_curr * R_GtoC_prev^T via set_gravity_warp().
+  // This is the frame-to-frame relative rotation: maps last-camera rays → current-camera frame.
+  //
+  // We warp ONLY img_last (NOT img_curr) with H = K * R_comp * K^{-1}.
+  // After warping, img_last_w shows the previous ground texture as if captured from the
+  // current camera orientation. KLT between img_last_w and the raw current image therefore
+  // sees only translational parallax; the rotational component is removed.
+  //
+  // COORDINATE INVARIANT: pts_left_new from KLT are directly in raw current-image coords.
+  // No un-warp step is needed. The estimator always receives original-space observations.
+  //
+  // RANSAC in perform_matching: pts0 are warped (H applied), pts1 are raw current.
+  // Undistorting warped-fisheye coords is slightly imprecise but tolerable (error bounded
+  // by ~rotation_mag * distortion_nonlinearity; well within RANSAC threshold for turns
+  // under ~15°).
+  //
+  // Warp type: cv::warpPerspective (true projective, H = K*R*K^{-1}, NOT warpAffine).
+  cv::Matx33d R_comp_gravity;
+  const bool do_gravity_warp = get_gravity_warp(cam_id, R_comp_gravity);
+  std::vector<cv::Mat> imgpyr_last_klt = img_pyramid_last[cam_id];
+  cv::Matx33d H_gravity;
+  cv::Mat prev_image_for_viz; // saved for warp viz packet (warped or raw prev)
+  if (do_gravity_warp) {
+    cv::Matx33d K = camera_calib.at(cam_id)->get_K();
+    H_gravity = K * R_comp_gravity * K.inv();
+    cv::warpPerspective(img_last[cam_id], prev_image_for_viz, cv::Mat(H_gravity), img.size(), cv::INTER_LINEAR);
+    cv::buildOpticalFlowPyramid(prev_image_for_viz, imgpyr_last_klt, win_size, pyr_levels);
+    apply_H_kp(pts_left_old, H_gravity); // move last-frame pts into current-orientation space
+    pts_left_new = pts_left_old;         // initial KLT guess ≈ current-frame location
+    PRINT_DEBUG("[KLT-WARP] cam%zu img0=warped_last img1=raw_curr "
+                "R_comp=[%.3f %.3f %.3f; %.3f %.3f %.3f; %.3f %.3f %.3f] %zu pts\n",
+                cam_id,
+                R_comp_gravity(0, 0), R_comp_gravity(0, 1), R_comp_gravity(0, 2),
+                R_comp_gravity(1, 0), R_comp_gravity(1, 1), R_comp_gravity(1, 2),
+                R_comp_gravity(2, 0), R_comp_gravity(2, 1), R_comp_gravity(2, 2),
+                pts_left_old.size());
+  } else {
+    prev_image_for_viz = img_last[cam_id];
+    PRINT_DEBUG("[KLT-WARP] cam%zu img0=raw_last img1=raw_curr (warp OFF)\n", cam_id);
+  }
+
+  // Track: warped-last vs raw-current (warp on) or raw-last vs raw-current (warp off).
+  // In both cases pts_left_new exits in raw current-image coordinates.
+  perform_matching(imgpyr_last_klt, imgpyr, pts_left_old, pts_left_new, cam_id, cam_id, mask_ll);
+  // NO un-warp: pts_left_new is already in raw current coords regardless of warp mode.
+
   assert(pts_left_new.size() == ids_left_old.size());
   rT4 = boost::posix_time::microsec_clock::local_time();
 
@@ -174,6 +233,7 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
   // Get our "good tracks"
   std::vector<cv::KeyPoint> good_left;
   std::vector<size_t> good_ids_left;
+  std::vector<cv::Point2f> good_prev_pts; // corresponding prev points for viz packet
 
   // Loop through all left points
   for (size_t i = 0; i < pts_left_new.size(); i++) {
@@ -189,6 +249,7 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
     if (mask_ll[i]) {
       good_left.push_back(pts_left_new[i]);
       good_ids_left.push_back(ids_left_old[i]);
+      good_prev_pts.push_back(pts_left_old[i].pt); // warped prev if warp active, raw prev if off
     }
   }
 
@@ -208,6 +269,25 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
     ids_last[cam_id] = good_ids_left;
   }
   rT5 = boost::posix_time::microsec_clock::local_time();
+
+  // Populate warp visualization packet with final accepted matches
+  {
+    TrackerWarpVizPacket pkt;
+    pkt.valid = true;
+    pkt.warp_active = do_gravity_warp;
+    pkt.cam_id = cam_id;
+    pkt.t_curr = message.timestamp;
+    pkt.prev_image_for_viz = prev_image_for_viz.clone();
+    pkt.curr_raw_image = img.clone();
+    pkt.prev_pts_for_viz = good_prev_pts;
+    // Convert current raw points to Point2f
+    pkt.curr_pts_raw.reserve(good_left.size());
+    for (const auto &kp : good_left)
+      pkt.curr_pts_raw.push_back(kp.pt);
+    pkt.feature_ids = good_ids_left;
+    std::lock_guard<std::mutex> lk(mtx_warp_viz_packets_);
+    warp_viz_packets_[cam_id] = std::move(pkt);
+  }
 
   // Timing information
   PRINT_ALL("[TIME-KLT]: %.4f seconds for pyramid\n", (rT2 - rT1).total_microseconds() * 1e-6);
@@ -284,16 +364,58 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
   std::vector<cv::KeyPoint> pts_left_new = pts_left_old;
   std::vector<cv::KeyPoint> pts_right_new = pts_right_old;
 
-  // Lets track temporally
+  // [Ground-parallel warp — stereo temporal, FRAME-TO-FRAME]
+  // Same warp logic as in feed_monocular but applied independently to left and right cameras
+  // (each has its own K and R_comp from set_gravity_warp).
+  // Only temporal KLT (left-to-left, right-to-right) is warped; stereo cross-matching
+  // (perform_detection_stereo above, and the left-right match below) runs on raw images.
+  // pts_left_new / pts_right_new exit in raw current-image coords; no un-warp needed.
+  cv::Matx33d R_comp_left, R_comp_right;
+  const bool do_warp_left = get_gravity_warp(cam_id_left, R_comp_left);
+  const bool do_warp_right = get_gravity_warp(cam_id_right, R_comp_right);
+
+  std::vector<cv::Mat> pyr_last_left_klt = img_pyramid_last[cam_id_left];
+  std::vector<cv::Mat> pyr_last_right_klt = img_pyramid_last[cam_id_right];
+  cv::Matx33d H_left, H_right;
+
+  cv::Mat prev_image_for_viz_left, prev_image_for_viz_right;
+  if (do_warp_left) {
+    cv::Matx33d K = camera_calib.at(cam_id_left)->get_K();
+    H_left = K * R_comp_left * K.inv();
+    cv::warpPerspective(img_last[cam_id_left], prev_image_for_viz_left, cv::Mat(H_left), img_left.size(), cv::INTER_LINEAR);
+    cv::buildOpticalFlowPyramid(prev_image_for_viz_left, pyr_last_left_klt, win_size, pyr_levels);
+    apply_H_kp(pts_left_old, H_left);
+    pts_left_new = pts_left_old;
+  } else {
+    prev_image_for_viz_left = img_last[cam_id_left];
+  }
+  if (do_warp_right) {
+    cv::Matx33d K = camera_calib.at(cam_id_right)->get_K();
+    H_right = K * R_comp_right * K.inv();
+    cv::warpPerspective(img_last[cam_id_right], prev_image_for_viz_right, cv::Mat(H_right), img_right.size(), cv::INTER_LINEAR);
+    cv::buildOpticalFlowPyramid(prev_image_for_viz_right, pyr_last_right_klt, win_size, pyr_levels);
+    apply_H_kp(pts_right_old, H_right);
+    pts_right_new = pts_right_old;
+  } else {
+    prev_image_for_viz_right = img_last[cam_id_right];
+  }
+
+  // Track temporally: warped-last vs raw-current for each camera.
+  // pts_left_new / pts_right_new exit in raw current-image coords (no un-warp needed).
   parallel_for_(cv::Range(0, 2), LambdaBody([&](const cv::Range &range) {
                   for (int i = range.start; i < range.end; i++) {
                     bool is_left = (i == 0);
-                    perform_matching(img_pyramid_last[is_left ? cam_id_left : cam_id_right], is_left ? imgpyr_left : imgpyr_right,
-                                     is_left ? pts_left_old : pts_right_old, is_left ? pts_left_new : pts_right_new,
-                                     is_left ? cam_id_left : cam_id_right, is_left ? cam_id_left : cam_id_right,
+                    perform_matching(is_left ? pyr_last_left_klt : pyr_last_right_klt,
+                                     is_left ? imgpyr_left : imgpyr_right, // raw current
+                                     is_left ? pts_left_old : pts_right_old,
+                                     is_left ? pts_left_new : pts_right_new,
+                                     is_left ? cam_id_left : cam_id_right,
+                                     is_left ? cam_id_left : cam_id_right,
                                      is_left ? mask_ll : mask_rr);
                   }
                 }));
+  // NO un-warp: pts are already in raw current coords.
+
   rT4 = boost::posix_time::microsec_clock::local_time();
 
   //===================================================================================
@@ -329,6 +451,7 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
   // Get our "good tracks"
   std::vector<cv::KeyPoint> good_left, good_right;
   std::vector<size_t> good_ids_left, good_ids_right;
+  std::vector<cv::Point2f> good_prev_pts_left, good_prev_pts_right;
 
   // Loop through all left points
   for (size_t i = 0; i < pts_left_new.size(); i++) {
@@ -357,11 +480,12 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
       good_right.push_back(pts_right_new.at(index_right));
       good_ids_left.push_back(ids_left_old.at(i));
       good_ids_right.push_back(ids_right_old.at(index_right));
-      // PRINT_DEBUG("adding to stereo - %u , %u\n", ids_left_old.at(i), ids_right_old.at(index_right));
+      good_prev_pts_left.push_back(pts_left_old[i].pt);
+      good_prev_pts_right.push_back(pts_right_old[index_right].pt);
     } else if (mask_ll[i]) {
       good_left.push_back(pts_left_new.at(i));
       good_ids_left.push_back(ids_left_old.at(i));
-      // PRINT_DEBUG("adding to left - %u \n",ids_left_old.at(i));
+      good_prev_pts_left.push_back(pts_left_old[i].pt);
     }
   }
 
@@ -377,7 +501,7 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
     if (mask_rr[i] && !added_already) {
       good_right.push_back(pts_right_new.at(i));
       good_ids_right.push_back(ids_right_old.at(i));
-      // PRINT_DEBUG("adding to right - %u \n", ids_right_old.at(i));
+      good_prev_pts_right.push_back(pts_right_old[i].pt);
     }
   }
 
@@ -408,6 +532,41 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
     ids_last[cam_id_right] = good_ids_right;
   }
   rT6 = boost::posix_time::microsec_clock::local_time();
+
+  // Populate warp visualization packets for both cameras with final accepted matches
+  {
+    std::lock_guard<std::mutex> lk(mtx_warp_viz_packets_);
+    { // Left camera
+      TrackerWarpVizPacket pkt;
+      pkt.valid = true;
+      pkt.warp_active = do_warp_left;
+      pkt.cam_id = cam_id_left;
+      pkt.t_curr = message.timestamp;
+      pkt.prev_image_for_viz = prev_image_for_viz_left.clone();
+      pkt.curr_raw_image = img_left.clone();
+      pkt.prev_pts_for_viz = good_prev_pts_left;
+      pkt.curr_pts_raw.reserve(good_left.size());
+      for (const auto &kp : good_left)
+        pkt.curr_pts_raw.push_back(kp.pt);
+      pkt.feature_ids = good_ids_left;
+      warp_viz_packets_[cam_id_left] = std::move(pkt);
+    }
+    { // Right camera
+      TrackerWarpVizPacket pkt;
+      pkt.valid = true;
+      pkt.warp_active = do_warp_right;
+      pkt.cam_id = cam_id_right;
+      pkt.t_curr = message.timestamp;
+      pkt.prev_image_for_viz = prev_image_for_viz_right.clone();
+      pkt.curr_raw_image = img_right.clone();
+      pkt.prev_pts_for_viz = good_prev_pts_right;
+      pkt.curr_pts_raw.reserve(good_right.size());
+      for (const auto &kp : good_right)
+        pkt.curr_pts_raw.push_back(kp.pt);
+      pkt.feature_ids = good_ids_right;
+      warp_viz_packets_[cam_id_right] = std::move(pkt);
+    }
+  }
 
   //  // Timing information
   PRINT_ALL("[TIME-KLT]: %.4f seconds for pyramid\n", (rT2 - rT1).total_microseconds() * 1e-6);
@@ -864,6 +1023,15 @@ void TrackKLT::perform_detection_stereo(const std::vector<cv::Mat> &img0pyr, con
       grid_2d_close1.at<uint8_t>(y_grid, x_grid) = 255;
     }
   }
+}
+
+bool TrackKLT::get_warp_viz_packet(size_t cam_id, TrackerWarpVizPacket &packet) {
+  std::lock_guard<std::mutex> lk(mtx_warp_viz_packets_);
+  auto it = warp_viz_packets_.find(cam_id);
+  if (it == warp_viz_packets_.end())
+    return false;
+  packet = it->second;
+  return packet.valid;
 }
 
 void TrackKLT::perform_matching(const std::vector<cv::Mat> &img0pyr, const std::vector<cv::Mat> &img1pyr, std::vector<cv::KeyPoint> &kpts0,

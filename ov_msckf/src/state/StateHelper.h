@@ -134,6 +134,46 @@ public:
                                      const std::vector<std::shared_ptr<ov_type::Type>> &order);
 
   /**
+   * @brief Inject noise into the position-z element of the state covariance.
+   * Used to maintain a minimum P_zz floor for GPS altitude fusion.
+   * @param state Pointer to state
+   * @param noise Amount of noise (variance) to add to P_zz diagonal
+   */
+  static void inject_pz_noise(std::shared_ptr<State> state, double noise);
+
+  /**
+   * @brief Z-only EKF covariance update: only reduce P_zz, cross-terms unchanged.
+   *
+   * Standard Joseph-form reduction for a 1-D measurement of p_z:
+   *   P_zz_new = P_zz - P_zz^2 / S
+   *
+   * @param state Pointer to state
+   * @param S Innovation covariance (P_zz + R)
+   */
+  static void ekf_update_zonly(std::shared_ptr<State> state, double R);
+
+  /**
+   * @brief Z-only EKF update: full covariance update, only p_z state correction.
+   *
+   * Performs a standard EKF covariance update (Joseph form) for consistency,
+   * but only applies the IMU position-z component of the state correction.
+   * All other state components (px, py, v, q, bg, ba, clones, SLAM) are
+   * reverted to their pre-update values.
+   *
+   * Uses the same H_order / H / res / R interface as EKFUpdate.
+   *
+   * @param state Pointer to state
+   * @param H_order Variable ordering used in the compressed Jacobian
+   * @param H Condensed Jacobian of updating measurement
+   * @param res Residual of updating measurement
+   * @param R Updating measurement covariance
+   */
+  static void EKFUpdateZOnly(std::shared_ptr<State> state,
+                             const std::vector<std::shared_ptr<ov_type::Type>> &H_order,
+                             const Eigen::MatrixXd &H, const Eigen::VectorXd &res,
+                             const Eigen::MatrixXd &R);
+
+  /**
    * @brief For a given set of variables, this will this will calculate a smaller covariance.
    *
    * That only includes the ones specified with all crossterms.

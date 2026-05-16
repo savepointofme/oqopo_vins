@@ -91,35 +91,7 @@ grid_y: 10 # extraction sub-grid count for vertical direction (uniform tracking)
 min_px_dist: 20 # distance between features (features near each other provide less information)
 knn_ratio: 0.70 # descriptor knn threshold for the top two descriptor matches
 track_frequency: 10.0 # frequency we will perform feature tracking at (in frames per second / hertz)
-use_gyro_aided_klt: true # warp KLT initial guess with IMU-derived inter-frame rotation (better tracking through turns)
-
-# === Gyro-aided KLT runtime gates (added 2026-05) ===
-# Below this integrated rotation magnitude (rad), the warp introduces more
-# systematic bias from bg uncertainty than it gains in LK basin coverage,
-# so we keep the legacy zero-motion seed. 0.026 rad ~= 1.5 deg.
-use_gyro_aided_klt_min_rot_rad: 0.026
-# Skip the warp while sqrt(diag P_bg) is still above this threshold.
-# 0.005 rad/s ~= 0.3 deg/s.
-use_gyro_aided_klt_max_bg_sigma: 0.005
-
-# === MSCKF parallax filter (added 2026-05) ===
-# Drops MSCKF candidate features whose pixel parallax across the clone
-# window is below this many pixels. Recommended 2.0 - 3.0 px for 50-90 m
-# downward-looking; 0.0 disables.
-min_msckf_parallax_px: 2.0
-
-# === Ground-parallel KLT warp (Stage 2, added 2026-05) ===
-# When true, warps both pyramids with H = K * R_comp * K^-1 before KLT,
-# removing accumulated rotation since the reference frame so translational
-# parallax is not contaminated by rotational optical flow.
-# Feature positions are un-warped back before reaching the estimator.
-# Set true to enable; false for legacy behavior (A/B testing).
-use_ground_parallel_warp: false
-
-# === Landing safety gate (added 2026-05) ===
-# If > 0, MSCKF / SLAM updates halt once altitude drops below this many
-# meters. -1 disables. Recommended 50.0 for 50-90 m evaluation envelope.
-landing_safety_min_alt_m: 50.0
+use_gyro_aided_klt: false # warp KLT initial guess with IMU-derived inter-frame rotation (better tracking through turns)
 downsample_cameras: false # will downsample image in half if true
 num_opencv_threads: 4 # -1: auto, 0-1: serial, >1: number of threads
 histogram_method: "NONE" # NONE, HISTOGRAM, CLAHE

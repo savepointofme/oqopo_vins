@@ -474,7 +474,49 @@ struct VioManagerOptions {
    * rotations (e.g. yaw turns) where the legacy zero-motion seed often
    * falls outside the LK convergence basin.
    */
-  bool use_gyro_aided_klt = true;
+  // Default false: must be explicitly opted-in via YAML `use_gyro_aided_klt: true`.
+  // Conservative default prevents unintended activation on mono runs that have no
+  // explicit YAML entry; stereo config sets this true explicitly.
+  bool use_gyro_aided_klt = false;
+
+  /// Min integrated rotation magnitude (rad) for the warp to fire. Below
+  /// this the bg-driven systematic warp error exceeds its LK basin benefit.
+  double use_gyro_aided_klt_min_rot_rad = 0.026;
+
+  /// Max sqrt(diag P_bg) (rad/s) for the warp to fire. Skips warp while
+  /// bg is uncertain, which would otherwise self-reinforce bias via the
+  /// visual residual cross-cov.
+  double use_gyro_aided_klt_max_bg_sigma = 0.005;
+
+  /// If > 0, drop MSCKF candidate features whose max 2-D pixel parallax
+  /// across the active clone window is below this threshold. Most
+  /// effective single lever in low-info downward-looking high-altitude.
+  double min_msckf_parallax_px = 0.0;
+
+  /// Gravity-aligned image warp in the KLT tracking path.
+  ///
+  /// TRACKING PATH (not visualization-only): when true, TrackKLT warps both
+  /// the "last" and "current" camera images into a gravity-aligned frame
+  /// (H = K * R_comp * K^{-1}) before running calcOpticalFlowPyrLK. Tracked
+  /// feature positions are un-warped back to original image coordinates before
+  /// FeatureDatabase storage, so the estimator's camera model is unaffected.
+  ///
+  /// Effect: KLT sees only translational parallax, not rotation+translation.
+  /// Features tracked through turns retain pure translational parallax and are
+  /// more likely to pass the min_msckf_parallax_px gate after the turn, reducing
+  /// post-turn scale/altitude jumps.
+  ///
+  /// Requires VIO to be initialised (uses current IMU attitude from state).
+  /// The reference orientation is captured at first activation and held fixed.
+  /// A/B test: run same dataset with/without this flag and compare ATE and
+  /// altitude traces.
+  ///
+  /// Config switch: use_ground_parallel_warp (default: false)
+  bool use_ground_parallel_warp = false;
+
+  /// If > 0, MSCKF / SLAM updates halt once estimated altitude drops below
+  /// this many meters. Operator should take over. -1 disables.
+  double landing_safety_min_alt_m = -1.0;
 
   /// Parameters used by our feature initialize / triangulator
   ov_core::FeatureInitializerOptions featinit_options;
@@ -518,6 +560,11 @@ struct VioManagerOptions {
       parser->parse_config("knn_ratio", knn_ratio);
       parser->parse_config("track_frequency", track_frequency);
       parser->parse_config("use_gyro_aided_klt", use_gyro_aided_klt, false);
+    parser->parse_config("use_gyro_aided_klt_min_rot_rad", use_gyro_aided_klt_min_rot_rad, false);
+    parser->parse_config("use_gyro_aided_klt_max_bg_sigma", use_gyro_aided_klt_max_bg_sigma, false);
+    parser->parse_config("min_msckf_parallax_px", min_msckf_parallax_px, false);
+    parser->parse_config("landing_safety_min_alt_m", landing_safety_min_alt_m, false);
+    parser->parse_config("use_ground_parallel_warp", use_ground_parallel_warp, false);
     }
     PRINT_DEBUG("FEATURE TRACKING PARAMETERS:\n");
     PRINT_DEBUG("  - use_stereo: %d\n", use_stereo);
@@ -536,6 +583,18 @@ struct VioManagerOptions {
     PRINT_DEBUG("  - knn ratio: %.3f\n", knn_ratio);
     PRINT_DEBUG("  - track frequency: %.1f\n", track_frequency);
     PRINT_DEBUG("  - use gyro-aided KLT: %d\n", use_gyro_aided_klt);
+  PRINT_DEBUG("  - gyro-KLT min_rot_rad:    %.4f (%.2f deg)\n",
+              use_gyro_aided_klt_min_rot_rad,
+              use_gyro_aided_klt_min_rot_rad * 180.0 / M_PI);
+  PRINT_DEBUG("  - gyro-KLT max_bg_sigma:   %.4f rad/s\n",
+              use_gyro_aided_klt_max_bg_sigma);
+  PRINT_DEBUG("  - min_msckf_parallax_px:   %.2f\n", min_msckf_parallax_px);
+  PRINT_DEBUG("  - use_ground_parallel_warp: %d\n", use_ground_parallel_warp);
+  PRINT_DEBUG("  - landing_safety_min_alt_m: %.2f\n", landing_safety_min_alt_m);
+  if (landing_safety_min_alt_m > 0.0) {
+    PRINT_INFO(CYAN "[CFG] landing_safety_min_alt_m = %.2fm: updates will halt below this altitude.\n" RESET,
+               landing_safety_min_alt_m);
+  }
     featinit_options.print(parser);
   }
 

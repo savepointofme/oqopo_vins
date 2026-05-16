@@ -1058,31 +1058,48 @@ Eigen::MatrixXd Propagator::compute_H_Tg(std::shared_ptr<State> state, const Eig
   H_Tg << a_1 * I_3x3, a_2 * I_3x3, a_3 * I_3x3;
   return H_Tg;
 }
-bool Propagator::compute_relative_rotation(double time0, double time1, const Eigen::Vector3d &bg, Eigen::Matrix3d &R_I0_to_I1) {
+bool Propagator::compute_relative_rotation(std::shared_ptr<State> state, double time0, double time1, Eigen::Matrix3d &R_I0_to_I1) {
 
   // Sanity: require a non-degenerate forward interval.
-  if (!(time1 > time0))
+  if (state == nullptr || !(time1 > time0))
     return false;
 
-  // Grab readings that bracket [time0, time1]. select_imu_readings()
-  // already handles linear interpolation at the endpoints so the returned
-  // vector spans the exact requested interval (when enough data exists).
+  // Grab readings that bracket [time0, time1].
   std::vector<ov_core::ImuData> readings;
   {
     std::lock_guard<std::mutex> lck(imu_data_mtx);
+    // warn=false is intentional — falling back to the zero-motion seed is OK.
     readings = Propagator::select_imu_readings(imu_data, time0, time1, false);
   }
-  if (readings.size() < 2)
+  if (readings.size() < 2) {
+    PRINT_DEBUG("Propagator::compute_relative_rotation(): only %d IMU samples in window [%.3f, %.3f]\n",
+                (int)readings.size(), time0, time1);
     return false;
+  }
 
-  // Bias-corrected, dt-weighted sum of angular velocity (trapezoidal rule).
-  // theta = integral_{t0}^{t1} (w - bg) dt
+  // Current best estimates of IMU intrinsics + biases. Match exactly what
+  // Propagator::predict_and_compute does so the KLT seed is consistent with
+  // the filter's belief (essential when do_calib_imu_intrinsics: true).
+  Eigen::Vector3d bg = state->_imu->bias_g();
+  Eigen::Vector3d ba = state->_imu->bias_a();
+  Eigen::Matrix3d Dw = State::Dm(state->_options.imu_model, state->_calib_imu_dw->value());
+  Eigen::Matrix3d Da = State::Dm(state->_options.imu_model, state->_calib_imu_da->value());
+  Eigen::Matrix3d Tg = State::Tg(state->_calib_imu_tg->value());
+  Eigen::Matrix3d R_ACCtoIMU = state->_calib_imu_ACCtoIMU->Rot();
+  Eigen::Matrix3d R_GYROtoIMU = state->_calib_imu_GYROtoIMU->Rot();
+
+  // Trapezoidal accumulation of bias- and intrinsic-corrected angular
+  // velocity. theta = integral_{t0}^{t1} w_corrected dt
   Eigen::Vector3d theta = Eigen::Vector3d::Zero();
   for (size_t k = 0; k < readings.size() - 1; k++) {
     double dt = readings[k + 1].timestamp - readings[k].timestamp;
     if (dt <= 0.0)
       continue;
-    Eigen::Vector3d w_avg = 0.5 * (readings[k].wm + readings[k + 1].wm) - bg;
+    Eigen::Vector3d a1 = R_ACCtoIMU * Da * (readings[k].am - ba);
+    Eigen::Vector3d a2 = R_ACCtoIMU * Da * (readings[k + 1].am - ba);
+    Eigen::Vector3d w1 = R_GYROtoIMU * Dw * (readings[k].wm - bg - Tg * a1);
+    Eigen::Vector3d w2 = R_GYROtoIMU * Dw * (readings[k + 1].wm - bg - Tg * a2);
+    Eigen::Vector3d w_avg = 0.5 * (w1 + w2);
     theta += w_avg * dt;
   }
 

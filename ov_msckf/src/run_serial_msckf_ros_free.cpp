@@ -43,6 +43,8 @@
 
 #include "core/VioManager.h"
 #include "core/VioManagerOptions.h"
+#include "update/UpdaterGroundPlaneRange.h"
+#include "update/UpdaterGroundPlaneFeature.h"
 #include "state/Propagator.h"
 #include "state/State.h"
 #include "types/IMU.h"
@@ -54,6 +56,7 @@
 #include "ros_free/DatasetReaderEuroc.h"
 #include "ros_free/TrajectoryAligner.h"
 #include "ros_free/VizDashboard.h"
+#include "utils/quat_ops.h"
 
 using namespace ov_msckf;
 namespace fs = boost::filesystem;
@@ -81,8 +84,24 @@ struct Args {
   bool gps_alt_schmidt = false;  // [中文] 使用 Schmidt consider-filter 避免 ba/bg 被 z 残差污染
   bool gps_alt_also_vz = false;  // [中文] active 集合加入 v(), 让 v_z 随 z 一起被 update
   bool gps_alt_range_mode = false; // [中文] C-mode: range model h=(p_z-z_ground)/r22, z_ground 首帧 bootstrap
-  double gps_cutoff_time = -1.0; // [中文] Hold-out 评估: 超过 t_cam > cutoff 后不再 feed GPS, 看 VIO 裸跑
-  double gps_feed_every = 1.0;   // [中文] GPS 喂入比例 1.0=全部, 0.2=每 5 个采样用 1 个 (验证降采样)
+  bool gps_alt_relative = false;  // [中文] 相对高度模型: res=(gps_now-gps_ref)-(p_z-vio_ref), VioManager 管 bootstrap
+  double gps_alt_min_pzz = 0.0;          // [中文] P_zz 地板: 防止 K_pz 坍缩 (0=禁用, 建议 0.005-0.02)
+  double gps_alt_min_t_after_init = 0.0; // delay Stage A z_ground bootstrap (s)
+  double gps_alt_max_res = 1e9;          // [中文] 创新拒绝门: |residual| > 此值则跳过更新 (1e9=禁用, 建议 30)
+  double gps_alt_guard_dxy = 0.0;        // [中文] 交叉协方差 guard: |dxy|_pred > 此值则拒 (0=禁用, 建议 0.5)
+  double gps_alt_guard_kxy_ratio = 0.0;  // [中文] 交叉协方差 guard: |K_xy|/|K_pz| > 此值则拒 (0=禁用, 建议 0.3)
+  double gps_alt_guard_dbias = 0.0;      // [中文] 交叉协方差 guard: |dbias|_pred > 此值则拒 (0=禁用)
+  bool gps_alt_zonly = false;            // [中文] Z-only 模式: 只更新 p_z, 其他状态不全改, cov 只降 P_zz
+  bool gps_alt_ground_plane = false;     // [中文] 地面平面伪测距模式: 将 GPS 高度转换为斜距观测
+  // -- Stage B (ground-plane feature update) --
+  bool gplane_feat_enable = false;        // turn on Stage B
+  double gplane_feat_sigma_px = 3.0;      // pixel noise (inflated to absorb anchor uncertainty)
+  int gplane_feat_max_features = 5;       // cap features per update
+  double gplane_feat_center_frac = 0.8;   // restrict anchor pixel to central fraction
+  double gplane_feat_min_cos_tilt = 0.85; // skip when drone tilted
+  double gplane_feat_max_res_px = 5.0;    // reject feature if predicted residual > this
+  double gps_cutoff_time = -1.0;         // [中文] Hold-out 评估: 超过 t_cam > cutoff 后不再 feed GPS, 看 VIO 裸跑
+  double gps_feed_every = 1.0;           // [中文] GPS 喂入比例 1.0=全部, 0.2=每 5 个采样用 1 个 (验证降采样)
   // [中文] CLI 覆盖 yaml 里的 gps_time_offset; NaN = 不覆盖, 用 yaml/默认值
   double gps_time_offset_cli = std::numeric_limits<double>::quiet_NaN();
   bool show = true;              // [中文] 显示窗口
@@ -102,6 +121,23 @@ void print_help() {
                "  --gps PATH            CSV: ts_ns, x, y, z  or  ts_ns, lat, lon, alt (WGS84)\n"
                "  --gps-alt-update      Feed GPS altitude (z) as 1D EKF update (mono rescue)\n"
                "  --gps-alt-sigma SIG   GPS altitude noise stddev meters (default 2.0)\n"
+               "  --gps-alt-min-pzz V   P_zz floor to prevent K_pz collapse (0=off, try 0.01)\n"
+               "  --gps-alt-min-t-after-init S   delay Stage A bootstrap by S sec after VIO init (default 0)\n"
+               "  --gps-alt-max-res M   Innovation rejection gate (m): skip updates where |res| > M (1e9=off, try 30)\n"
+               "  --gps-alt-guard-dxy M Reject update if predicted |dXY| > M (0=off, try 0.5)\n"
+               "  --gps-alt-guard-kxy R Reject if |K_xy|/|K_pz| > R (0=off, try 0.3)\n"
+               "  --gps-alt-guard-dbias V Reject if predicted |dbias| > V (0=off)\n"
+               "  --gps-alt-zonly       Only apply IMU p_z correction; zero all other corrections.\n"
+               "                        Covariance: only reduce P_zz, cross-terms unchanged.\n"
+               "  --gps-alt-ground-plane   Pseudo-rangefinder mode: treat GPS altitude as\n"
+               "                            slant range to a local flat ground plane.\n"
+               "                            Bootstraps z_ground on first GPS sample.\n"
+               "  --gplane-feat            Stage B: ground-plane feature update (requires --gps-alt-ground-plane)\n"
+               "  --gplane-feat-sigma-px V    pixel noise (default 3.0)\n"
+               "  --gplane-feat-max N         max features per update (default 5)\n"
+               "  --gplane-feat-center-frac V central image fraction to keep (default 0.8)\n"
+               "  --gplane-feat-min-cos-tilt V skip when |cos_tilt|<V (default 0.85)\n"
+               "  --gplane-feat-max-res-px V  reject feature if predicted residual>V (default 5.0)\n"
                "  --gps-cutoff-time T   Stop feeding GPS after t_cam > T (hold-out test)\n"
                "  --gps-feed-every F    Feed 1/F of GPS samples (e.g. 0.2 = 1-in-5, validation set)\n"
                "  --gps-time-offset SEC Override yaml gps_time_offset (sec). Adds to gps timestamps.\n"
@@ -144,6 +180,21 @@ bool parse_args(int argc, char **argv, Args &a) {
     else if (s == "--gps-alt-schmidt") a.gps_alt_schmidt = true;
     else if (s == "--gps-alt-also-vz") a.gps_alt_also_vz = true;
     else if (s == "--gps-alt-range-mode") a.gps_alt_range_mode = true;
+    else if (s == "--gps-alt-relative") a.gps_alt_relative = true;
+    else if (s == "--gps-alt-min-pzz") a.gps_alt_min_pzz = std::atof(next("--gps-alt-min-pzz").c_str());
+    else if (s == "--gps-alt-min-t-after-init") a.gps_alt_min_t_after_init = std::atof(next("--gps-alt-min-t-after-init").c_str());
+    else if (s == "--gps-alt-max-res") a.gps_alt_max_res = std::atof(next("--gps-alt-max-res").c_str());
+    else if (s == "--gps-alt-guard-dxy") a.gps_alt_guard_dxy = std::atof(next("--gps-alt-guard-dxy").c_str());
+    else if (s == "--gps-alt-guard-kxy") a.gps_alt_guard_kxy_ratio = std::atof(next("--gps-alt-guard-kxy").c_str());
+    else if (s == "--gps-alt-guard-dbias") a.gps_alt_guard_dbias = std::atof(next("--gps-alt-guard-dbias").c_str());
+    else if (s == "--gps-alt-zonly") a.gps_alt_zonly = true;
+    else if (s == "--gps-alt-ground-plane") a.gps_alt_ground_plane = true;
+    else if (s == "--gplane-feat") a.gplane_feat_enable = true;
+    else if (s == "--gplane-feat-sigma-px") a.gplane_feat_sigma_px = std::atof(next("--gplane-feat-sigma-px").c_str());
+    else if (s == "--gplane-feat-max") a.gplane_feat_max_features = std::atoi(next("--gplane-feat-max").c_str());
+    else if (s == "--gplane-feat-center-frac") a.gplane_feat_center_frac = std::atof(next("--gplane-feat-center-frac").c_str());
+    else if (s == "--gplane-feat-min-cos-tilt") a.gplane_feat_min_cos_tilt = std::atof(next("--gplane-feat-min-cos-tilt").c_str());
+    else if (s == "--gplane-feat-max-res-px") a.gplane_feat_max_res_px = std::atof(next("--gplane-feat-max-res-px").c_str());
     else if (s == "--gps-cutoff-time") a.gps_cutoff_time = std::atof(next("--gps-cutoff-time").c_str());
     else if (s == "--gps-feed-every") a.gps_feed_every = std::atof(next("--gps-feed-every").c_str());
     else if (s == "--gps-time-offset") a.gps_time_offset_cli = std::atof(next("--gps-time-offset").c_str());
@@ -197,6 +248,51 @@ int main(int argc, char **argv) {
     return EXIT_FAILURE;
   }
   auto sys = std::make_shared<VioManager>(params);
+
+  // [中文] 设置 P_zz 地板 (如果 CLI 指定)
+  if (args.gps_alt_min_pzz > 0) {
+    sys->set_gps_alt_min_pzz(args.gps_alt_min_pzz);
+    PRINT_INFO(CYAN "[ros-free] GPS alt P_zz floor = %.4f\n" RESET, args.gps_alt_min_pzz);
+  }
+  // Optional Stage A bootstrap-delay (ablation)
+  if (args.gps_alt_min_t_after_init > 0.0) {
+    sys->set_gps_alt_min_t_after_init(args.gps_alt_min_t_after_init);
+    PRINT_INFO(CYAN "[ros-free] GPS alt bootstrap delay = %.1fs after VIO init\n" RESET,
+               args.gps_alt_min_t_after_init);
+  }
+  // Stage B (ground-plane feature update) — relies on Stage A's z_ground
+  if (args.gplane_feat_enable) {
+    if (!args.gps_alt_ground_plane) {
+      PRINT_WARNING(YELLOW "[ros-free] --gplane-feat requested but --gps-alt-ground-plane not set; "
+                    "Stage B will not fire until z_ground is bootstrapped.\n" RESET);
+    }
+    sys->enable_gplane_feature(args.gplane_feat_sigma_px, args.gplane_feat_max_features,
+                               args.gplane_feat_center_frac, args.gplane_feat_min_cos_tilt,
+                               args.gplane_feat_max_res_px);
+  }
+  // [中文] 设置创新截断 (如果 CLI 指定, 建议 30m)
+  if (args.gps_alt_max_res < 1e8) {
+    sys->set_gps_alt_max_res_gate(args.gps_alt_max_res);
+    PRINT_INFO(CYAN "[ros-free] GPS alt max-res gate = %.1f m\n" RESET, args.gps_alt_max_res);
+  }
+  // [中文] 交叉协方差 guard
+  if (args.gps_alt_guard_dxy > 0) {
+    sys->set_gps_alt_guard_dxy_max(args.gps_alt_guard_dxy);
+    PRINT_INFO(CYAN "[ros-free] GPS alt guard |dXY| max = %.3f m\n" RESET, args.gps_alt_guard_dxy);
+  }
+  if (args.gps_alt_guard_kxy_ratio > 0) {
+    sys->set_gps_alt_guard_kxy_ratio_max(args.gps_alt_guard_kxy_ratio);
+    PRINT_INFO(CYAN "[ros-free] GPS alt guard |K_xy|/|K_pz| max = %.3f\n" RESET, args.gps_alt_guard_kxy_ratio);
+  }
+  if (args.gps_alt_guard_dbias > 0) {
+    sys->set_gps_alt_guard_dbias_max(args.gps_alt_guard_dbias);
+    PRINT_INFO(CYAN "[ros-free] GPS alt guard |dbias| max = %.5f\n" RESET, args.gps_alt_guard_dbias);
+  }
+  if (args.gps_alt_zonly) {
+    sys->set_gps_alt_zonly_update(true);
+    PRINT_INFO(CYAN "[ros-free] GPS alt Z-only update mode ENABLED "
+               "(only p_z correction, cov: only P_zz reduced)\n" RESET);
+  }
 
   const int num_cams = params.state_options.num_cameras;
   if (args.stereo && num_cams < 2) {
@@ -295,15 +391,19 @@ int main(int argc, char **argv) {
   // 按时间戳合并排序后顺序喂入, 与 ROS 版本结果数值一致 (仅受初始化线程
   // 非确定性影响)。
   size_t imu_i = 0, cam_i = 0, cam1_i = 0, gps_i = 0;
+  // Track last GPS sample index actually fed to the filter, so we don't
+  // feed the same physical GPS sample multiple times when cam_hz > gps_hz.
+  long long last_fed_gps_i = -1;
   const double INF = std::numeric_limits<double>::infinity();
   double t_init_done = -1; // [中文] 滤波器完成初始化的时刻
   std::deque<std::pair<double, Eigen::Vector3d>> vio_for_align;
   int frame_idx = 0;
   int align_fit_count = 0;
 
-  // [中文] GPS 高度当 1D 观测量时: 用 VIO 初始化时刻附近的 GPS 高度作为参考零点,
-  // 后续全部减去它. 这样 VIO world frame (起飞点 z=0) 和 GPS alt 同基准.
+  // [中文] GPS 高度当 1D 观测量时: 第一帧 GPS 到达时同时记录 GPS z 和 VIO z,
+  // 后续 measurement = GPS_now - GPS_ref + VIO_ref, 对齐到 VIO 世界坐标系.
   double gps_alt_ref = std::numeric_limits<double>::quiet_NaN();
+  double gps_alt_vio_ref = 0.0;
   size_t gps_alt_feeds = 0, gps_alt_rejects = 0;
 
   auto maybe_align = [&](double t) {
@@ -399,19 +499,44 @@ int main(int argc, char **argv) {
           int stride = static_cast<int>(std::round(1.0 / args.gps_feed_every));
           feed_this_sample = (static_cast<int>(gps_i) % stride == 0);
         }
-        if (std::fabs(t_gps - t_cam) < 0.10 && !cutoff_reached && feed_this_sample) {
-          // [中文] ALT-only 模式: 取 z 分量, 第一次记下参考点 (= VIO 原点高度),
-          // 之后相对 feed. 这样 init 瞬间残差=0, 避免 cross-cov 把 offset 打进 ba.
-          if (std::isnan(gps_alt_ref)) {
-            gps_alt_ref = xyz_raw(2);
-            PRINT_INFO(GREEN "[GPS-ALT]: set reference alt=%.2fm at t=%.3f (VIO world z=0 -> GPS alt)\n" RESET,
-                       gps_alt_ref, t_gps);
+        bool gps_sample_is_new = (static_cast<long long>(gps_i) != last_fed_gps_i);
+        if (std::fabs(t_gps - t_cam) < 0.10 && !cutoff_reached && feed_this_sample && gps_sample_is_new) {
+          last_fed_gps_i = static_cast<long long>(gps_i);
+          if (args.gps_alt_ground_plane) {
+            // Ground-plane pseudo-rangefinder mode.  zonly is controlled by
+            // --gps-alt-zonly (default false: full-state update).
+            double alt_raw = xyz_raw(2);
+            sys->feed_measurement_gps_ground_plane(t_gps, alt_raw, args.gps_alt_sigma,
+                                                   args.gps_alt_zonly);
+          } else if (args.gps_alt_relative) {
+            // [中文] 相对高度模式: VioManager 管理 bootstrap (gps_ref / vio_ref)
+            // 这里直接喂原始 ENU z, 不预设参考。
+            double alt_raw = xyz_raw(2);
+            sys->feed_measurement_gps_altitude_relative(t_gps, alt_raw, args.gps_alt_sigma,
+                                                         args.gps_alt_chi2, args.gps_alt_schmidt,
+                                                         args.gps_alt_also_vz);
+          } else {
+            // [中文] ALT-only 模式: 第一帧 GPS+VIO 同时 bootstrap,
+            // measurement = GPS_now - GPS_ref + VIO_ref, 对齐到 VIO 世界坐标系.
+            if (std::isnan(gps_alt_ref)) {
+              gps_alt_ref = xyz_raw(2);
+              auto state_ref = sys->get_state();
+              gps_alt_vio_ref = state_ref->_imu->pos()(2);
+              PRINT_INFO(GREEN "[GPS-ALT]: bootstrap gps_ref=%.2f vio_ref=%.2f at t=%.3f\n" RESET,
+                         gps_alt_ref, gps_alt_vio_ref, t_gps);
+            }
+            double alt_z = xyz_raw(2) - gps_alt_ref + gps_alt_vio_ref;
+            sys->feed_measurement_gps_altitude(t_gps, alt_z, args.gps_alt_sigma, args.gps_alt_chi2,
+                                               args.gps_alt_schmidt, args.gps_alt_also_vz,
+                                               args.gps_alt_range_mode);
           }
-          double alt_z = xyz_raw(2) - gps_alt_ref;
-          sys->feed_measurement_gps_altitude(t_gps, alt_z, args.gps_alt_sigma, args.gps_alt_chi2,
-                                             args.gps_alt_schmidt, args.gps_alt_also_vz,
-                                             args.gps_alt_range_mode);
           gps_alt_feeds++;
+          // Push GPS diagnostic snapshot to dashboard
+          const auto &gd = sys->get_last_gps_alt_update();
+          if (gd.t > 0) {
+            dash.update_gps_alt_diag(t_cam, gd.gps_z, gd.vio_z,
+                                     gd.residual, gd.pzz, gd.kpz);
+          }
         }
       }
       auto state = sys->get_state();
@@ -441,6 +566,7 @@ int main(int argc, char **argv) {
 
       // dashboard data
       dash.update_vio_pose(t_cam, R_wi, p_wi, v_wi);
+      dash.update_biases(t_cam, bg, ba); // bg/ba read from state above; always from live EKF
       std::vector<Eigen::Vector3d> slam_pts = sys->get_features_SLAM();
       std::vector<Eigen::Vector3d> msckf_pts = sys->get_good_features_MSCKF();
       dash.update_features(slam_pts, msckf_pts);
@@ -482,6 +608,15 @@ int main(int argc, char **argv) {
       dash.update_image(t_cam, hist);
     else
       dash.update_image(t_cam, img0);
+    // Tracker-owned warp viz packet → cross-pane matching view
+    {
+      ov_core::TrackerWarpVizPacket pkt;
+      if (sys->get_warp_viz_packet(0, pkt)) {
+        dash.update_tracker_flow(pkt.prev_image_for_viz, pkt.prev_pts_for_viz,
+                                 pkt.curr_pts_raw, pkt.curr_raw_image,
+                                 pkt.warp_active, pkt.t_curr);
+      }
+    }
 
     // [中文] cam-only 视频: 拿 VioManager 的历史 viz 图 (stereo panel + TrackBase
     // 历史轨迹叠加), 加一行时间戳文字, 写入 MP4. 帧尺寸在首帧固化.
@@ -545,6 +680,17 @@ int main(int argc, char **argv) {
     cam_writer.release();
   PRINT_INFO(GREEN "[ros-free] done. trajectory written to %s (frames=%d, aligned_pairs=%d)\n" RESET,
              args.output_path.c_str(), frame_idx, align_fit_count);
+
+  // final GPS altitude / ground-plane statistics
+  if (args.gps_alt_ground_plane) {
+    if (sys->get_updater_gplane_range())
+      sys->get_updater_gplane_range()->print_summary();
+  } else if (args.gps_alt_update) {
+    sys->print_gps_alt_final_summary();
+  }
+  if (args.gplane_feat_enable && sys->get_updater_gplane_feature()) {
+    sys->get_updater_gplane_feature()->print_summary();
+  }
 
   // final frame + hold if window
   dash.render_and_show(1);

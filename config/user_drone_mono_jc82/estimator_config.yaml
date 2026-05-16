@@ -4,8 +4,8 @@ verbosity: "INFO" # ALL, DEBUG, INFO, WARNING, ERROR, SILENT
 
 use_fej: true # if first-estimate Jacobians should be used (enable for good consistency)
 integration: "rk4" # discrete, rk4, analytical (if rk4 or analytical used then analytical covariance propagation is used)
-use_stereo: true # if we have more than 1 camera, if we should try to track stereo constraints between pairs
-max_cameras: 2 # how many cameras we have 1 = mono, 2 = stereo, >2 = binocular (all mono tracking)
+use_stereo: false
+max_cameras: 1
 
 calib_cam_extrinsics: true # if the transform between camera and IMU should be optimized R_ItoC, p_CinI
 calib_cam_intrinsics: true # if camera intrinsics should be optimized (focal, center, distortion)
@@ -28,11 +28,11 @@ feat_rep_aruco: "GLOBAL_3D"
 # zero velocity update parameters we can use
 # we support either IMU-based or disparity detection.
 try_zupt: false
-zupt_chi2_multipler: 50 # set to 0 for only disp-based
-zupt_max_velocity: 0.5
-zupt_noise_multiplier: 50
-zupt_max_disparity: 0 # set to 0 for only imu-based
-zupt_only_at_beginning: false
+zupt_chi2_multipler: 1
+zupt_max_velocity: 0.03
+zupt_noise_multiplier: 5
+zupt_max_disparity: 0.5
+zupt_only_at_beginning: true
 
 # [中文] GPS 时间戳与 IMU 时钟的常量偏移 (秒). t_gps_corrected = t_gps_raw + gps_time_offset.
 # jc82 18r.bag: gps0/data.csv 锚点偏 IMU bag 起始 ~+36s
@@ -84,6 +84,7 @@ filepath_gt: "/tmp/ov_groundtruth.txt"
 # our front-end feature tracking parameters
 # we have a KLT and descriptor based (KLT is better implemented...)
 use_klt: true # if true we will use KLT, otherwise use a ORB descriptor + robust matching
+use_gyro_aided_klt: false # explicit opt-out for mono; default is false in code (stereo config opts in)
 num_pts: 350 # number of points (per camera) we will extract and try to track
 fast_threshold: 30 # threshold for fast extraction (warning: lower threshs can be expensive)
 grid_x: 10 # extraction sub-grid count for horizontal direction (uniform tracking)
@@ -91,35 +92,6 @@ grid_y: 10 # extraction sub-grid count for vertical direction (uniform tracking)
 min_px_dist: 20 # distance between features (features near each other provide less information)
 knn_ratio: 0.70 # descriptor knn threshold for the top two descriptor matches
 track_frequency: 10.0 # frequency we will perform feature tracking at (in frames per second / hertz)
-use_gyro_aided_klt: true # warp KLT initial guess with IMU-derived inter-frame rotation (better tracking through turns)
-
-# === Gyro-aided KLT runtime gates (added 2026-05) ===
-# Below this integrated rotation magnitude (rad), the warp introduces more
-# systematic bias from bg uncertainty than it gains in LK basin coverage,
-# so we keep the legacy zero-motion seed. 0.026 rad ~= 1.5 deg.
-use_gyro_aided_klt_min_rot_rad: 0.026
-# Skip the warp while sqrt(diag P_bg) is still above this threshold.
-# 0.005 rad/s ~= 0.3 deg/s.
-use_gyro_aided_klt_max_bg_sigma: 0.005
-
-# === MSCKF parallax filter (added 2026-05) ===
-# Drops MSCKF candidate features whose pixel parallax across the clone
-# window is below this many pixels. Recommended 2.0 - 3.0 px for 50-90 m
-# downward-looking; 0.0 disables.
-min_msckf_parallax_px: 2.0
-
-# === Ground-parallel KLT warp (Stage 2, added 2026-05) ===
-# When true, warps both pyramids with H = K * R_comp * K^-1 before KLT,
-# removing accumulated rotation since the reference frame so translational
-# parallax is not contaminated by rotational optical flow.
-# Feature positions are un-warped back before reaching the estimator.
-# Set true to enable; false for legacy behavior (A/B testing).
-use_ground_parallel_warp: false
-
-# === Landing safety gate (added 2026-05) ===
-# If > 0, MSCKF / SLAM updates halt once altitude drops below this many
-# meters. -1 disables. Recommended 50.0 for 50-90 m evaluation envelope.
-landing_safety_min_alt_m: 50.0
 downsample_cameras: false # will downsample image in half if true
 num_opencv_threads: 4 # -1: auto, 0-1: serial, >1: number of threads
 histogram_method: "NONE" # NONE, HISTOGRAM, CLAHE
@@ -130,40 +102,25 @@ use_aruco: false
 num_aruco: 1024
 downsize_aruco: true
 
-fi_max_dist: 300.0
-# [中] fi_max_baseline: FeatureInitializer 三角化通过率门限。判定式
-#       || p_FinA || / max_baseline_in_window  >  fi_max_baseline   →   reject
-#   p_FinA           : 特征点在 anchor 相机系下的位置 (≈ 飞行高度 ~70m)
-#   max_baseline     : MSCKF 滑窗内所有相机位姿两两距离的最大值 (含 cam0+cam1)
-#
-# OpenVINS 默认值 40 是面向中低速、近景 (≤30m) 标定的。本数据集 jc82
-# 处于 70m 高空鱼眼下视, ground feature 深度 ≈ 70m, 而 KLT 短窗口 +
-# 立体基线 0.16m 给出的 max_baseline_in_window ≈ 0.5–2m. 比值常态
-# 35–140, 远超默认 40 → 几乎所有立体三角化点被拒绝, EKF 退化为单目
-# + IMU, 这是高空 stereo 比 mono 更差 (84.5m vs 29.8m RMSE) 的根因。
-# 实测: 40 → 84.51m, 100 → 10.15m (8.3× 提升, 已超过参考 stereo
-# 14m baseline), 150 → 16.28m, ≥200 几何病态导致发散 21000m+. 选 100.
-# (注: 该参数对单目相反, mono 在 b≥80 即发散, 故 mono yaml 保持默认.)
-fi_max_baseline: 100.0
+fi_max_dist: 350.0
 # ==================================================================
 # ==================================================================
 
 # camera noises and chi-squared threshold multipliers
 up_msckf_sigma_px: 2
-up_msckf_chi2_multipler: 5
+up_msckf_chi2_multipler: 2
 up_slam_sigma_px: 2
-up_slam_chi2_multipler: 5
+up_slam_chi2_multipler: 2
 up_aruco_sigma_px: 1
 up_aruco_chi2_multipler: 1
 
 # masks for our images
-use_mask: false
+use_mask: true
+mask0: "drone_mask_binary_inverted.png" # relative to current file; white pixels are rejected by TrackKLT
 
 # imu and camera spacial-temporal
 # imu config should also have the correct noise values
 relative_config_imu: "kalibr_imu_chain.yaml"
 relative_config_imucam: "kalibr_imucam_chain.yaml"
-
-
 
 

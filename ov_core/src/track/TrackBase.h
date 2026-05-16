@@ -44,6 +44,26 @@ class CamBase;
 class FeatureDatabase;
 
 /**
+ * @brief Per-camera visualization packet owned by TrackKLT.
+ *
+ * Contains the exact warped image and warped points that TrackKLT produced
+ * during the last feed_new_camera call, together with the final accepted
+ * current-frame matches. This is the single source of truth for the cross-pane
+ * matching visualization — no independent homography path exists elsewhere.
+ */
+struct TrackerWarpVizPacket {
+  bool valid = false;
+  bool warp_active = false;
+  size_t cam_id = 0;
+  double t_curr = 0.0;
+  cv::Mat prev_image_for_viz;                 // warped prev if warp active, else raw prev
+  cv::Mat curr_raw_image;                     // current raw image
+  std::vector<cv::Point2f> prev_pts_for_viz;  // warped prev pts if warp active, else raw prev pts
+  std::vector<cv::Point2f> curr_pts_raw;      // final accepted matches in raw current image
+  std::vector<size_t> feature_ids;            // matching feature IDs
+};
+
+/**
  * @brief Visual feature tracking base class
  *
  * This is the base class for all our visual trackers.
@@ -190,6 +210,41 @@ public:
   /// given camera id, and writes it into @p R_out.
   bool get_predicted_rotation(size_t cam_id, cv::Matx33d &R_out);
 
+  /// Accessor for the latest per-camera warp visualization packet.
+  /// Base returns false; TrackKLT overrides with the real packet.
+  virtual bool get_warp_viz_packet(size_t cam_id, TrackerWarpVizPacket &packet) { return false; }
+
+  /**
+   * @brief Set a gravity-aligned rotation warp for the given camera.
+   *
+   * When set, TrackKLT applies H = K * R_comp * K^{-1} to warp both the
+   * "last" and "current" image into a gravity-aligned frame before running
+   * calcOpticalFlowPyrLK. Tracked feature positions are un-warped back to
+   * original image coordinates before FeatureDatabase storage, so the
+   * estimator's camera model is unaffected.
+   *
+   * This is a TRACKING-PATH operation (not visualization-only). It reduces
+   * rotational optical-flow contamination of translational parallax during
+   * and after turns, which is the root cause of post-turn scale/height jumps.
+   *
+   * Must be called BEFORE feed_new_camera() for the matching frame. After
+   * feed_new_camera() the caller must call clear_gravity_warps() so the
+   * warp is not applied to a later frame. Controlled by
+   * use_ground_parallel_warp in VioManagerOptions.
+   *
+   * @param cam_id  Camera id (same as in CameraData::sensor_ids).
+   * @param R_comp  Rotation to apply: warped_ray = R_comp * original_ray.
+   *                Typically R_GtoC_ref * R_GtoC_curr^T (reference orientation
+   *                relative to current).
+   */
+  void set_gravity_warp(size_t cam_id, const cv::Matx33d &R_comp);
+
+  /// Clear all gravity warps. Called after each feed_new_camera().
+  void clear_gravity_warps();
+
+  /// Returns true if a gravity warp is set for the given camera, writes it to R_out.
+  bool get_gravity_warp(size_t cam_id, cv::Matx33d &R_out);
+
 protected:
   /// Camera object which has all calibration in it
   std::unordered_map<size_t, std::shared_ptr<CamBase>> camera_calib;
@@ -237,6 +292,11 @@ protected:
   /// each feed_new_camera; consumed once and cleared by the tracker).
   std::mutex mtx_predicted_rotation;
   std::unordered_map<size_t, cv::Matx33d> predicted_rotation_per_cam;
+
+  /// Per-camera gravity-aligned warp rotation R_comp (set by VioManager before
+  /// each feed_new_camera when use_ground_parallel_warp is enabled; cleared after).
+  std::mutex mtx_gravity_warp;
+  std::unordered_map<size_t, cv::Matx33d> gravity_warp_per_cam;
 };
 
 } // namespace ov_core

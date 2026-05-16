@@ -296,6 +296,49 @@ void StateHelper::set_initial_covariance(std::shared_ptr<State> state, const Eig
   state->_Cov = state->_Cov.selfadjointView<Eigen::Upper>();
 }
 
+void StateHelper::inject_pz_noise(std::shared_ptr<State> state, double noise) {
+  int global_pz = state->_imu->id() + 5; // q(3) + p_z(idx=2)
+  state->_Cov(global_pz, global_pz) += noise;
+}
+
+void StateHelper::ekf_update_zonly(std::shared_ptr<State> state, double R) {
+  int pz_global = state->_imu->p()->id() + 2; // p_z = 3rd element of IMU position
+  double P_pz = state->_Cov(pz_global, pz_global);
+  double S = P_pz + R;
+  state->_Cov(pz_global, pz_global) -= (P_pz * P_pz) / S;
+}
+
+void StateHelper::EKFUpdateZOnly(std::shared_ptr<State> state,
+                                 const std::vector<std::shared_ptr<Type>> &H_order,
+                                 const Eigen::MatrixXd &H, const Eigen::VectorXd &res,
+                                 const Eigen::MatrixXd &R) {
+
+  // Save pre-update IMU position (to extract p_z correction later)
+  Eigen::Vector3d p_pre = state->_imu->pos();
+
+  // Save pre-update values for all state variables
+  std::vector<Eigen::VectorXd> pre_vals;
+  for (const auto &var : state->_variables) {
+    pre_vals.push_back(var->value());
+  }
+
+  // Full standard EKF update (consistent covariance + state)
+  EKFUpdate(state, H_order, H, res, R);
+
+  // Record post-update p_z
+  double p_z_new = state->_imu->pos()(2);
+
+  // Revert ALL state variables to pre-update values
+  for (size_t i = 0; i < state->_variables.size(); i++) {
+    state->_variables[i]->set_value(pre_vals[i]);
+  }
+
+  // Apply only the p_z correction (covariance remains fully updated)
+  Eigen::Vector3d p_final = p_pre;
+  p_final(2) = p_z_new;
+  state->_imu->p()->set_value(p_final);
+}
+
 Eigen::MatrixXd StateHelper::get_marginal_covariance(std::shared_ptr<State> state,
                                                      const std::vector<std::shared_ptr<Type>> &small_variables) {
 

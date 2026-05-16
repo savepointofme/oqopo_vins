@@ -41,6 +41,8 @@
 #include "state/StateHelper.h"
 #include "update/UpdaterMSCKF.h"
 #include "update/UpdaterSLAM.h"
+#include "update/UpdaterGroundPlaneRange.h"
+#include "update/UpdaterGroundPlaneFeature.h"
 #include "update/UpdaterZeroVelocity.h"
 
 using namespace ov_core;
@@ -175,6 +177,9 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
                                                         params.zupt_noise_multiplier, params.zupt_max_disparity,
                                                         params.zupt_max_altitude);
   }
+
+  // Ground-plane pseudo-rangefinder updater (created on demand via feed method)
+  updaterGPlaneRange = nullptr;
 }
 
 // =============================================================================
@@ -220,12 +225,48 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
   if (!is_initialized_vio) {
     return;
   }
+  // Optional bootstrap-delay gate (Stage A ablation): drop GPS altitude
+  // calls until enough time has passed since VIO init.  This lets
+  // monocular scale settle before z_ground / refs are locked.
+  if (gps_alt_min_t_after_init_ > 0.0 && startup_time > 0.0 &&
+      timestamp - startup_time < gps_alt_min_t_after_init_) {
+    return;
+  }
+
+  double t_state = state->_timestamp;
+  double dt_gps = t_state - timestamp;
+  gps_alt_stats_.n_called++;
+  gps_alt_stats_.last_eval_time = t_state;
+  if (gps_alt_stats_.first_eval_time < 0) gps_alt_stats_.first_eval_time = t_state;
+
+  // --- Periodic STAT summary (fires for ALL calls: accept/reject/skip) ---
+  if (t_state - gps_alt_stats_.last_summary_time > 30.0) {
+    gps_alt_stats_.last_summary_time = t_state;
+    size_t n_evals = gps_alt_stats_.n_accepted + gps_alt_stats_.n_rejected;
+    double rate = n_evals > 0 ? 100.0 * gps_alt_stats_.n_accepted / n_evals : 0;
+    PRINT_INFO(CYAN "[GPS-ALT-STAT] t=%.1f calls=%zu acc=%zu rej=%zu(dxy=%zu kxy=%zu bias=%zu) skip=%zu rate=%.1f%% "
+               "K_pz_mu=%.5f |K_xy|_mu=%.5f |dxy|_mu=%.4f |dtheta|_mu=%.4f |dba|_mu=%.5f |dbg|_mu=%.5f "
+               "P_zz_mu=%.4f |res|_mu=%.2f dpz_mu=%.3f\n" RESET,
+               t_state, gps_alt_stats_.n_called, gps_alt_stats_.n_accepted, gps_alt_stats_.n_rejected,
+               gps_alt_stats_.n_rejected_dxy, gps_alt_stats_.n_rejected_kxy, gps_alt_stats_.n_rejected_bias,
+               gps_alt_stats_.n_skipped, rate,
+               n_evals > 0 ? gps_alt_stats_.sum_K_pz / n_evals : 0.0,
+               n_evals > 0 ? gps_alt_stats_.sum_K_xy_norm / n_evals : 0.0,
+               n_evals > 0 ? gps_alt_stats_.sum_dxy_norm / n_evals : 0.0,
+               n_evals > 0 ? gps_alt_stats_.sum_dtheta_norm / n_evals : 0.0,
+               n_evals > 0 ? gps_alt_stats_.sum_dba_norm / n_evals : 0.0,
+               n_evals > 0 ? gps_alt_stats_.sum_dbg_norm / n_evals : 0.0,
+               n_evals > 0 ? gps_alt_stats_.sum_P_zz / n_evals : 0.0,
+               n_evals > 0 ? gps_alt_stats_.sum_abs_res / n_evals : 0.0,
+               gps_alt_stats_.n_accepted > 0 ? gps_alt_stats_.sum_abs_dpz / gps_alt_stats_.n_accepted : 0.0);
+  }
 
   // [中文] 时间差容忍放宽到 200ms. GPS 5Hz 间隔 200ms, cam 20Hz 间隔 50ms.
   // 调用方已经在最近的 cam 帧触发, 所以差值通常 < 100ms.
-  if (state->_timestamp < timestamp - 0.2 || state->_timestamp > timestamp + 0.2) {
-    PRINT_DEBUG(YELLOW "[GPS-ALT]: skip dt=%.3fs (state=%.3f meas=%.3f)\n" RESET,
-                state->_timestamp - timestamp, state->_timestamp, timestamp);
+  if (t_state < timestamp - 0.2 || t_state > timestamp + 0.2) {
+    gps_alt_stats_.n_skipped++;
+    PRINT_DEBUG(YELLOW "[GPS-ALT-EVAL] status=SKIP t_cam=%.3f t_gps=%.3f dt=%+.3fs (state=%.3f meas=%.3f)\n" RESET,
+                t_state, timestamp, dt_gps, t_state, timestamp);
     return;
   }
 
@@ -299,38 +340,165 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
   Eigen::MatrixXd R = Eigen::MatrixXd::Zero(1, 1);
   R(0, 0) = std::pow(sigma, 2);
 
-  Eigen::VectorXd res = Eigen::VectorXd::Zero(1);
-  res(0) = res_scalar;
+  int pz_idx = range_mode ? (3 + 2) : 2;
 
-  // [中文] Chi^2 gate. 用一个宽松的门 (chi2 < 10000) 只拒绝极端 spike (例如 GPS
-  // 时间偏错产生 100m 级残差). 我们不希望 VIO 已经错了、chi2 过严把所有正确的
-  // GPS 更新全拒掉 — 那样 GPS 高度永远不会把 VIO 拉回来.
+  // --- P_zz floor BEFORE update: prevent K_pz from collapsing to ~0 ---
+  // When P_pz << R, K_pz = P_pz/(P_pz+R) ≈ P_pz/R ≈ 0, making GPS useless.
+  // Injecting noise before computing S/K keeps the Kalman gain alive.
+  if (gps_alt_min_pzz_ > 0) {
+    Eigen::MatrixXd P_pre_check = StateHelper::get_marginal_covariance(state, Hx_order);
+    double P_pz_pre = P_pre_check(pz_idx, pz_idx);
+    if (P_pz_pre < gps_alt_min_pzz_) {
+      StateHelper::inject_pz_noise(state, gps_alt_min_pzz_ - P_pz_pre);
+    }
+  }
+
   Eigen::MatrixXd P = StateHelper::get_marginal_covariance(state, Hx_order);
   double S = (H * P * H.transpose())(0, 0) + R(0, 0);
   double chi2 = res_scalar * res_scalar / S;
-  // find p_z index in the stacked order (q first -> offset 3; otherwise 0) + 2
-  int pz_idx = range_mode ? (3 + 2) : 2;
   double P_pz = P(pz_idx, pz_idx);
-  if (chi2 > chi2_gate) {
-    PRINT_INFO(YELLOW "[GPS-ALT]: REJECT res=%.2fm chi2=%.1f>gate=%.1f (P_zz=%.2f sigma=%.2f)\n" RESET,
-               res_scalar, chi2, chi2_gate, P_pz, std::sqrt(R(0, 0)));
+
+  // --- Innovation gate: reject updates where |res| exceeds threshold ---
+  // Large residuals indicate a systematic GPS offset that would pull the state
+  // incorrectly.  Skipping the update entirely is safer than clamping.
+  const double raw_res = res_scalar;
+  if (gps_alt_max_res_gate_ < 1e8 && std::fabs(res_scalar) > gps_alt_max_res_gate_) {
+    gps_alt_stats_.n_rejected++;
+    PRINT_INFO(YELLOW "[GPS-ALT] REJECT t=%.3f |res|=%.1f > %.1f m — skipping update\n" RESET,
+               t_state, std::fabs(raw_res), gps_alt_max_res_gate_);
     return;
   }
 
-  // === [DIAG] dump state BEFORE update ===
+  Eigen::VectorXd res = Eigen::VectorXd::Zero(1);
+  res(0) = res_scalar;
+
+  // GPS 高度是绝对基准 — VIO 飘了的时候应该信 GPS 而不是拒掉它.
+  // 保留 chi2 用于诊断日志, 但不再拒绝更新. Schmidt filter 已保护 IMU bias.
+  // Log large residuals for diagnostics (no rejection)
+  if (chi2 > chi2_gate) {
+    PRINT_INFO(YELLOW "[GPS-ALT-DIAG] large-res t=%.3f res=%.2f chi2=%.1f P_zz=%.4f — accepting anyway\n" RESET,
+               t_state, raw_res, chi2, P_pz);
+  }
+
+  // --- Marginal Kalman gain for position block ---
+  // K = P * H^T / S.  H has a 1 at p_z (col 2) and 0 elsewhere,
+  // so K_p = P[:, 2] / S = [P_xz, P_yz, P_zz]^T / S.
+  Eigen::VectorXd K_pz_vec = (P * H.transpose()) / S;  // n×1
+  double K_px = (K_pz_vec.size() > 0) ? K_pz_vec(0) : 0.0;
+  double K_py = (K_pz_vec.size() > 1) ? K_pz_vec(1) : 0.0;
+  double K_pz_gain = K_pz_vec(pz_idx);
+  double K_xy_norm = std::sqrt(K_px * K_px + K_py * K_py);
+
+  // Predicted position correction (error-state): dx = K * residual
+  double pred_dx = K_px * res_scalar;
+  double pred_dy = K_py * res_scalar;
+  double pred_dz = K_pz_gain * res_scalar;
+  double pred_dxy_norm = std::sqrt(pred_dx * pred_dx + pred_dy * pred_dy);
+
+  // --- Full-state K for orientation/bias diagnostics (only if a guard is active) ---
+  double pred_dtheta_norm = -1.0;
+  double pred_dba_norm = -1.0;
+  double pred_dbg_norm = -1.0;
+  bool guards_active = (gps_alt_guard_dxy_max_ > 0.0 || gps_alt_guard_kxy_ratio_max_ > 0.0 ||
+                        gps_alt_guard_dbias_max_ > 0.0);
+  if (guards_active) {
+    // Compute full K for the entire state: K_full = P_full * H_full^T / S.
+    // H_full has a 1 at the global index of state->_imu->p()(2), 0 elsewhere.
+    Eigen::MatrixXd P_full = StateHelper::get_full_covariance(state);
+    int pz_global_idx = state->_imu->p()->id() + 2;  // p_z = 3rd element of IMU position
+    if (pz_global_idx >= 0 && pz_global_idx < P_full.cols()) {
+      Eigen::VectorXd K_full = P_full.col(pz_global_idx) / S;
+
+      // Orientation correction norm (from IMU q() block)
+      int q_start = state->_imu->q()->id();
+      if (q_start >= 0 && q_start + 2 < K_full.size())
+        pred_dtheta_norm = K_full.segment(q_start, 3).norm() * std::fabs(res_scalar);
+
+      // Accel bias correction norm
+      int ba_start = state->_imu->ba()->id();
+      if (ba_start >= 0 && ba_start + 2 < K_full.size())
+        pred_dba_norm = K_full.segment(ba_start, 3).norm() * std::fabs(res_scalar);
+
+      // Gyro bias correction norm
+      int bg_start = state->_imu->bg()->id();
+      if (bg_start >= 0 && bg_start + 2 < K_full.size())
+        pred_dbg_norm = K_full.segment(bg_start, 3).norm() * std::fabs(res_scalar);
+    }
+  }
+
+  // --- Cross-covariance guard: reject before EKF update if contamination is too large ---
+  std::string decision = "APPLY";
+
+  // Guard 1: predicted XY position correction too large
+  if (gps_alt_guard_dxy_max_ > 0.0 && pred_dxy_norm > gps_alt_guard_dxy_max_) {
+    decision = "REJECT_BY_DXY";
+  }
+  // Guard 2: K_xy / |K_pz| ratio too large → too much XY leakage per unit Z correction
+  if (decision == "APPLY" && gps_alt_guard_kxy_ratio_max_ > 0.0 &&
+      K_pz_gain != 0.0 && K_xy_norm / std::fabs(K_pz_gain) > gps_alt_guard_kxy_ratio_max_) {
+    decision = "REJECT_BY_GAIN_RATIO";
+  }
+  // Guard 3: predicted bias correction too large
+  if (decision == "APPLY" && gps_alt_guard_dbias_max_ > 0.0 &&
+      std::max(pred_dba_norm, pred_dbg_norm) > gps_alt_guard_dbias_max_) {
+    decision = "REJECT_BY_BIAS";
+  }
+
+  if (decision != "APPLY") {
+    if (decision == "REJECT_BY_DXY") gps_alt_stats_.n_rejected_dxy++;
+    else if (decision == "REJECT_BY_GAIN_RATIO") gps_alt_stats_.n_rejected_kxy++;
+    else if (decision == "REJECT_BY_BIAS") gps_alt_stats_.n_rejected_bias++;
+    gps_alt_stats_.n_rejected++;
+
+    // Populate snapshot with guard info before returning
+    gps_alt_last_.t = t_state;
+    gps_alt_last_.gps_z = altitude_z;
+    gps_alt_last_.vio_z = p_IinG(2);
+    gps_alt_last_.residual = raw_res;
+    gps_alt_last_.pzz = P_pz;
+    gps_alt_last_.kpz = K_pz_gain;
+    gps_alt_last_.kpx = K_px;
+    gps_alt_last_.kpy = K_py;
+    gps_alt_last_.kxy_norm = K_xy_norm;
+    gps_alt_last_.dx = pred_dx;
+    gps_alt_last_.dy = pred_dy;
+    gps_alt_last_.dz = pred_dz;
+    gps_alt_last_.dtheta_norm = pred_dtheta_norm;
+    gps_alt_last_.dba_norm = pred_dba_norm;
+    gps_alt_last_.dbg_norm = pred_dbg_norm;
+    gps_alt_last_.chi2 = chi2;
+    gps_alt_last_.decision = decision;
+
+    PRINT_INFO(YELLOW "[GPS-ALT-GUARD] %s t=%.3f res=%.2f |dxy|=%.4f K_xy/|Kz|=%.4f "
+               "|dbias|=%.5f |dtheta|=%.5f — skipping update\n" RESET,
+               decision.c_str(), t_state, raw_res, pred_dxy_norm,
+               (K_pz_gain != 0.0 ? K_xy_norm / std::fabs(K_pz_gain) : -1.0),
+               std::max(pred_dba_norm, pred_dbg_norm), pred_dtheta_norm);
+    return;
+  }
+
+  // === capture state BEFORE update for delta computation ===
   Eigen::Vector3d ba_pre = state->_imu->bias_a();
   Eigen::Vector3d bg_pre = state->_imu->bias_g();
   Eigen::Vector3d v_pre = state->_imu->vel();
   Eigen::Vector3d p_pre = state->_imu->pos();
   Eigen::Matrix3d R_GtoI_pre = state->_imu->Rot();
+  double z_before = p_pre(2);
 
-  if (use_schmidt) {
+  if (gps_alt_zonly_update_) {
+    // --- Z-only update with consistent covariance ---
+    // Full EKF covariance update (Joseph form) for consistency.
+    // State: only IMU p_z is corrected; all other state components
+    // (px, py, v, q, bg, ba, clones, SLAM) are reverted.
+    StateHelper::EKFUpdateZOnly(state, Hx_order, H, res, R);
+    decision = "ZONLY";
+  } else if (use_schmidt) {
     StateHelper::EKFUpdateSchmidt(state, Hx_order, H, res, R);
   } else {
     StateHelper::EKFUpdate(state, Hx_order, H, res, R);
   }
 
-  // === [DIAG] dump state AFTER update ===
+  // === capture state AFTER update ===
   Eigen::Vector3d ba_post = state->_imu->bias_a();
   Eigen::Vector3d bg_post = state->_imu->bias_g();
   Eigen::Vector3d v_post = state->_imu->vel();
@@ -340,21 +508,186 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
   Eigen::Vector3d dbg = bg_post - bg_pre;
   Eigen::Vector3d dv = v_post - v_pre;
   Eigen::Vector3d dp = p_post - p_pre;
-  // pre/post tilt as roll-pitch from R_GtoI (yaw not relevant here)
+  double z_after = p_post(2);
+  double res_after = altitude_z - z_after;
   double tilt_pre = std::acos(std::min(1.0, std::max(-1.0, R_GtoI_pre(2, 2)))) * 180.0 / M_PI;
   double tilt_post = std::acos(std::min(1.0, std::max(-1.0, R_GtoI_post(2, 2)))) * 180.0 / M_PI;
 
-  PRINT_INFO(CYAN "[GPS-ALT%s%s]: t=%.3f meas=%.2fm pred=%.2fm res=%+.2fm chi2=%.1f P_zz=%.2f r22=%.3f%s\n" RESET,
-             range_mode ? "-C" : "", use_schmidt ? "-S" : "",
-             timestamp, altitude_z, z_pred, res_scalar, chi2, P_pz, r22,
-             also_update_vz ? " (p+v)" : "");
-  PRINT_INFO(MAGENTA "[GPS-ALT-DIAG]: t=%.3f | p_pre=[%.2f %.2f %.2f] dp=[%+.3f %+.3f %+.3f] | v_pre=[%.2f %.2f %.2f] dv=[%+.3f %+.3f %+.3f] | tilt %.2f->%.2f deg | ba_pre=[%+.3f %+.3f %+.3f] dba=[%+.4f %+.4f %+.4f] | bg_pre=[%+.4f %+.4f %+.4f] dbg=[%+.5f %+.5f %+.5f]\n" RESET,
+  // --- P_zz floor AFTER update: maintain floor for next call ---
+  double P_pz_floor_applied = 0.0;
+  if (gps_alt_min_pzz_ > 0) {
+    Eigen::MatrixXd P_post = StateHelper::get_marginal_covariance(state, Hx_order);
+    double P_pz_post = P_post(pz_idx, pz_idx);
+    if (P_pz_post < gps_alt_min_pzz_) {
+      StateHelper::inject_pz_noise(state, gps_alt_min_pzz_ - P_pz_post);
+      P_pz_floor_applied = gps_alt_min_pzz_ - P_pz_post;
+    }
+  }
+
+  // --- populate diagnostic snapshot ---
+  gps_alt_last_.t = t_state;
+  gps_alt_last_.gps_z = altitude_z;
+  gps_alt_last_.vio_z = z_before;
+  gps_alt_last_.residual = raw_res;
+  gps_alt_last_.pzz = P_pz;
+  gps_alt_last_.kpz = K_pz_gain;
+  gps_alt_last_.kpx = K_px;
+  gps_alt_last_.kpy = K_py;
+  gps_alt_last_.kxy_norm = K_xy_norm;
+  gps_alt_last_.dx = pred_dx;
+  gps_alt_last_.dy = pred_dy;
+  gps_alt_last_.dz = pred_dz;
+  gps_alt_last_.dtheta_norm = pred_dtheta_norm;
+  gps_alt_last_.dba_norm = pred_dba_norm;
+  gps_alt_last_.dbg_norm = pred_dbg_norm;
+  gps_alt_last_.chi2 = chi2;
+  gps_alt_last_.zonly = gps_alt_zonly_update_;
+  gps_alt_last_.clipped = false;
+  gps_alt_last_.decision = decision;
+
+  // --- statistics ---
+  gps_alt_stats_.n_accepted++;
+  gps_alt_stats_.sum_K_pz += K_pz_gain;
+  gps_alt_stats_.sum_K_xy_norm += K_xy_norm;
+  gps_alt_stats_.sum_dxy_norm += pred_dxy_norm;
+  if (pred_dtheta_norm >= 0) gps_alt_stats_.sum_dtheta_norm += pred_dtheta_norm;
+  if (pred_dba_norm >= 0) gps_alt_stats_.sum_dba_norm += pred_dba_norm;
+  if (pred_dbg_norm >= 0) gps_alt_stats_.sum_dbg_norm += pred_dbg_norm;
+  gps_alt_stats_.sum_P_zz += P_pz;
+  gps_alt_stats_.sum_abs_res += std::abs(raw_res);
+  gps_alt_stats_.sum_abs_dpz += std::abs(dp(2));
+
+  // --- unified EVAL log with guard diagnostics ---
+  PRINT_INFO(CYAN "[GPS-ALT-EVAL] status=%s t_cam=%.3f dt=%+.3fs meas=%.2f z_pred=%.2f z_after=%.2f "
+             "res=%+.2f chi2=%.1f P_zz=%.4f K_pz=%.5f |K_xy|=%.5f |dxy|_pred=%.4f "
+             "|dtheta|_pred=%.4f |dba|_pred=%.5f |dbg|_pred=%.5f dp_z_actual=%+.3f %s%s%s%s\n" RESET,
+             gps_alt_zonly_update_ ? "ZONLY" : "ACC",
+             t_state, dt_gps, altitude_z, z_before, z_after,
+             raw_res, chi2, P_pz, K_pz_gain, K_xy_norm, pred_dxy_norm,
+             pred_dtheta_norm, pred_dba_norm, pred_dbg_norm, dp(2),
+             gps_alt_zonly_update_ ? " ZONLY" : "",
+             use_schmidt ? " Schmidt" : "",
+             also_update_vz ? " +vz" : "",
+             P_pz_floor_applied > 0 ? " FLOOR" : "");
+
+  // --- detailed DIAG: full state delta (keep for correctness verification) ---
+  PRINT_INFO(MAGENTA "[GPS-ALT-DIAG] t=%.3f | p_pre=[%.2f %.2f %.2f] dp=[%+.3f %+.3f %+.3f] | v_pre=[%.2f %.2f %.2f] dv=[%+.3f %+.3f %+.3f] | tilt %.2f->%.2f deg | ba_pre=[%+.3f %+.3f %+.3f] dba=[%+.4f %+.4f %+.4f] | bg_pre=[%+.4f %+.4f %+.4f] dbg=[%+.5f %+.5f %+.5f]\n" RESET,
              timestamp,
              p_pre(0), p_pre(1), p_pre(2), dp(0), dp(1), dp(2),
              v_pre(0), v_pre(1), v_pre(2), dv(0), dv(1), dv(2),
              tilt_pre, tilt_post,
              ba_pre(0), ba_pre(1), ba_pre(2), dba(0), dba(1), dba(2),
              bg_pre(0), bg_pre(1), bg_pre(2), dbg(0), dbg(1), dbg(2));
+
+}
+
+void VioManager::feed_measurement_gps_altitude_relative(double timestamp, double altitude_z, double sigma,
+                                                         double chi2_gate, bool use_schmidt,
+                                                         bool also_update_vz) {
+
+  if (!is_initialized_vio) {
+    return;
+  }
+
+  Eigen::Vector3d p_IinG = state->_imu->pos();
+  double p_z = p_IinG(2);
+
+  // Bootstrap references on first call, then delegate to the absolute method
+  // with an effective altitude that shifts GPS into VIO's world frame:
+  //   effective_alt = (GPS_now - GPS_ref) + VIO_ref
+  // Then res = effective_alt - p_z = (GPS_now - GPS_ref) - (p_z - VIO_ref)
+  if (!gps_alt_rel_bootstrapped_) {
+    gps_alt_rel_gps_ref_ = altitude_z;
+    gps_alt_rel_vio_ref_ = p_z;
+    gps_alt_rel_bootstrapped_ = true;
+    PRINT_INFO(CYAN "[GPS-ALT-REL] bootstrap: gps_ref=%.3f vio_ref=%.3f\n" RESET,
+               gps_alt_rel_gps_ref_, gps_alt_rel_vio_ref_);
+  }
+
+  double effective_alt = altitude_z - gps_alt_rel_gps_ref_ + gps_alt_rel_vio_ref_;
+
+  feed_measurement_gps_altitude(timestamp, effective_alt, sigma, chi2_gate, use_schmidt,
+                                also_update_vz, false);
+}
+
+bool VioManager::feed_measurement_gps_ground_plane(double timestamp, double z_gps,
+                                                     double sigma_range, bool zonly) {
+
+  if (!is_initialized_vio)
+    return false;
+  // Optional bootstrap-delay gate (Stage A ablation): drop ground-plane
+  // calls until enough time has passed since VIO init.  This lets the
+  // monocular scale settle before z_ground is locked.
+  if (gps_alt_min_t_after_init_ > 0.0 && startup_time > 0.0 &&
+      timestamp - startup_time < gps_alt_min_t_after_init_) {
+    return false;
+  }
+
+  // Relative-mode bootstrap: align GPS ENU-z to VIO world z on first call.
+  // z_gps is near zero (ENU-relative) while p_z can be tens of meters.
+  // We compute effective_z = (z_gps - gps_ref) + vio_ref so the residual
+  // reflects VIO drift relative to GPS, not the absolute frame offset.
+  if (!gps_alt_rel_bootstrapped_) {
+    gps_alt_rel_gps_ref_ = z_gps;
+    gps_alt_rel_vio_ref_ = state->_imu->pos()(2);
+    gps_alt_rel_bootstrapped_ = true;
+    PRINT_INFO(CYAN "[GPLANE-RNG] bootstrap: gps_ref=%.3f vio_ref=%.3f\n" RESET,
+               gps_alt_rel_gps_ref_, gps_alt_rel_vio_ref_);
+  }
+  double effective_z = z_gps - gps_alt_rel_gps_ref_ + gps_alt_rel_vio_ref_;
+
+  // Lazy construction of the ground-plane range updater
+  if (updaterGPlaneRange == nullptr) {
+    updaterGPlaneRange = std::make_shared<UpdaterGroundPlaneRange>(
+        sigma_range,           // sigma_range
+        0.3,                   // min_cos_tilt (skip if tilt > 72°)
+        10000.0,               // chi2_gate (permissive)
+        zonly,                 // use_zonly
+        gps_alt_min_pzz_,      // P_zz floor (share with GPS altitude setting)
+        gps_alt_max_res_gate_  // innovation gate
+    );
+    PRINT_INFO(GREEN "[GPLANE-RNG] created: sigma=%.2f zonly=%d\n" RESET,
+               sigma_range, (int)zonly);
+  }
+
+  return updaterGPlaneRange->try_update(state, state->_timestamp, effective_z, timestamp);
+}
+
+void VioManager::enable_gplane_feature(double sigma_pixel, int max_features,
+                                       double center_frac, double min_cos_tilt,
+                                       double max_residual_px) {
+  updaterGPlaneFeature = std::make_shared<UpdaterGroundPlaneFeature>(
+      sigma_pixel, max_features, center_frac, min_cos_tilt, max_residual_px);
+  PRINT_INFO(GREEN "[GPLANE-FEAT] enabled: sigma_px=%.2f K=%d center=%.2f "
+             "min_cos_tilt=%.2f max_res=%.1fpx\n" RESET,
+             sigma_pixel, max_features, center_frac, min_cos_tilt, max_residual_px);
+}
+
+void VioManager::print_gps_alt_final_summary() {
+  auto &s = gps_alt_stats_;
+  size_t n_evals = s.n_accepted + s.n_rejected;
+  double rate = n_evals > 0 ? 100.0 * s.n_accepted / n_evals : 0;
+  double span = s.last_eval_time - s.first_eval_time;
+  PRINT_INFO(GREEN "[GPS-ALT-FINAL] ====== GPS Altitude Fusion Summary ======\n" RESET);
+  PRINT_INFO(GREEN "[GPS-ALT-FINAL] time span: %.1f s (%.1f - %.1f)\n" RESET,
+             span, s.first_eval_time, s.last_eval_time);
+  PRINT_INFO(GREEN "[GPS-ALT-FINAL] calls=%zu  acc=%zu  rej=%zu (dxy=%zu kxy=%zu bias=%zu)  skip=%zu  rate=%.1f%%\n" RESET,
+             s.n_called, s.n_accepted, s.n_rejected,
+             s.n_rejected_dxy, s.n_rejected_kxy, s.n_rejected_bias,
+             s.n_skipped, rate);
+  PRINT_INFO(GREEN "[GPS-ALT-FINAL] K_pz mean=%.5f  |K_xy| mean=%.5f  |dxy| mean=%.4f m\n" RESET,
+             n_evals > 0 ? s.sum_K_pz / n_evals : 0.0,
+             n_evals > 0 ? s.sum_K_xy_norm / n_evals : 0.0,
+             n_evals > 0 ? s.sum_dxy_norm / n_evals : 0.0);
+  PRINT_INFO(GREEN "[GPS-ALT-FINAL] |dtheta| mean=%.4f  |dba| mean=%.5f  |dbg| mean=%.5f\n" RESET,
+             n_evals > 0 ? s.sum_dtheta_norm / n_evals : 0.0,
+             n_evals > 0 ? s.sum_dba_norm / n_evals : 0.0,
+             n_evals > 0 ? s.sum_dbg_norm / n_evals : 0.0);
+  PRINT_INFO(GREEN "[GPS-ALT-FINAL] P_zz mean=%.4f  |res| mean=%.2f m  |dp_z| mean=%.3f m\n" RESET,
+             n_evals > 0 ? s.sum_P_zz / n_evals : 0.0,
+             n_evals > 0 ? s.sum_abs_res / n_evals : 0.0,
+             s.n_accepted > 0 ? s.sum_abs_dpz / s.n_accepted : 0.0);
+  PRINT_INFO(GREEN "[GPS-ALT-FINAL] ==========================================\n" RESET);
 }
 
 void VioManager::feed_measurement_simulation(double timestamp, const std::vector<int> &camids,
@@ -464,10 +797,23 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
   // bias estimate and IMU-to-camera extrinsics) and KLT is the active
   // front-end. The prediction is consumed exactly once and cleared after
   // feed_new_camera() so no stale rotation can leak to a later frame.
-  if (params.use_gyro_aided_klt && params.use_klt && is_initialized_vio && propagator != nullptr) {
+  // Ground-parallel warp provides its own rotation-aware initial guess via apply_H_kp; suppress
+  // the gyro-aided initial-guess here to avoid double-applying the same rotation homography.
+  if (params.use_gyro_aided_klt && !params.use_ground_parallel_warp && params.use_klt && is_initialized_vio && propagator != nullptr) {
+  double bg_sigma_max = 0.0;
+  if (params.use_gyro_aided_klt_max_bg_sigma > 0.0) {
+    Eigen::MatrixXd P_bg = StateHelper::get_marginal_covariance(state, {state->_imu->bg()});
+    bg_sigma_max = std::sqrt(std::max({P_bg(0, 0), P_bg(1, 1), P_bg(2, 2)}));
+  }
+  bool bg_sigma_ok = (params.use_gyro_aided_klt_max_bg_sigma <= 0.0) ||
+                     (bg_sigma_max <= params.use_gyro_aided_klt_max_bg_sigma);
+  if (!bg_sigma_ok) {
+    PRINT_DEBUG("[GYRO-KLT-GATE] skip: bg_sigma_max=%.5f > %.5f rad/s\n",
+                bg_sigma_max, params.use_gyro_aided_klt_max_bg_sigma);
+  }
+  if (bg_sigma_ok) {
     double t_off = state->_calib_dt_CAMtoIMU->value()(0);
     double t_curr_imu = message.timestamp + t_off;
-    Eigen::Vector3d bg = state->_imu->bias_g();
     for (size_t i = 0; i < message.sensor_ids.size(); i++) {
       size_t cam_id = message.sensor_ids.at(i);
       auto it_prev = last_track_image_time_.find(cam_id);
@@ -476,31 +822,88 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
       }
       double t_prev_imu = it_prev->second + t_off;
       Eigen::Matrix3d R_I0_to_I1;
-      if (!propagator->compute_relative_rotation(t_prev_imu, t_curr_imu, bg, R_I0_to_I1)) {
+      if (!propagator->compute_relative_rotation(state, t_prev_imu, t_curr_imu, R_I0_to_I1)) {
         continue;
       }
-      // Map the body-frame relative rotation into the camera frame via the
-      // (current best estimate of the) IMU-to-camera extrinsic:
-      //   R_C0_to_C1 = R_ItoC * R_I0_to_I1 * R_ItoC^T
-      // Both R_ItoC and the bias estimate are time-varying when online
-      // calibration is enabled; for a short inter-frame interval this is
-      // accurate enough for an LK seed.
+      double theta_norm = ov_core::log_so3(R_I0_to_I1).norm();
+      if (params.use_gyro_aided_klt_min_rot_rad > 0.0 &&
+          theta_norm < params.use_gyro_aided_klt_min_rot_rad) {
+        PRINT_DEBUG("[GYRO-KLT-GATE] skip cam%zu: |theta|=%.4f rad < %.4f rad\n",
+                    cam_id, theta_norm, params.use_gyro_aided_klt_min_rot_rad);
+        continue;
+      }
       Eigen::Matrix3d R_ItoC = state->_calib_IMUtoCAM.at(cam_id)->Rot();
       Eigen::Matrix3d R_C0_to_C1 = R_ItoC * R_I0_to_I1 * R_ItoC.transpose();
-      // Convert Eigen (column-major) to cv::Matx33d (row-major) explicitly.
       cv::Matx33d R_cv(R_C0_to_C1(0, 0), R_C0_to_C1(0, 1), R_C0_to_C1(0, 2),
                        R_C0_to_C1(1, 0), R_C0_to_C1(1, 1), R_C0_to_C1(1, 2),
                        R_C0_to_C1(2, 0), R_C0_to_C1(2, 1), R_C0_to_C1(2, 2));
       trackFEATS->set_predicted_rotation(cam_id, R_cv);
+      PRINT_DEBUG("[GYRO-KLT-GATE] use cam%zu: |theta|=%.4f rad, bg_sigma=%.5f rad/s\n",
+                  cam_id, theta_norm, bg_sigma_max);
     }
+  }
+}
+
+  // [Ground-parallel warp] FRAME-TO-FRAME rotation warp for KLT tracking.
+  //
+  // TRACKING PATH (how it works):
+  //   TrackKLT warps ONLY the stored last image with H = K * R_comp * K^{-1}.
+  //   The current image is NOT warped. After this warp the last image appears in the
+  //   current camera orientation, so KLT sees only translational parallax — not the
+  //   rotation component. pts_left_new from KLT are directly in raw current-image
+  //   coordinates; no un-warp step is required. The estimator receives unmodified
+  //   original-space observations.
+  //
+  // ROTATION USED (frame-to-frame, NOT absolute):
+  //   R_comp = R_GtoC_curr * R_GtoC_prev^T
+  //   Maps a 3-D ray expressed in the PREVIOUS camera frame to the CURRENT camera
+  //   frame. gravity_warp_R_ref_ is updated each frame to store R_GtoC_curr so the
+  //   next call can compute the delta.
+  //
+  // FIRST ACTIVATION: gravity_warp_R_ref_ is not yet populated → skip warp, save
+  //   current R_GtoC as "prev" for the next frame.
+  //
+  // GYRO-AIDED KLT: suppressed above when this warp is active, to prevent the same
+  //   rotation homography being applied twice to the KLT initial guess.
+  //
+  // Config switch: use_ground_parallel_warp (default: false)
+  if (params.use_ground_parallel_warp && params.use_klt && is_initialized_vio) {
+    Eigen::Matrix3d R_GtoI_curr = state->_imu->Rot(); // R_GtoI (JPL: global→IMU)
+    for (size_t i = 0; i < message.sensor_ids.size(); i++) {
+      size_t cam_id = message.sensor_ids.at(i);
+      Eigen::Matrix3d R_ItoC = state->_calib_IMUtoCAM.at(cam_id)->Rot();
+      Eigen::Matrix3d R_GtoC_curr = R_ItoC * R_GtoI_curr; // global→camera at current time
+      // First activation: save current orientation as "prev" and skip warp this frame.
+      if (gravity_warp_R_ref_.find(cam_id) == gravity_warp_R_ref_.end()) {
+        gravity_warp_R_ref_[cam_id] = R_GtoC_curr;
+        continue;
+      }
+      Eigen::Matrix3d R_GtoC_prev = gravity_warp_R_ref_.at(cam_id);
+      // Frame-to-frame rotation: maps a ray in last-cam frame → current-cam frame.
+      // H = K * R_comp * K^{-1} warps last image to current orientation.
+      Eigen::Matrix3d R_comp = R_GtoC_curr * R_GtoC_prev.transpose();
+      cv::Matx33d R_comp_cv(R_comp(0, 0), R_comp(0, 1), R_comp(0, 2),
+                             R_comp(1, 0), R_comp(1, 1), R_comp(1, 2),
+                             R_comp(2, 0), R_comp(2, 1), R_comp(2, 2));
+      trackFEATS->set_gravity_warp(cam_id, R_comp_cv);
+      PRINT_DEBUG("[VIO-WARP] cam%zu R_comp (prev→curr cam rays) = [%.3f %.3f %.3f; %.3f %.3f %.3f; %.3f %.3f %.3f]\n",
+                  cam_id,
+                  R_comp(0, 0), R_comp(0, 1), R_comp(0, 2),
+                  R_comp(1, 0), R_comp(1, 1), R_comp(1, 2),
+                  R_comp(2, 0), R_comp(2, 1), R_comp(2, 2));
+      // Update "prev" for next frame (must happen before feed_new_camera consumes it).
+      gravity_warp_R_ref_[cam_id] = R_GtoC_curr;
+    }
+    gravity_warp_ref_set_ = true;
   }
 
   // Perform our feature tracking!
   // [中文] 视觉前端: KLT / Descriptor / SIM. 内部会更新 FeatureDatabase
   trackFEATS->feed_new_camera(message);
 
-  // Consume the prediction so a later frame can't reuse a stale rotation.
+  // Consume the prediction and gravity warp so a later frame can't reuse stale state.
   trackFEATS->clear_predicted_rotations();
+  trackFEATS->clear_gravity_warps();
 
   // Remember the latest image time per camera id for the next call.
   for (size_t i = 0; i < message.sensor_ids.size(); i++) {
@@ -543,9 +946,49 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
     }
   }
 
+  // [Landing gate] If altitude has dropped into the configured safety band AND
+  // the platform is descending (not taking off), halt MSCKF/SLAM updates
+  // (propagate-only). Uses a 20% hysteresis so flutter near the threshold
+  // doesn't toggle the gate. Once latched, the gate clears only when altitude
+  // rises above 1.2 * threshold.
+  // The velocity gate (vel_z < 0.5 m/s) prevents this from triggering during
+  // takeoff when altitude is temporarily below the threshold.
+  if (is_initialized_vio && params.landing_safety_min_alt_m > 0.0) {
+    double alt_now = state->_imu->pos()(2);
+    double vel_z_now = state->_imu->vel()(2); // +up in global frame
+    double thr_in  = params.landing_safety_min_alt_m;
+    double thr_out = 1.2 * params.landing_safety_min_alt_m;
+    if (!landing_update_halted_ && alt_now < thr_in && vel_z_now < 0.5) {
+      landing_update_halted_ = true;
+      landing_halt_msg_emitted_ = false;
+    } else if (landing_update_halted_ && alt_now > thr_out) {
+      landing_update_halted_ = false;
+      PRINT_INFO(CYAN "[LANDING-GATE] cleared: alt=%.2fm > %.2fm (hysteresis), updates re-enabled\n" RESET,
+                 alt_now, thr_out);
+    }
+    if (landing_update_halted_ && !landing_halt_msg_emitted_) {
+      PRINT_WARNING(YELLOW "[LANDING-GATE] alt=%.2fm < %.2fm vel_z=%.1f: MSCKF/SLAM updates HALTED, "
+                           "dead-reckoning only. Operator: take manual control / abort evaluation.\n" RESET,
+                    alt_now, thr_in, vel_z_now);
+      landing_halt_msg_emitted_ = true;
+    }
+  }
+
   // Call on our propagate and update function
   // [中文] 进入完整的 EKF 流程 (传播 + 克隆 + MSCKF/SLAM/ZUPT 更新 + 边缘化)
-  do_feature_propagate_update(message);
+  if (landing_update_halted_) {
+    // Propagate-only path: still advance time and clone window, no update.
+    if (state->_timestamp < message.timestamp) {
+      propagator->propagate_and_clone(state, message.timestamp);
+      // Keep clone window bounded; do_feature_propagate_update normally
+      // does this at the end.
+      StateHelper::marginalize_old_clone(state);
+    }
+    PRINT_INFO(YELLOW "[LANDING-GATE] frame %.3f: skipped MSCKF/SLAM update (alt=%.2fm)\n" RESET,
+               message.timestamp, state->_imu->pos()(2));
+  } else {
+    do_feature_propagate_update(message);
+  }
 }
 
 // =============================================================================
@@ -775,6 +1218,48 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // NOTE: this should only really be used if you want to track a lot of features, or have limited computational resources
   if ((int)featsup_MSCKF.size() > state->_options.max_msckf_in_update)
     featsup_MSCKF.erase(featsup_MSCKF.begin(), featsup_MSCKF.end() - state->_options.max_msckf_in_update);
+
+  // [MSCKF parallax filter] Drop features whose max 2-D pixel parallax
+  // across the active clone window is below the threshold. They carry
+  // essentially no metric scale info at high altitude and just inject
+  // noise into the H matrix.
+  if (params.min_msckf_parallax_px > 0.0 && !featsup_MSCKF.empty()) {
+    int n_in = (int)featsup_MSCKF.size();
+    auto needs_drop = [&](const std::shared_ptr<Feature> &f) -> bool {
+      double umin = 1e18, umax = -1e18, vmin = 1e18, vmax = -1e18;
+      for (const auto &cam_uvs : f->uvs) {
+        for (const auto &uv : cam_uvs.second) {
+          if (uv(0) < umin) umin = uv(0);
+          if (uv(0) > umax) umax = uv(0);
+          if (uv(1) < vmin) vmin = uv(1);
+          if (uv(1) > vmax) vmax = uv(1);
+        }
+      }
+      double du = (umax > -1e17) ? (umax - umin) : 0.0;
+      double dv = (vmax > -1e17) ? (vmax - vmin) : 0.0;
+      double parallax_px = std::sqrt(du * du + dv * dv);
+      return parallax_px < params.min_msckf_parallax_px;
+    };
+    featsup_MSCKF.erase(
+        std::remove_if(featsup_MSCKF.begin(), featsup_MSCKF.end(), needs_drop),
+        featsup_MSCKF.end());
+    int n_out = (int)featsup_MSCKF.size();
+    if (n_in != n_out) {
+      PRINT_DEBUG("[MSCKF-PARALLAX] dropped %d/%d features below %.2f px\n",
+                  n_in - n_out, n_in, params.min_msckf_parallax_px);
+    }
+  }
+
+  // Stage B — ground-plane feature update (optional).  Runs BEFORE MSCKF
+  // so MSCKF hasn't yet marked features for deletion; we only need to look
+  // at the database, we don't consume features.
+  if (updaterGPlaneFeature != nullptr && updaterGPlaneRange != nullptr &&
+      updaterGPlaneRange->bootstrapped()) {
+    double z_g = updaterGPlaneRange->z_ground();
+    updaterGPlaneFeature->try_update(state, trackFEATS->get_feature_database(),
+                                     message.timestamp, z_g);
+  }
+
   updaterMSCKF->update(state, featsup_MSCKF);
   propagator->invalidate_cache();
   rT4 = boost::posix_time::microsec_clock::local_time();
@@ -908,6 +1393,35 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   PRINT_INFO("q_GtoI = %.3f,%.3f,%.3f,%.3f | p_IinG = %.3f,%.3f,%.3f | dist = %.2f (meters)\n", state->_imu->quat()(0),
              state->_imu->quat()(1), state->_imu->quat()(2), state->_imu->quat()(3), state->_imu->pos()(0), state->_imu->pos()(1),
              state->_imu->pos()(2), distance);
+  // [STATS] Per-frame size diagnostics. Helps identify which structure
+  // is growing if real-time degrades over a long flight. Cheap (just sizes).
+  {
+    int n_slam   = (int)state->_features_SLAM.size();
+    int n_clones = (int)state->_clones_IMU.size();
+    int n_total  = state->max_covariance_size();
+    int n_db     = (int)trackFEATS->get_feature_database()->size();
+    PRINT_DEBUG("[STATS] state_dim=%d n_clones=%d n_slam=%d db=%d\n",
+                n_total, n_clones, n_slam, n_db);
+    slam_count_history_.emplace_back(message.timestamp, n_slam);
+    while (!slam_count_history_.empty() &&
+           message.timestamp - slam_count_history_.front().first > 2.0) {
+      slam_count_history_.pop_front();
+    }
+    if (slam_count_history_.size() >= 2) {
+      double t0 = slam_count_history_.front().first;
+      int n0   = slam_count_history_.front().second;
+      double dt = message.timestamp - t0;
+      if (dt > 0.5 && n0 > 5) {
+        double rate = (double)(n0 - n_slam) / (double)n0 / dt;
+        if (rate > 0.30) {
+          PRINT_WARNING(YELLOW "[LANDING-WATCH] SLAM dropping %.0f%%/s (%d -> %d in %.2fs). "
+                               "Likely descent or scene change; consider landing_safety_min_alt_m.\n" RESET,
+                        100.0 * rate, n0, n_slam, dt);
+        }
+      }
+    }
+  }
+
   PRINT_INFO("bg = %.4f,%.4f,%.4f | ba = %.4f,%.4f,%.4f\n", state->_imu->bias_g()(0), state->_imu->bias_g()(1), state->_imu->bias_g()(2),
              state->_imu->bias_a()(0), state->_imu->bias_a()(1), state->_imu->bias_a()(2));
 

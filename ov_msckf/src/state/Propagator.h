@@ -207,7 +207,7 @@ public:
    * @param[out] R_I0_to_I1 Resulting passive rotation
    * @return True iff at least two IMU samples were available in the window
    */
-  bool compute_relative_rotation(double time0, double time1, const Eigen::Vector3d &bg, Eigen::Matrix3d &R_I0_to_I1);
+  bool compute_relative_rotation(std::shared_ptr<State> state, double time0, double time1, Eigen::Matrix3d &R_I0_to_I1);
 
   /**
    * @brief Nice helper function that will linearly interpolate between two imu messages.

@@ -86,6 +86,10 @@ public:
    */
   void feed_new_camera(const CameraData &message) override;
 
+  /// Returns the latest per-camera warp visualization packet.
+  /// Only the most recent packet per camera is kept.
+  bool get_warp_viz_packet(size_t cam_id, TrackerWarpVizPacket &packet);
+
 protected:
   /**
    * @brief Process a new monocular image
@@ -171,6 +175,10 @@ protected:
   std::map<size_t, std::vector<cv::Mat>> img_pyramid_last;
   std::map<size_t, cv::Mat> img_curr;
   std::map<size_t, std::vector<cv::Mat>> img_pyramid_curr;
+
+  // Warp visualization packet — latest per camera, populated after final matches
+  std::unordered_map<size_t, TrackerWarpVizPacket> warp_viz_packets_;
+  std::mutex mtx_warp_viz_packets_;
 };
 
 } // namespace ov_core

@@ -265,3 +265,22 @@ bool TrackBase::get_predicted_rotation(size_t cam_id, cv::Matx33d &R_out) {
   R_out = it->second;
   return true;
 }
+
+void TrackBase::set_gravity_warp(size_t cam_id, const cv::Matx33d &R_comp) {
+  std::lock_guard<std::mutex> lck(mtx_gravity_warp);
+  gravity_warp_per_cam[cam_id] = R_comp;
+}
+
+void TrackBase::clear_gravity_warps() {
+  std::lock_guard<std::mutex> lck(mtx_gravity_warp);
+  gravity_warp_per_cam.clear();
+}
+
+bool TrackBase::get_gravity_warp(size_t cam_id, cv::Matx33d &R_out) {
+  std::lock_guard<std::mutex> lck(mtx_gravity_warp);
+  auto it = gravity_warp_per_cam.find(cam_id);
+  if (it == gravity_warp_per_cam.end())
+    return false;
+  R_out = it->second;
+  return true;
+}
