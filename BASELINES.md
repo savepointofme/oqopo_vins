@@ -67,15 +67,12 @@ must use the same start-time.**
 
 | flight | start-time (s) | init status on current binary |
 | ------ | -------------: | -------- |
-| fly1 | 200 | OK (`[init]: successful initialization in 0.0018s` at start=200) |
-| fly2 | 185 | **FAIL** — disparity ≈ 6–13 ≫ 0.7 (static), rotation < 0.3° (dynamic). start=0 also fails in 120s probe window. Needs investigation: find a takeoff-adjacent start-time, or tweak `init_max_features`/`init_dyn_min_deg` for this flight. |
-| fly3 | 244 | **FAIL** — same pattern as fly2 (drone already mid-flight, dynamic init can't accumulate enough rotation in the probe window). Needs investigation. |
+| fly1 | 200 | OK (`[init]: successful initialization in 0.0018s`) |
+| fly2 | **160** | OK (was 185 historically; jc82 init refuses 185 because the drone is already mid-flight there. The drone is on the ground at 160s and takes off shortly after — static init fires.) |
+| fly3 | **180** | OK (was 244 historically; same reason as fly2. 200 also fails on jc82.) |
 | fly4 | 239 | OK — matches current canonical `stage_a_v2/R0_nogps.txt` (R0 and R6_d10 reused as B0/B1) |
 
-When fly2/fly3 init is resolved, this table is updated and the run scripts
-are rerun. Stage B v1 development does **not** block on this — fly1 and fly4
-are sufficient to validate the v1 EKF math; cross-flight generalisation is
-checked once fly2/fly3 baselines exist.
+History note: the historical start-times (185 / 244) worked under the PR17-era binary because that build's initializer used looser thresholds. The current jc82 mono config requires either a stationary takeoff window or a smaller mid-flight window for dynamic init; the table above lists the validated values.
 
 ## fly4 reuses existing canonical runs
 

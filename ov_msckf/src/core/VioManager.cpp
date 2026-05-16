@@ -43,6 +43,7 @@
 #include "update/UpdaterSLAM.h"
 #include "update/UpdaterGroundPlaneRange.h"
 #include "update/UpdaterGroundPlaneFeature.h"
+#include "update/UpdaterGroundPlaneFeatureV1.h"
 #include "update/UpdaterZeroVelocity.h"
 
 using namespace ov_core;
@@ -663,6 +664,27 @@ void VioManager::enable_gplane_feature(double sigma_pixel, int max_features,
              sigma_pixel, max_features, center_frac, min_cos_tilt, max_residual_px);
 }
 
+void VioManager::enable_gplane_feature_v1(bool dry_run, double sigma_pixel,
+                                          int max_features, double center_frac,
+                                          double min_cos_tilt, double max_residual_px,
+                                          double fd_step_rot, double fd_step_pos,
+                                          double fd_rel_tol,
+                                          bool exclude_used_from_msckf) {
+  auto mode = dry_run ? UpdaterGroundPlaneFeatureV1::Mode::DRY_RUN
+                      : UpdaterGroundPlaneFeatureV1::Mode::UPDATE;
+  updaterGPlaneFeatureV1 = std::make_shared<UpdaterGroundPlaneFeatureV1>(
+      mode, sigma_pixel, max_features, center_frac, min_cos_tilt,
+      max_residual_px, /*min_lambda*/ 0.5, /*max_lambda*/ 100.0,
+      fd_step_rot, fd_step_pos, fd_rel_tol, exclude_used_from_msckf);
+  PRINT_INFO(GREEN "[GPLANE-V1] enabled mode=%s sigma_px=%.2f K=%d center=%.2f "
+             "min_cos_tilt=%.2f max_res=%.1fpx fd_step_rot=%.1e fd_step_pos=%.1e "
+             "fd_rel_tol=%.1e exclude_msckf=%d\n" RESET,
+             dry_run ? "DRY_RUN" : "UPDATE",
+             sigma_pixel, max_features, center_frac, min_cos_tilt,
+             max_residual_px, fd_step_rot, fd_step_pos, fd_rel_tol,
+             exclude_used_from_msckf ? 1 : 0);
+}
+
 void VioManager::print_gps_alt_final_summary() {
   auto &s = gps_alt_stats_;
   size_t n_evals = s.n_accepted + s.n_rejected;
@@ -1258,6 +1280,17 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     double z_g = updaterGPlaneRange->z_ground();
     updaterGPlaneFeature->try_update(state, trackFEATS->get_feature_database(),
                                      message.timestamp, z_g);
+  }
+
+  // Stage B v1 — two-clone H, dry-run + FD check (optional, mutually
+  // exclusive with v0 in practice).  Same activation gate as v0: requires
+  // Stage A bootstrap and Stage A delay (Stage A enforces the delay itself,
+  // so once Stage A has fired, both feature updaters become eligible).
+  if (updaterGPlaneFeatureV1 != nullptr && updaterGPlaneRange != nullptr &&
+      updaterGPlaneRange->bootstrapped()) {
+    double z_g = updaterGPlaneRange->z_ground();
+    updaterGPlaneFeatureV1->try_update(state, trackFEATS->get_feature_database(),
+                                       message.timestamp, z_g);
   }
 
   updaterMSCKF->update(state, featsup_MSCKF);

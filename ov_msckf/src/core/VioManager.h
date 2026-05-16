@@ -82,6 +82,7 @@ class UpdaterSLAM;
 class UpdaterZeroVelocity;
 class UpdaterGroundPlaneRange;
 class UpdaterGroundPlaneFeature;
+class UpdaterGroundPlaneFeatureV1;
 class Propagator;
 
 /**
@@ -261,6 +262,26 @@ public:
   /// Access the ground-plane feature updater for diagnostics.
   std::shared_ptr<UpdaterGroundPlaneFeature> get_updater_gplane_feature() { return updaterGPlaneFeature; }
 
+  /// Enable Stage B v1 (two-clone H, anchor pose is a state, not fixed).
+  /// dry_run=true builds analytic + finite-difference Jacobian and logs the
+  /// comparison without ever calling EKFUpdate.  Activation policy mirrors
+  /// Stage A's: this fires only after z_ground is bootstrapped and the
+  /// Stage-A min-t-after-init delay has elapsed (so callers don't need to
+  /// gate themselves).
+  void enable_gplane_feature_v1(bool dry_run,
+                                double sigma_pixel = 3.0,
+                                int max_features = 5,
+                                double center_frac = 0.8,
+                                double min_cos_tilt = 0.85,
+                                double max_residual_px = 5.0,
+                                double fd_step_rot = 1e-5,
+                                double fd_step_pos = 1e-5,
+                                double fd_rel_tol = 1e-3,
+                                bool exclude_used_from_msckf = true);
+
+  /// Access the v1 updater for diagnostics.
+  std::shared_ptr<UpdaterGroundPlaneFeatureV1> get_updater_gplane_feature_v1() { return updaterGPlaneFeatureV1; }
+
   /// If we are initialized or not
   /// [中文] 判断系统是否已初始化: 必须既完成初始化又至少做过一次更新。
   bool initialized() { return is_initialized_vio && timelastupdate != -1; }
@@ -422,6 +443,9 @@ protected:
 
   /// Stage B — ground-plane feature updater (optional, off by default)
   std::shared_ptr<UpdaterGroundPlaneFeature> updaterGPlaneFeature;
+
+  /// Stage B v1 — two-clone H, dry-run-first updater (optional, off by default)
+  std::shared_ptr<UpdaterGroundPlaneFeatureV1> updaterGPlaneFeatureV1;
 
   /// This is the queue of measurement times that have come in since we starting doing initialization
   /// After we initialize, we will want to prop & update to the latest timestamp quickly

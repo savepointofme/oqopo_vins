@@ -45,6 +45,7 @@
 #include "core/VioManagerOptions.h"
 #include "update/UpdaterGroundPlaneRange.h"
 #include "update/UpdaterGroundPlaneFeature.h"
+#include "update/UpdaterGroundPlaneFeatureV1.h"
 #include "state/Propagator.h"
 #include "state/State.h"
 #include "types/IMU.h"
@@ -100,6 +101,14 @@ struct Args {
   double gplane_feat_center_frac = 0.8;   // restrict anchor pixel to central fraction
   double gplane_feat_min_cos_tilt = 0.85; // skip when drone tilted
   double gplane_feat_max_res_px = 5.0;    // reject feature if predicted residual > this
+  // -- Stage B v1 (two-clone H + dry-run/FD) --
+  bool gplane_feat_v1_enable = false;     // turn on v1 (mutually exclusive with v0 in practice)
+  bool gplane_feat_v1_dry_run = true;     // default: dry-run, no EKF update
+  bool gplane_feat_v1_update = false;     // when --gplane-feat-v1-update is passed, overrides dry-run
+  double gplane_feat_v1_fd_step_rot = 1e-5;
+  double gplane_feat_v1_fd_step_pos = 1e-5;
+  double gplane_feat_v1_fd_rel_tol = 1e-3;
+  bool gplane_feat_exclude_used_from_msckf = true;
   double gps_cutoff_time = -1.0;         // [中文] Hold-out 评估: 超过 t_cam > cutoff 后不再 feed GPS, 看 VIO 裸跑
   double gps_feed_every = 1.0;           // [中文] GPS 喂入比例 1.0=全部, 0.2=每 5 个采样用 1 个 (验证降采样)
   // [中文] CLI 覆盖 yaml 里的 gps_time_offset; NaN = 不覆盖, 用 yaml/默认值
@@ -138,6 +147,12 @@ void print_help() {
                "  --gplane-feat-center-frac V central image fraction to keep (default 0.8)\n"
                "  --gplane-feat-min-cos-tilt V skip when |cos_tilt|<V (default 0.85)\n"
                "  --gplane-feat-max-res-px V  reject feature if predicted residual>V (default 5.0)\n"
+               "  --gplane-feat-v1          Stage B v1 (two-clone H, dry-run by default)\n"
+               "  --gplane-feat-v1-update   Run v1 in UPDATE mode (refuses features whose FD check fails)\n"
+               "  --gplane-feat-v1-fd-step-rot V  rotation FD step (default 1e-5)\n"
+               "  --gplane-feat-v1-fd-step-pos V  position FD step (default 1e-5)\n"
+               "  --gplane-feat-v1-fd-rel-tol V   FD relative-error pass threshold (default 1e-3)\n"
+               "  --gplane-feat-exclude-used-from-msckf {0|1}  default 1 in v1 UPDATE\n"
                "  --gps-cutoff-time T   Stop feeding GPS after t_cam > T (hold-out test)\n"
                "  --gps-feed-every F    Feed 1/F of GPS samples (e.g. 0.2 = 1-in-5, validation set)\n"
                "  --gps-time-offset SEC Override yaml gps_time_offset (sec). Adds to gps timestamps.\n"
@@ -195,6 +210,12 @@ bool parse_args(int argc, char **argv, Args &a) {
     else if (s == "--gplane-feat-center-frac") a.gplane_feat_center_frac = std::atof(next("--gplane-feat-center-frac").c_str());
     else if (s == "--gplane-feat-min-cos-tilt") a.gplane_feat_min_cos_tilt = std::atof(next("--gplane-feat-min-cos-tilt").c_str());
     else if (s == "--gplane-feat-max-res-px") a.gplane_feat_max_res_px = std::atof(next("--gplane-feat-max-res-px").c_str());
+    else if (s == "--gplane-feat-v1") a.gplane_feat_v1_enable = true;
+    else if (s == "--gplane-feat-v1-update") { a.gplane_feat_v1_enable = true; a.gplane_feat_v1_update = true; }
+    else if (s == "--gplane-feat-v1-fd-step-rot") a.gplane_feat_v1_fd_step_rot = std::atof(next("--gplane-feat-v1-fd-step-rot").c_str());
+    else if (s == "--gplane-feat-v1-fd-step-pos") a.gplane_feat_v1_fd_step_pos = std::atof(next("--gplane-feat-v1-fd-step-pos").c_str());
+    else if (s == "--gplane-feat-v1-fd-rel-tol") a.gplane_feat_v1_fd_rel_tol = std::atof(next("--gplane-feat-v1-fd-rel-tol").c_str());
+    else if (s == "--gplane-feat-exclude-used-from-msckf") a.gplane_feat_exclude_used_from_msckf = (std::atoi(next("--gplane-feat-exclude-used-from-msckf").c_str()) != 0);
     else if (s == "--gps-cutoff-time") a.gps_cutoff_time = std::atof(next("--gps-cutoff-time").c_str());
     else if (s == "--gps-feed-every") a.gps_feed_every = std::atof(next("--gps-feed-every").c_str());
     else if (s == "--gps-time-offset") a.gps_time_offset_cli = std::atof(next("--gps-time-offset").c_str());
@@ -269,6 +290,23 @@ int main(int argc, char **argv) {
     sys->enable_gplane_feature(args.gplane_feat_sigma_px, args.gplane_feat_max_features,
                                args.gplane_feat_center_frac, args.gplane_feat_min_cos_tilt,
                                args.gplane_feat_max_res_px);
+  }
+  // Stage B v1 — two-clone H, dry-run + FD by default
+  if (args.gplane_feat_v1_enable) {
+    if (!args.gps_alt_ground_plane) {
+      PRINT_WARNING(YELLOW "[ros-free] --gplane-feat-v1 requested but --gps-alt-ground-plane not set; "
+                    "v1 will not fire until z_ground is bootstrapped.\n" RESET);
+    }
+    bool dry_run = !args.gplane_feat_v1_update;
+    sys->enable_gplane_feature_v1(dry_run, args.gplane_feat_sigma_px,
+                                  args.gplane_feat_max_features,
+                                  args.gplane_feat_center_frac,
+                                  args.gplane_feat_min_cos_tilt,
+                                  args.gplane_feat_max_res_px,
+                                  args.gplane_feat_v1_fd_step_rot,
+                                  args.gplane_feat_v1_fd_step_pos,
+                                  args.gplane_feat_v1_fd_rel_tol,
+                                  args.gplane_feat_exclude_used_from_msckf);
   }
   // [中文] 设置创新截断 (如果 CLI 指定, 建议 30m)
   if (args.gps_alt_max_res < 1e8) {
@@ -690,6 +728,9 @@ int main(int argc, char **argv) {
   }
   if (args.gplane_feat_enable && sys->get_updater_gplane_feature()) {
     sys->get_updater_gplane_feature()->print_summary();
+  }
+  if (args.gplane_feat_v1_enable && sys->get_updater_gplane_feature_v1()) {
+    sys->get_updater_gplane_feature_v1()->print_summary();
   }
 
   // final frame + hold if window

@@ -89,6 +89,7 @@ list(APPEND LIBRARY_SOURCES
         src/update/UpdaterZeroVelocity.cpp
         src/update/UpdaterGroundPlaneRange.cpp
         src/update/UpdaterGroundPlaneFeature.cpp
+        src/update/UpdaterGroundPlaneFeatureV1.cpp
 )
 if (catkin_FOUND AND ENABLE_ROS)
     list(APPEND LIBRARY_SOURCES src/ros/ROS1Visualizer.cpp src/ros/ROSVisualizerHelper.cpp)
