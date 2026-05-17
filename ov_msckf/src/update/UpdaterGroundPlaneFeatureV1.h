@@ -116,14 +116,17 @@ public:
     double sum_residual_px = 0.0;
     double sum_dxy_norm = 0.0;
     double sum_dz_after = 0.0;
+    double max_residual_px = 0.0;
+    double max_dxy_norm = 0.0;
+    double max_dz_after = 0.0;
     double first_t = -1.0;
     double last_t = -1.0;
     double last_summary_t = -1.0;
   };
 
   UpdaterGroundPlaneFeatureV1(Mode mode,
-                              double sigma_pixel = 3.0,
-                              int max_features = 5,
+                              double sigma_pixel = 50.0,         // E1 (was 3.0)
+                              int max_features = 2,              // E1 (was 5)
                               double center_frac = 0.8,
                               double min_cos_tilt = 0.85,
                               double max_residual_px = 5.0,
@@ -134,7 +137,7 @@ public:
                               double fd_rel_tol_rot = 1e-3,
                               double fd_rel_tol_pos = 3e-3,
                               double fd_max_abs_rel_tol = 1e-2,
-                              bool   exclude_used_from_msckf = true,
+                              bool   exclude_used_from_msckf = false, // E1 (was true)
                               int    dump_first_n = 0);
 
   /// Attempt one update at the current camera timestamp.  In DRY_RUN mode
@@ -149,6 +152,10 @@ public:
   /// exclude_used_from_msckf is true, callers should pass these to the
   /// MSCKF updater so the same observations are not double-counted.
   const std::unordered_set<size_t> &last_used_feat_ids() const { return last_used_ids_; }
+
+  /// True iff features consumed by v1's most recent UPDATE call should be
+  /// removed from the MSCKF feature pool to prevent double-counting.
+  bool exclude_used_from_msckf() const { return exclude_used_from_msckf_; }
 
   const LastUpdate &last_update() const { return last_; }
   const Stats &stats() const { return stats_; }

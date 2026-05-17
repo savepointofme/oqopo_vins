@@ -269,8 +269,8 @@ public:
   /// Stage-A min-t-after-init delay has elapsed (so callers don't need to
   /// gate themselves).
   void enable_gplane_feature_v1(bool dry_run,
-                                double sigma_pixel = 3.0,
-                                int max_features = 5,
+                                double sigma_pixel = 50.0,        // E1 default (was 3.0)
+                                int max_features = 2,             // E1 default (was 5)
                                 double center_frac = 0.8,
                                 double min_cos_tilt = 0.85,
                                 double max_residual_px = 5.0,
@@ -279,7 +279,7 @@ public:
                                 double fd_rel_tol_rot = 1e-3,
                                 double fd_rel_tol_pos = 3e-3,
                                 double fd_max_abs_rel_tol = 1e-2,
-                                bool exclude_used_from_msckf = true,
+                                bool exclude_used_from_msckf = false, // E1 default (was true)
                                 int dump_first_n = 0);
 
   /// Access the v1 updater for diagnostics.

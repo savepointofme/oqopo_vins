@@ -95,9 +95,11 @@ struct Args {
   bool gps_alt_zonly = false;            // [中文] Z-only 模式: 只更新 p_z, 其他状态不全改, cov 只降 P_zz
   bool gps_alt_ground_plane = false;     // [中文] 地面平面伪测距模式: 将 GPS 高度转换为斜距观测
   // -- Stage B (ground-plane feature update) --
+  // Shared defaults between v0 and v1 — chosen to match the empirically-best
+  // v0 R5b config (sigma=50, K=2) and v1 E1 config (sigma=50, K=2, excl=false).
   bool gplane_feat_enable = false;        // turn on Stage B
-  double gplane_feat_sigma_px = 3.0;      // pixel noise (inflated to absorb anchor uncertainty)
-  int gplane_feat_max_features = 5;       // cap features per update
+  double gplane_feat_sigma_px = 50.0;     // E1/R5b default (was 3.0)
+  int gplane_feat_max_features = 2;       // E1/R5b default (was 5)
   double gplane_feat_center_frac = 0.8;   // restrict anchor pixel to central fraction
   double gplane_feat_min_cos_tilt = 0.85; // skip when drone tilted
   double gplane_feat_max_res_px = 5.0;    // reject feature if predicted residual > this
@@ -110,7 +112,7 @@ struct Args {
   double gplane_feat_v1_fd_rel_tol_rot = 1e-3;  // rotation blocks (tha, thc)
   double gplane_feat_v1_fd_rel_tol_pos = 3e-3;  // position blocks (pa, pc)
   double gplane_feat_v1_fd_max_abs_rel_tol = 1e-2; // |max(A-F)|/||A,F||
-  bool gplane_feat_exclude_used_from_msckf = true;
+  bool gplane_feat_exclude_used_from_msckf = false;  // E1 default (was true)
   int gplane_feat_v1_fd_dump = 0;        // dump full matrices for first N features
   double gps_cutoff_time = -1.0;         // [中文] Hold-out 评估: 超过 t_cam > cutoff 后不再 feed GPS, 看 VIO 裸跑
   double gps_feed_every = 1.0;           // [中文] GPS 喂入比例 1.0=全部, 0.2=每 5 个采样用 1 个 (验证降采样)
