@@ -274,10 +274,13 @@ public:
                                 double center_frac = 0.8,
                                 double min_cos_tilt = 0.85,
                                 double max_residual_px = 5.0,
-                                double fd_step_rot = 1e-5,
-                                double fd_step_pos = 1e-5,
-                                double fd_rel_tol = 1e-3,
-                                bool exclude_used_from_msckf = true);
+                                double fd_step_rot = 1e-4,
+                                double fd_step_pos = 1e-2,
+                                double fd_rel_tol_rot = 1e-3,
+                                double fd_rel_tol_pos = 3e-3,
+                                double fd_max_abs_rel_tol = 1e-2,
+                                bool exclude_used_from_msckf = true,
+                                int dump_first_n = 0);
 
   /// Access the v1 updater for diagnostics.
   std::shared_ptr<UpdaterGroundPlaneFeatureV1> get_updater_gplane_feature_v1() { return updaterGPlaneFeatureV1; }

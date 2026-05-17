@@ -668,21 +668,28 @@ void VioManager::enable_gplane_feature_v1(bool dry_run, double sigma_pixel,
                                           int max_features, double center_frac,
                                           double min_cos_tilt, double max_residual_px,
                                           double fd_step_rot, double fd_step_pos,
-                                          double fd_rel_tol,
-                                          bool exclude_used_from_msckf) {
+                                          double fd_rel_tol_rot,
+                                          double fd_rel_tol_pos,
+                                          double fd_max_abs_rel_tol,
+                                          bool exclude_used_from_msckf,
+                                          int dump_first_n) {
   auto mode = dry_run ? UpdaterGroundPlaneFeatureV1::Mode::DRY_RUN
                       : UpdaterGroundPlaneFeatureV1::Mode::UPDATE;
   updaterGPlaneFeatureV1 = std::make_shared<UpdaterGroundPlaneFeatureV1>(
       mode, sigma_pixel, max_features, center_frac, min_cos_tilt,
       max_residual_px, /*min_lambda*/ 0.5, /*max_lambda*/ 100.0,
-      fd_step_rot, fd_step_pos, fd_rel_tol, exclude_used_from_msckf);
+      fd_step_rot, fd_step_pos,
+      fd_rel_tol_rot, fd_rel_tol_pos, fd_max_abs_rel_tol,
+      exclude_used_from_msckf, dump_first_n);
   PRINT_INFO(GREEN "[GPLANE-V1] enabled mode=%s sigma_px=%.2f K=%d center=%.2f "
              "min_cos_tilt=%.2f max_res=%.1fpx fd_step_rot=%.1e fd_step_pos=%.1e "
-             "fd_rel_tol=%.1e exclude_msckf=%d\n" RESET,
+             "rel_tol_rot=%.1e rel_tol_pos=%.1e max_abs_rel_tol=%.1e exclude_msckf=%d dump_first_n=%d\n" RESET,
              dry_run ? "DRY_RUN" : "UPDATE",
              sigma_pixel, max_features, center_frac, min_cos_tilt,
-             max_residual_px, fd_step_rot, fd_step_pos, fd_rel_tol,
-             exclude_used_from_msckf ? 1 : 0);
+             max_residual_px, fd_step_rot, fd_step_pos,
+             fd_rel_tol_rot, fd_rel_tol_pos, fd_max_abs_rel_tol,
+             exclude_used_from_msckf ? 1 : 0,
+             dump_first_n);
 }
 
 void VioManager::print_gps_alt_final_summary() {

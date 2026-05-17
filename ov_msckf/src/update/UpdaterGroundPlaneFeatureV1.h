@@ -22,6 +22,7 @@
 #ifndef OV_MSCKF_UPDATER_GROUNDPLANE_FEATURE_V1_H
 #define OV_MSCKF_UPDATER_GROUNDPLANE_FEATURE_V1_H
 
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <unordered_set>
@@ -103,8 +104,15 @@ public:
     size_t n_accepted_updates = 0;
     size_t n_features_used_total = 0;
     size_t n_fd_checks = 0;
-    size_t n_fd_pass = 0;
-    size_t n_fd_fail = 0;
+    size_t n_fd_pass = 0;     // all-4-blocks pass
+    size_t n_fd_fail = 0;     // any block failed
+    // Per-block tracking (indices: 0=tha, 1=pa, 2=thc, 3=pc):
+    size_t n_pass_block[4] = {0, 0, 0, 0};
+    size_t n_fail_block[4] = {0, 0, 0, 0};
+    double max_rel_err_block[4] = {0, 0, 0, 0};
+    double sum_rel_err_block[4] = {0, 0, 0, 0};
+    double max_abs_err_block[4] = {0, 0, 0, 0};
+    std::vector<double> rel_err_history[4]; // for p95
     double sum_residual_px = 0.0;
     double sum_dxy_norm = 0.0;
     double sum_dz_after = 0.0;
@@ -121,10 +129,13 @@ public:
                               double max_residual_px = 5.0,
                               double min_lambda = 0.5,
                               double max_lambda = 100.0,
-                              double fd_step_rot = 1e-5,
-                              double fd_step_pos = 1e-5,
-                              double fd_rel_tol = 1e-3,
-                              bool   exclude_used_from_msckf = true);
+                              double fd_step_rot = 1e-4,
+                              double fd_step_pos = 1e-2,
+                              double fd_rel_tol_rot = 1e-3,
+                              double fd_rel_tol_pos = 3e-3,
+                              double fd_max_abs_rel_tol = 1e-2,
+                              bool   exclude_used_from_msckf = true,
+                              int    dump_first_n = 0);
 
   /// Attempt one update at the current camera timestamp.  In DRY_RUN mode
   /// runs the FD check and logs results; never touches state/covariance.
@@ -156,12 +167,19 @@ private:
   double max_lambda_;
   double fd_step_rot_;
   double fd_step_pos_;
-  double fd_rel_tol_;
+  double fd_rel_tol_rot_;
+  double fd_rel_tol_pos_;
+  double fd_max_abs_rel_tol_;
   bool exclude_used_from_msckf_;
 
   LastUpdate last_;
   Stats stats_;
   std::unordered_set<size_t> last_used_ids_;
+
+  /// Verbose diagnostic dump: dump the full analytic, numeric, and diff
+  /// 2x12 matrices + intermediates + step-size sweep for the first
+  /// `dump_remaining_` features that pass forward()+analytic+default-FD.
+  int dump_remaining_;
 };
 
 } // namespace ov_msckf

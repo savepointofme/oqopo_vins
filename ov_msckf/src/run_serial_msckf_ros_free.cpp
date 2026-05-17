@@ -105,10 +105,13 @@ struct Args {
   bool gplane_feat_v1_enable = false;     // turn on v1 (mutually exclusive with v0 in practice)
   bool gplane_feat_v1_dry_run = true;     // default: dry-run, no EKF update
   bool gplane_feat_v1_update = false;     // when --gplane-feat-v1-update is passed, overrides dry-run
-  double gplane_feat_v1_fd_step_rot = 1e-5;
-  double gplane_feat_v1_fd_step_pos = 1e-5;
-  double gplane_feat_v1_fd_rel_tol = 1e-3;
+  double gplane_feat_v1_fd_step_rot = 1e-4;     // tuned for camera quantization floor
+  double gplane_feat_v1_fd_step_pos = 1e-2;     // tuned for camera quantization floor
+  double gplane_feat_v1_fd_rel_tol_rot = 1e-3;  // rotation blocks (tha, thc)
+  double gplane_feat_v1_fd_rel_tol_pos = 3e-3;  // position blocks (pa, pc)
+  double gplane_feat_v1_fd_max_abs_rel_tol = 1e-2; // |max(A-F)|/||A,F||
   bool gplane_feat_exclude_used_from_msckf = true;
+  int gplane_feat_v1_fd_dump = 0;        // dump full matrices for first N features
   double gps_cutoff_time = -1.0;         // [中文] Hold-out 评估: 超过 t_cam > cutoff 后不再 feed GPS, 看 VIO 裸跑
   double gps_feed_every = 1.0;           // [中文] GPS 喂入比例 1.0=全部, 0.2=每 5 个采样用 1 个 (验证降采样)
   // [中文] CLI 覆盖 yaml 里的 gps_time_offset; NaN = 不覆盖, 用 yaml/默认值
@@ -149,10 +152,14 @@ void print_help() {
                "  --gplane-feat-max-res-px V  reject feature if predicted residual>V (default 5.0)\n"
                "  --gplane-feat-v1          Stage B v1 (two-clone H, dry-run by default)\n"
                "  --gplane-feat-v1-update   Run v1 in UPDATE mode (refuses features whose FD check fails)\n"
-               "  --gplane-feat-v1-fd-step-rot V  rotation FD step (default 1e-5)\n"
-               "  --gplane-feat-v1-fd-step-pos V  position FD step (default 1e-5)\n"
-               "  --gplane-feat-v1-fd-rel-tol V   FD relative-error pass threshold (default 1e-3)\n"
+               "  --gplane-feat-v1-fd-step-rot V  rotation FD step (default 1e-4)\n"
+               "  --gplane-feat-v1-fd-step-pos V  position FD step (default 1e-2)\n"
+               "  --gplane-feat-v1-fd-rel-tol-rot V   rotation rel_err pass threshold (default 1e-3)\n"
+               "  --gplane-feat-v1-fd-rel-tol-pos V   position rel_err pass threshold (default 3e-3)\n"
+               "  --gplane-feat-v1-fd-max-abs-rel-tol V  max-abs per-entry rel threshold (default 1e-2)\n"
                "  --gplane-feat-exclude-used-from-msckf {0|1}  default 1 in v1 UPDATE\n"
+               "  --gplane-feat-v1-fd-dump N    dump full H_analytic/H_numeric/H_diff matrices\n"
+               "                                + intermediate geometry + step-size sweep for first N features\n"
                "  --gps-cutoff-time T   Stop feeding GPS after t_cam > T (hold-out test)\n"
                "  --gps-feed-every F    Feed 1/F of GPS samples (e.g. 0.2 = 1-in-5, validation set)\n"
                "  --gps-time-offset SEC Override yaml gps_time_offset (sec). Adds to gps timestamps.\n"
@@ -214,8 +221,11 @@ bool parse_args(int argc, char **argv, Args &a) {
     else if (s == "--gplane-feat-v1-update") { a.gplane_feat_v1_enable = true; a.gplane_feat_v1_update = true; }
     else if (s == "--gplane-feat-v1-fd-step-rot") a.gplane_feat_v1_fd_step_rot = std::atof(next("--gplane-feat-v1-fd-step-rot").c_str());
     else if (s == "--gplane-feat-v1-fd-step-pos") a.gplane_feat_v1_fd_step_pos = std::atof(next("--gplane-feat-v1-fd-step-pos").c_str());
-    else if (s == "--gplane-feat-v1-fd-rel-tol") a.gplane_feat_v1_fd_rel_tol = std::atof(next("--gplane-feat-v1-fd-rel-tol").c_str());
+    else if (s == "--gplane-feat-v1-fd-rel-tol-rot") a.gplane_feat_v1_fd_rel_tol_rot = std::atof(next("--gplane-feat-v1-fd-rel-tol-rot").c_str());
+    else if (s == "--gplane-feat-v1-fd-rel-tol-pos") a.gplane_feat_v1_fd_rel_tol_pos = std::atof(next("--gplane-feat-v1-fd-rel-tol-pos").c_str());
+    else if (s == "--gplane-feat-v1-fd-max-abs-rel-tol") a.gplane_feat_v1_fd_max_abs_rel_tol = std::atof(next("--gplane-feat-v1-fd-max-abs-rel-tol").c_str());
     else if (s == "--gplane-feat-exclude-used-from-msckf") a.gplane_feat_exclude_used_from_msckf = (std::atoi(next("--gplane-feat-exclude-used-from-msckf").c_str()) != 0);
+    else if (s == "--gplane-feat-v1-fd-dump") a.gplane_feat_v1_fd_dump = std::atoi(next("--gplane-feat-v1-fd-dump").c_str());
     else if (s == "--gps-cutoff-time") a.gps_cutoff_time = std::atof(next("--gps-cutoff-time").c_str());
     else if (s == "--gps-feed-every") a.gps_feed_every = std::atof(next("--gps-feed-every").c_str());
     else if (s == "--gps-time-offset") a.gps_time_offset_cli = std::atof(next("--gps-time-offset").c_str());
@@ -305,8 +315,11 @@ int main(int argc, char **argv) {
                                   args.gplane_feat_max_res_px,
                                   args.gplane_feat_v1_fd_step_rot,
                                   args.gplane_feat_v1_fd_step_pos,
-                                  args.gplane_feat_v1_fd_rel_tol,
-                                  args.gplane_feat_exclude_used_from_msckf);
+                                  args.gplane_feat_v1_fd_rel_tol_rot,
+                                  args.gplane_feat_v1_fd_rel_tol_pos,
+                                  args.gplane_feat_v1_fd_max_abs_rel_tol,
+                                  args.gplane_feat_exclude_used_from_msckf,
+                                  args.gplane_feat_v1_fd_dump);
   }
   // [中文] 设置创新截断 (如果 CLI 指定, 建议 30m)
   if (args.gps_alt_max_res < 1e8) {

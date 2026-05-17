@@ -53,7 +53,8 @@ UpdaterGroundPlaneFeatureV1::UpdaterGroundPlaneFeatureV1(
     Mode mode, double sigma_pixel, int max_features, double center_frac,
     double min_cos_tilt, double max_residual_px, double min_lambda,
     double max_lambda, double fd_step_rot, double fd_step_pos,
-    double fd_rel_tol, bool exclude_used_from_msckf)
+    double fd_rel_tol_rot, double fd_rel_tol_pos, double fd_max_abs_rel_tol,
+    bool exclude_used_from_msckf, int dump_first_n)
     : mode_(mode),
       sigma_pixel_(sigma_pixel),
       max_features_(max_features),
@@ -64,8 +65,11 @@ UpdaterGroundPlaneFeatureV1::UpdaterGroundPlaneFeatureV1(
       max_lambda_(max_lambda),
       fd_step_rot_(fd_step_rot),
       fd_step_pos_(fd_step_pos),
-      fd_rel_tol_(fd_rel_tol),
-      exclude_used_from_msckf_(exclude_used_from_msckf) {}
+      fd_rel_tol_rot_(fd_rel_tol_rot),
+      fd_rel_tol_pos_(fd_rel_tol_pos),
+      fd_max_abs_rel_tol_(fd_max_abs_rel_tol),
+      exclude_used_from_msckf_(exclude_used_from_msckf),
+      dump_remaining_(dump_first_n) {}
 
 void UpdaterGroundPlaneFeatureV1::reset() {
   last_ = LastUpdate();
@@ -307,9 +311,33 @@ bool fd_jacobian(const Eigen::Matrix3d &R_GtoIa, const Eigen::Vector3d &p_IainG,
   return true;
 }
 
+// Print a 2x12 matrix with column labels matching the v1 Hx_order.
+void print_2x12(const char *label, const Eigen::Matrix<double, 2, 12> &M) {
+  PRINT_INFO(CYAN "[V1-DUMP] %s\n" RESET, label);
+  PRINT_INFO(CYAN "[V1-DUMP]           "
+             "%10s %10s %10s | %10s %10s %10s | %10s %10s %10s | %10s %10s %10s\n" RESET,
+             "tha_x", "tha_y", "tha_z",
+             "pa_x", "pa_y", "pa_z",
+             "thc_x", "thc_y", "thc_z",
+             "pc_x", "pc_y", "pc_z");
+  for (int r = 0; r < 2; r++) {
+    PRINT_INFO(CYAN "[V1-DUMP]  row%d: "
+               "%+10.3e %+10.3e %+10.3e | %+10.3e %+10.3e %+10.3e | "
+               "%+10.3e %+10.3e %+10.3e | %+10.3e %+10.3e %+10.3e\n" RESET,
+               r, M(r,0), M(r,1), M(r,2),
+                  M(r,3), M(r,4), M(r,5),
+                  M(r,6), M(r,7), M(r,8),
+                  M(r,9), M(r,10), M(r,11));
+  }
+}
+
+// b=0 (tha) and b=2 (thc) are rotation blocks; b=1 (pa) and b=3 (pc) are
+// position blocks.  A block passes when BOTH (rel_err < per-block rel_tol)
+// AND (max_abs_err / max(an, fn) < max_abs_rel_tol).
 void compare_jacobian(const Eigen::Matrix<double, 2, 12> &Ha,
                       const Eigen::Matrix<double, 2, 12> &Hf,
-                      double rel_tol,
+                      double rel_tol_rot, double rel_tol_pos,
+                      double max_abs_rel_tol,
                       UpdaterGroundPlaneFeatureV1::FDCheck &out) {
   out.valid = true;
   for (int b = 0; b < 4; b++) {
@@ -319,11 +347,14 @@ void compare_jacobian(const Eigen::Matrix<double, 2, 12> &Ha,
     double maxabs = (A - F).cwiseAbs().maxCoeff();
     double denom = std::max({an, fn, 1e-9});
     double rel = (A - F).norm() / denom;
+    double maxabs_rel = maxabs / denom;
+    bool is_rotation = (b == 0 || b == 2);
+    double rel_tol = is_rotation ? rel_tol_rot : rel_tol_pos;
     out.analytic_norm[b] = an;
     out.numeric_norm[b] = fn;
     out.max_abs_err[b] = maxabs;
     out.rel_err[b] = rel;
-    out.passed[b] = (rel < rel_tol);
+    out.passed[b] = (rel < rel_tol) && (maxabs_rel < max_abs_rel_tol);
   }
   out.passed_all = out.passed[0] && out.passed[1] && out.passed[2] && out.passed[3];
 }
@@ -440,11 +471,24 @@ bool UpdaterGroundPlaneFeatureV1::try_update(
                                max_lambda_, cam, fwd,
                                fd_step_rot_, fd_step_pos_, Hf);
       if (fd_ok) {
-        FDCheck fd; compare_jacobian(Ha, Hf, fd_rel_tol_, fd);
+        FDCheck fd; compare_jacobian(Ha, Hf,
+                                     fd_rel_tol_rot_, fd_rel_tol_pos_,
+                                     fd_max_abs_rel_tol_, fd);
         last_fd = fd;
         stats_.n_fd_checks++;
         if (fd.passed_all) stats_.n_fd_pass++;
         else               stats_.n_fd_fail++;
+        // per-block stats
+        for (int b = 0; b < 4; b++) {
+          if (fd.passed[b]) stats_.n_pass_block[b]++;
+          else              stats_.n_fail_block[b]++;
+          stats_.sum_rel_err_block[b] += fd.rel_err[b];
+          if (fd.rel_err[b] > stats_.max_rel_err_block[b])
+            stats_.max_rel_err_block[b] = fd.rel_err[b];
+          if (fd.max_abs_err[b] > stats_.max_abs_err_block[b])
+            stats_.max_abs_err_block[b] = fd.max_abs_err[b];
+          stats_.rel_err_history[b].push_back(fd.rel_err[b]);
+        }
 
         PRINT_INFO(
             CYAN "[GPLANE-V1-FD] t=%.3f feat=%zu "
@@ -461,6 +505,129 @@ bool UpdaterGroundPlaneFeatureV1::try_update(
             fd.passed[2] ? "PASS" : "FAIL",
             fd.analytic_norm[3], fd.numeric_norm[3], fd.max_abs_err[3], fd.rel_err[3],
             fd.passed[3] ? "PASS" : "FAIL");
+
+        // Verbose dump for the first N features (debug aid).
+        if (dump_remaining_ > 0) {
+          PRINT_INFO(CYAN "[V1-DUMP] ===== feature dump (remaining=%d) =====\n" RESET,
+                     dump_remaining_);
+          PRINT_INFO(CYAN "[V1-DUMP] t=%.6f feat_id=%zu cam_id=%zu\n" RESET,
+                     t_state, feat->featid, cam_id);
+          PRINT_INFO(CYAN "[V1-DUMP] anchor:  t=%.6f  R_GtoIa row0=(%.4f %.4f %.4f) row1=(%.4f %.4f %.4f) row2=(%.4f %.4f %.4f)\n" RESET,
+                     t_anchor,
+                     R_GtoIa(0,0), R_GtoIa(0,1), R_GtoIa(0,2),
+                     R_GtoIa(1,0), R_GtoIa(1,1), R_GtoIa(1,2),
+                     R_GtoIa(2,0), R_GtoIa(2,1), R_GtoIa(2,2));
+          PRINT_INFO(CYAN "[V1-DUMP] anchor:  p_IainG=(%.6f, %.6f, %.6f)\n" RESET,
+                     p_IainG(0), p_IainG(1), p_IainG(2));
+          PRINT_INFO(CYAN "[V1-DUMP] current: t=%.6f  R_GtoIc row0=(%.4f %.4f %.4f) row1=(%.4f %.4f %.4f) row2=(%.4f %.4f %.4f)\n" RESET,
+                     t_state,
+                     R_GtoIc(0,0), R_GtoIc(0,1), R_GtoIc(0,2),
+                     R_GtoIc(1,0), R_GtoIc(1,1), R_GtoIc(1,2),
+                     R_GtoIc(2,0), R_GtoIc(2,1), R_GtoIc(2,2));
+          PRINT_INFO(CYAN "[V1-DUMP] current: p_IcinG=(%.6f, %.6f, %.6f)\n" RESET,
+                     p_IcinG(0), p_IcinG(1), p_IcinG(2));
+          PRINT_INFO(CYAN "[V1-DUMP] calib: R_ItoC row0=(%.4f %.4f %.4f) row1=(%.4f %.4f %.4f) row2=(%.4f %.4f %.4f)  p_IinC=(%.4f, %.4f, %.4f)\n" RESET,
+                     R_ItoC(0,0), R_ItoC(0,1), R_ItoC(0,2),
+                     R_ItoC(1,0), R_ItoC(1,1), R_ItoC(1,2),
+                     R_ItoC(2,0), R_ItoC(2,1), R_ItoC(2,2),
+                     p_IinC(0), p_IinC(1), p_IinC(2));
+          PRINT_INFO(CYAN "[V1-DUMP] z_ground=%.6f\n" RESET, z_ground);
+          PRINT_INFO(CYAN "[V1-DUMP] anchor_pixel=(%.4f, %.4f)  current_pixel=(%.4f, %.4f)\n" RESET,
+                     uv_anchor(0), uv_anchor(1), uv_curr(0), uv_curr(1));
+          PRINT_INFO(CYAN "[V1-DUMP] u_C=(%.6f, %.6f, %.6f)  (undistorted anchor ray in cam frame)\n" RESET,
+                     fwd.u_C(0), fwd.u_C(1), fwd.u_C(2));
+          PRINT_INFO(CYAN "[V1-DUMP] u_G_raw=(%.6f, %.6f, %.6f)  (NOT normalised)\n" RESET,
+                     fwd.u_G_raw(0), fwd.u_G_raw(1), fwd.u_G_raw(2));
+          PRINT_INFO(CYAN "[V1-DUMP] lambda=%.6f  p_FinG=(%.6f, %.6f, %.6f)\n" RESET,
+                     fwd.lambda, fwd.p_FinG(0), fwd.p_FinG(1), fwd.p_FinG(2));
+          PRINT_INFO(CYAN "[V1-DUMP] p_FinIc=(%.6f, %.6f, %.6f)  p_FinCc=(%.6f, %.6f, %.6f)\n" RESET,
+                     fwd.p_FinIc(0), fwd.p_FinIc(1), fwd.p_FinIc(2),
+                     fwd.p_FinCc(0), fwd.p_FinCc(1), fwd.p_FinCc(2));
+          PRINT_INFO(CYAN "[V1-DUMP] uv_n_pred=(%.6f, %.6f)  uv_pred=(%.4f, %.4f)  residual=(%.4f, %.4f)\n" RESET,
+                     fwd.uv_n_pred(0), fwd.uv_n_pred(1),
+                     fwd.uv_pred(0), fwd.uv_pred(1),
+                     res(0), res(1));
+
+          // J_proj = H_dist * H_proj (2x3), the camera-frame -> pixel Jac
+          Eigen::MatrixXd Hd_zn, Hd_zeta;
+          cam->compute_distort_jacobian(fwd.uv_n_pred, Hd_zn, Hd_zeta);
+          Eigen::Matrix<double, 2, 2> H_dist = Hd_zn.block<2, 2>(0, 0);
+          double zc = fwd.p_FinCc.z(), zc2 = zc * zc;
+          Eigen::Matrix<double, 2, 3> H_proj;
+          H_proj << 1.0 / zc, 0.0, -fwd.p_FinCc.x() / zc2,
+                    0.0, 1.0 / zc, -fwd.p_FinCc.y() / zc2;
+          Eigen::Matrix<double, 2, 3> J_proj = H_dist * H_proj;
+          PRINT_INFO(CYAN "[V1-DUMP] H_dist:\n  row0=(%.6f, %.6f)  row1=(%.6f, %.6f)\n" RESET,
+                     H_dist(0,0), H_dist(0,1), H_dist(1,0), H_dist(1,1));
+          PRINT_INFO(CYAN "[V1-DUMP] H_proj (2x3, d(uv_n)/d(p_FinCc)):\n  row0=(%.6f, %.6f, %.6f)  row1=(%.6f, %.6f, %.6f)\n" RESET,
+                     H_proj(0,0), H_proj(0,1), H_proj(0,2),
+                     H_proj(1,0), H_proj(1,1), H_proj(1,2));
+          PRINT_INFO(CYAN "[V1-DUMP] J_proj = H_dist * H_proj (2x3):\n  row0=(%.4f, %.4f, %.4f)  row1=(%.4f, %.4f, %.4f)\n" RESET,
+                     J_proj(0,0), J_proj(0,1), J_proj(0,2),
+                     J_proj(1,0), J_proj(1,1), J_proj(1,2));
+
+          print_2x12("H_analytic (2x12):", Ha);
+          char hdr[160];
+          std::snprintf(hdr, sizeof(hdr),
+                        "H_numeric (h_rot=%.0e, h_pos=%.0e):",
+                        fd_step_rot_, fd_step_pos_);
+          print_2x12(hdr, Hf);
+          Eigen::Matrix<double, 2, 12> Hdiff = Ha - Hf;
+          print_2x12("H_diff = H_analytic - H_numeric:", Hdiff);
+
+          // Rotation step-size sweep
+          PRINT_INFO(CYAN "[V1-DUMP] rotation step-size sweep (h_pos=%.0e fixed):\n" RESET, fd_step_pos_);
+          for (double h : {1e-4, 1e-5, 1e-6}) {
+            Eigen::Matrix<double, 2, 12> Hf_sw;
+            if (fd_jacobian(R_GtoIa, p_IainG, R_GtoIc, p_IcinG, R_ItoC,
+                            p_IinC, uv_a_n, z_ground, min_lambda_,
+                            max_lambda_, cam, fwd,
+                            h, fd_step_pos_, Hf_sw)) {
+              FDCheck fd_sw;
+              compare_jacobian(Ha, Hf_sw,
+                               fd_rel_tol_rot_, fd_rel_tol_pos_,
+                               fd_max_abs_rel_tol_, fd_sw);
+              PRINT_INFO(CYAN "[V1-DUMP]   h_rot=%.0e  blk_tha:[an=%.4g num=%.4g maxabs=%.3g rel=%.3g %s]  "
+                         "blk_thc:[an=%.4g num=%.4g maxabs=%.3g rel=%.3g %s]\n" RESET,
+                         h,
+                         fd_sw.analytic_norm[0], fd_sw.numeric_norm[0],
+                         fd_sw.max_abs_err[0], fd_sw.rel_err[0],
+                         fd_sw.passed[0] ? "PASS" : "FAIL",
+                         fd_sw.analytic_norm[2], fd_sw.numeric_norm[2],
+                         fd_sw.max_abs_err[2], fd_sw.rel_err[2],
+                         fd_sw.passed[2] ? "PASS" : "FAIL");
+            } else {
+              PRINT_INFO(CYAN "[V1-DUMP]   h_rot=%.0e  FD degenerate\n" RESET, h);
+            }
+          }
+          // Position step-size sweep
+          PRINT_INFO(CYAN "[V1-DUMP] position step-size sweep (h_rot=%.0e fixed):\n" RESET, fd_step_rot_);
+          for (double h : {1e-3, 1e-4, 1e-5, 1e-6}) {
+            Eigen::Matrix<double, 2, 12> Hf_sw;
+            if (fd_jacobian(R_GtoIa, p_IainG, R_GtoIc, p_IcinG, R_ItoC,
+                            p_IinC, uv_a_n, z_ground, min_lambda_,
+                            max_lambda_, cam, fwd,
+                            fd_step_rot_, h, Hf_sw)) {
+              FDCheck fd_sw;
+              compare_jacobian(Ha, Hf_sw,
+                               fd_rel_tol_rot_, fd_rel_tol_pos_,
+                               fd_max_abs_rel_tol_, fd_sw);
+              PRINT_INFO(CYAN "[V1-DUMP]   h_pos=%.0e  blk_pa:[an=%.4g num=%.4g maxabs=%.3g rel=%.3g %s]  "
+                         "blk_pc:[an=%.4g num=%.4g maxabs=%.3g rel=%.3g %s]\n" RESET,
+                         h,
+                         fd_sw.analytic_norm[1], fd_sw.numeric_norm[1],
+                         fd_sw.max_abs_err[1], fd_sw.rel_err[1],
+                         fd_sw.passed[1] ? "PASS" : "FAIL",
+                         fd_sw.analytic_norm[3], fd_sw.numeric_norm[3],
+                         fd_sw.max_abs_err[3], fd_sw.rel_err[3],
+                         fd_sw.passed[3] ? "PASS" : "FAIL");
+            } else {
+              PRINT_INFO(CYAN "[V1-DUMP]   h_pos=%.0e  FD degenerate\n" RESET, h);
+            }
+          }
+          PRINT_INFO(CYAN "[V1-DUMP] ===== end of feature dump =====\n" RESET);
+          dump_remaining_--;
+        }
 
         // In UPDATE mode: refuse to use a feature whose FD check failed.
         if (mode_ == Mode::UPDATE && !fd.passed_all) continue;
@@ -545,19 +712,43 @@ bool UpdaterGroundPlaneFeatureV1::try_update(
 void UpdaterGroundPlaneFeatureV1::print_summary() const {
   size_t na = std::max((size_t)1, stats_.n_accepted_updates);
   PRINT_INFO(GREEN "[GPLANE-V1-FINAL] ===== Stage B v1 Summary =====\n" RESET);
-  PRINT_INFO(GREEN "[GPLANE-V1-FINAL] mode=%s\n" RESET,
-             mode_ == Mode::DRY_RUN ? "DRY_RUN" : "UPDATE");
+  PRINT_INFO(GREEN "[GPLANE-V1-FINAL] mode=%s  h_rot=%.0e  h_pos=%.0e  "
+             "rel_tol_rot=%.0e  rel_tol_pos=%.0e  max_abs_rel_tol=%.0e\n" RESET,
+             mode_ == Mode::DRY_RUN ? "DRY_RUN" : "UPDATE",
+             fd_step_rot_, fd_step_pos_,
+             fd_rel_tol_rot_, fd_rel_tol_pos_, fd_max_abs_rel_tol_);
   PRINT_INFO(GREEN "[GPLANE-V1-FINAL] called=%zu acc=%zu skip_tilt=%zu "
              "skip_noclone=%zu skip_nofeat=%zu\n" RESET,
              stats_.n_called, stats_.n_accepted_updates,
              stats_.n_skipped_tilt, stats_.n_skipped_no_clones,
              stats_.n_skipped_no_features);
-  PRINT_INFO(GREEN "[GPLANE-V1-FINAL] fd_checks=%zu fd_pass=%zu fd_fail=%zu  "
+  PRINT_INFO(GREEN "[GPLANE-V1-FINAL] fd_checks=%zu  all4_pass=%zu  any_fail=%zu  "
              "feats/upd=%.2f  |res|_mu=%.2fpx  |dxy|_mu=%.3fm  |dz|_mu=%.3fm\n" RESET,
              stats_.n_fd_checks, stats_.n_fd_pass, stats_.n_fd_fail,
              (double)stats_.n_features_used_total / na,
              stats_.sum_residual_px /
                  std::max((size_t)1, stats_.n_features_used_total),
              stats_.sum_dxy_norm / na, stats_.sum_dz_after / na);
+
+  const char *names[4] = {"tha", "pa ", "thc", "pc "};
+  for (int b = 0; b < 4; b++) {
+    size_t n = stats_.n_pass_block[b] + stats_.n_fail_block[b];
+    if (n == 0) continue;
+    double mean = stats_.sum_rel_err_block[b] / (double)n;
+    // p95 (modify a local copy so the function stays const for clarity)
+    std::vector<double> v = stats_.rel_err_history[b];
+    double p95 = 0.0;
+    if (!v.empty()) {
+      std::sort(v.begin(), v.end());
+      size_t idx = (size_t)((v.size() - 1) * 0.95);
+      p95 = v[idx];
+    }
+    double pass_rate = 100.0 * (double)stats_.n_pass_block[b] / (double)n;
+    PRINT_INFO(GREEN "[GPLANE-V1-FINAL]   blk_%s: pass=%zu/%zu (%.1f%%)  "
+               "rel_err mean=%.3e  p95=%.3e  max=%.3e  maxabs_seen=%.3e\n" RESET,
+               names[b], stats_.n_pass_block[b], n, pass_rate,
+               mean, p95, stats_.max_rel_err_block[b],
+               stats_.max_abs_err_block[b]);
+  }
   PRINT_INFO(GREEN "[GPLANE-V1-FINAL] =================================\n" RESET);
 }
