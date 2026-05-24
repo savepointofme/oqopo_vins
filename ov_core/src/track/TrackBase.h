@@ -61,6 +61,9 @@ struct TrackerWarpVizPacket {
   std::vector<cv::Point2f> prev_pts_for_viz;  // warped prev pts if warp active, else raw prev pts
   std::vector<cv::Point2f> curr_pts_raw;      // final accepted matches in raw current image
   std::vector<size_t> feature_ids;            // matching feature IDs
+  // Diagnostic counters — populated by TrackKLT::feed_monocular
+  int n_klt_attempted = 0;   // total points entering KLT (prev tracks + newly detected on prev frame)
+  int n_newly_detected = 0;  // FAST corners added to prev frame this step
 };
 
 /**

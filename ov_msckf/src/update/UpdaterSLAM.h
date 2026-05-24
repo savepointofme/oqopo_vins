@@ -28,6 +28,7 @@
 #include "feat/FeatureInitializerOptions.h"
 
 #include "UpdaterOptions.h"
+#include "state/StateHelper.h"
 
 namespace ov_core {
 class Feature;
@@ -69,6 +70,12 @@ public:
    */
   void update(std::shared_ptr<State> state, std::vector<std::shared_ptr<ov_core::Feature>> &feature_vec);
 
+  void set_visual_yaw_update_control(StateHelper::VisualYawUpdateMode mode, double scale, double global_alpha) {
+    visual_yaw_update_mode_ = mode;
+    visual_yaw_update_scale_ = scale;
+    visual_global_yaw_oc_alpha_ = global_alpha;
+  }
+
   /**
    * @brief Given max track features, this will try to use them to initialize them in the state.
    * @param state State of the filter
@@ -108,6 +115,10 @@ protected:
 
   /// Chi squared 95th percentile table (lookup would be size of residual)
   std::map<int, double> chi_squared_table;
+
+  StateHelper::VisualYawUpdateMode visual_yaw_update_mode_ = StateHelper::VisualYawUpdateMode::ORIGINAL;
+  double visual_yaw_update_scale_ = 1.0;
+  double visual_global_yaw_oc_alpha_ = 0.0;
 };
 
 } // namespace ov_msckf

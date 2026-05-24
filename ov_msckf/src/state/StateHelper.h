@@ -45,6 +45,13 @@ class State;
 class StateHelper {
 
 public:
+  enum class VisualYawUpdateMode {
+    ORIGINAL = 0,
+    PER_BLOCK_SCALE = 1,
+    GLOBAL_YAW_OC_PROJECTION = 2,
+    CURRENT_ONLY_SCALE = 3
+  };
+
   /**
    * @brief Performs EKF propagation of the state covariance.
    *
@@ -86,7 +93,10 @@ public:
    * @param R Updating measurement covariance
    */
   static void EKFUpdate(std::shared_ptr<State> state, const std::vector<std::shared_ptr<ov_type::Type>> &H_order, const Eigen::MatrixXd &H,
-                        const Eigen::VectorXd &res, const Eigen::MatrixXd &R);
+                        const Eigen::VectorXd &res, const Eigen::MatrixXd &R,
+                        VisualYawUpdateMode visual_yaw_update_mode = VisualYawUpdateMode::ORIGINAL,
+                        double visual_yaw_update_scale = 1.0,
+                        double visual_global_yaw_oc_alpha = 0.0);
 
   /**
    * @brief Consider-Filter (Schmidt-KF) update.
@@ -239,7 +249,10 @@ public:
    */
   static bool initialize(std::shared_ptr<State> state, std::shared_ptr<ov_type::Type> new_variable,
                          const std::vector<std::shared_ptr<ov_type::Type>> &H_order, Eigen::MatrixXd &H_R, Eigen::MatrixXd &H_L,
-                         Eigen::MatrixXd &R, Eigen::VectorXd &res, double chi_2_mult);
+                         Eigen::MatrixXd &R, Eigen::VectorXd &res, double chi_2_mult,
+                         VisualYawUpdateMode visual_yaw_update_mode = VisualYawUpdateMode::ORIGINAL,
+                         double visual_yaw_update_scale = 1.0,
+                         double visual_global_yaw_oc_alpha = 0.0);
 
   /**
    * @brief Initializes new variable into covariance (H_L must be invertible)

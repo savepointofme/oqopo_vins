@@ -1,0 +1,41 @@
+%YAML:1.0
+
+imu0:
+  T_i_b:
+    - [1.0, 0.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0, 0.0]
+    - [0.0, 0.0, 1.0, 0.0]
+    - [0.0, 0.0, 0.0, 1.0]
+  # From Kalibr IMU/camera calibration (d455_config.yaml)
+  # IN-FLIGHT INFLATION: measured HF vibration (200Hz consec-diff) during cruise:
+  #   accel: ~2.24 m/s² per-sample -> noise_density = 2.24/sqrt(200) = 0.158 (was 0.006, 27x)
+  #   gyro:  ~0.049 rad/s per-sample -> noise_density = 0.049/sqrt(200) = 0.0035 (was 0.00058, 6x)
+  # Inflating to cover worst-axis + margin.  random_walk kept as calibrated.
+  accelerometer_noise_density: 0.20
+  accelerometer_random_walk: 0.0006826266703255001
+  gyroscope_noise_density: 0.005
+  gyroscope_random_walk: 1.2120242262934236e-05
+  rostopic: /camera/imu
+  time_offset: 0.0
+  update_rate: 200
+  model: "kalibr"
+  Tw:
+    - [ 1.0, 0.0, 0.0 ]
+    - [ 0.0, 1.0, 0.0 ]
+    - [ 0.0, 0.0, 1.0 ]
+  R_IMUtoGYRO:
+    - [ 1.0, 0.0, 0.0 ]
+    - [ 0.0, 1.0, 0.0 ]
+    - [ 0.0, 0.0, 1.0 ]
+  Ta:
+    - [ 1.0, 0.0, 0.0 ]
+    - [ 0.0, 1.0, 0.0 ]
+    - [ 0.0, 0.0, 1.0 ]
+  R_IMUtoACC:
+    - [ 1.0, 0.0, 0.0 ]
+    - [ 0.0, 1.0, 0.0 ]
+    - [ 0.0, 0.0, 1.0 ]
+  Tg:
+    - [ 0.0, 0.0, 0.0 ]
+    - [ 0.0, 0.0, 0.0 ]
+    - [ 0.0, 0.0, 0.0 ]

@@ -700,6 +700,9 @@ bool UpdaterGroundPlaneFeatureV1::try_update(
   stats_.sum_residual_px += sum_abs_res;
   stats_.sum_dxy_norm += last_.dxy_norm;
   stats_.sum_dz_after += std::fabs(dp.z());
+  if (max_abs_res > stats_.max_residual_px) stats_.max_residual_px = max_abs_res;
+  if (last_.dxy_norm > stats_.max_dxy_norm) stats_.max_dxy_norm = last_.dxy_norm;
+  if (std::fabs(dp.z()) > stats_.max_dz_after) stats_.max_dz_after = std::fabs(dp.z());
 
   PRINT_INFO(CYAN "[GPLANE-V1] t=%.3f cand=%d gate=%d used=%d "
              "|res|_mu=%.2fpx max=%.2fpx |dxy|=%.3fm dz=%+.3fm\n" RESET,
@@ -723,12 +726,15 @@ void UpdaterGroundPlaneFeatureV1::print_summary() const {
              stats_.n_skipped_tilt, stats_.n_skipped_no_clones,
              stats_.n_skipped_no_features);
   PRINT_INFO(GREEN "[GPLANE-V1-FINAL] fd_checks=%zu  all4_pass=%zu  any_fail=%zu  "
-             "feats/upd=%.2f  |res|_mu=%.2fpx  |dxy|_mu=%.3fm  |dz|_mu=%.3fm\n" RESET,
+             "feats/upd=%.2f  |res|_mu=%.2fpx  |res|_max=%.2fpx  "
+             "|dxy|_mu=%.3fm  |dxy|_max=%.3fm  |dz|_mu=%.3fm  |dz|_max=%.3fm\n" RESET,
              stats_.n_fd_checks, stats_.n_fd_pass, stats_.n_fd_fail,
              (double)stats_.n_features_used_total / na,
              stats_.sum_residual_px /
                  std::max((size_t)1, stats_.n_features_used_total),
-             stats_.sum_dxy_norm / na, stats_.sum_dz_after / na);
+             stats_.max_residual_px,
+             stats_.sum_dxy_norm / na, stats_.max_dxy_norm,
+             stats_.sum_dz_after / na, stats_.max_dz_after);
 
   const char *names[4] = {"tha", "pa ", "thc", "pc "};
   for (int b = 0; b < 4; b++) {

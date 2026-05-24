@@ -59,7 +59,9 @@
 #include <mutex>
 #include <string>
 #include <deque>
+#include <functional>
 
+#include "FCInitLoader.h"
 #include "VioManagerOptions.h"
 
 namespace ov_core {
@@ -72,6 +74,9 @@ class FeatureInitializer;
 namespace ov_init {
 class InertialInitializer;
 } // namespace ov_init
+namespace ov_type {
+class PoseJPL;
+} // namespace ov_type
 
 namespace ov_msckf {
 
@@ -155,6 +160,16 @@ public:
    */
   void initialize_with_gt(Eigen::Matrix<double, 17, 1> imustate);
 
+  /// Initialize from a one-shot flight-controller state. This bypasses the
+  /// visual DynamicInitializer and does not enable continuous FC/GPS fusion.
+  void initialize_with_fc_state(const FCInitState &fc,
+                                double sigma_att_rad,
+                                double sigma_vel,
+                                double sigma_pos,
+                                double sigma_bg,
+                                double sigma_ba,
+                                double camera_timestamp);
+
   /**
    * @brief Feed a scalar GPS altitude (world Z) measurement, performs a 1D EKF
    *        update on the IMU position z component.
@@ -207,6 +222,16 @@ public:
   /// Reject if bias correction norm (acc or gyro) exceeds this.
   void set_gps_alt_guard_dbias_max(double v) { gps_alt_guard_dbias_max_ = v; }
 
+  /// Visual yaw update control. A disabled yaw update is implemented inside
+  /// EKFUpdate by scaling Kalman-gain orientation rows, not by restoring yaw.
+  void set_enable_vio_yaw_update(bool v);
+  void set_vio_yaw_update_mode(const std::string &mode);
+  void set_vio_yaw_update_scale(double scale);
+  void set_vio_global_yaw_oc_alpha(double alpha);
+
+  /// Open/replace the per-visual-update yaw diagnostic CSV.
+  void set_vio_yaw_update_diag_path(const std::string &path);
+
   /// Per-call diagnostic snapshot populated by every GPS altitude update.
   struct GpsAltLastUpdate {
     double t = -1.0;
@@ -230,6 +255,37 @@ public:
     std::string decision = "NONE"; ///< APPLY / REJECT_BY_DXY / REJECT_BY_GAIN_RATIO / REJECT_BY_BIAS / ZONLY
   };
   const GpsAltLastUpdate &get_last_gps_alt_update() const { return gps_alt_last_; }
+
+  /// Last-frame MSCKF update statistics (chi2 rejected, accepted, etc.)
+  struct MsckfLastStats {
+    int n_features_in = 0;
+    int n_tri_failed = 0;
+    int n_chi2_rejected = 0;
+    int n_accepted = 0;
+    double chi2_sum_rej = 0.0;
+    double chi2_max_rej = 0.0;
+    double chi2_sum_acc = 0.0;
+    double chi2_max_acc = 0.0;
+    int track_len_sum_acc = 0;
+    int track_len_max_acc = 0;
+    int track_len_sum_rej = 0;
+    int track_len_max_rej = 0;
+    // Triangulation rejection breakdown (flat copy from FeatureInitializer::TriBatchStats)
+    int    tri_cond_bad = 0;
+    int    tri_depth_near = 0;
+    int    tri_depth_far = 0;
+    int    tri_nan = 0;
+    int    tri_gn_depth_near = 0;
+    int    tri_gn_depth_far = 0;
+    int    tri_gn_baseline_ratio = 0;
+    int    tri_gn_nan = 0;
+    int    tri_n_geom = 0;
+    double tri_cond_sum = 0, tri_cond_max = 0;
+    double tri_depth_sum = 0, tri_depth_max = 0;
+    double tri_base_sum  = 0, tri_base_max  = 0;
+    double tri_ratio_sum = 0, tri_ratio_max = 0;
+  };
+  MsckfLastStats get_last_msckf_stats() const;
 
   /// Reset GPS altitude bootstrap state (for all modes). Call between runs.
   void reset_gps_altitude_bootstrap() {
@@ -318,6 +374,9 @@ public:
   /// Returns 3d features used in the last update in global frame
   std::vector<Eigen::Vector3d> get_good_features_MSCKF() { return good_features_MSCKF; }
 
+  /// Number of feature tracks currently stored in the frontend database.
+  int get_feature_database_size();
+
   /// Return the image used when projecting the active tracks
   void get_active_image(double &timestamp, cv::Mat &image) {
     timestamp = active_tracks_time;
@@ -366,6 +425,42 @@ protected:
    *   Step 4. retriangulate_active_tracks + marginalize_old_clone (维持滑窗大小)
    */
   void do_feature_propagate_update(const ov_core::CameraData &message);
+
+  /// Wrap one visual update with yaw before/after logging.
+  void apply_visual_update_with_yaw_diag(const std::string &update_type,
+                                         const std::function<void()> &update_fn,
+                                         int num_features,
+                                         double chi2,
+                                         int accepted);
+
+  /// Current yaw from IMU orientation, in degrees.
+  double current_imu_yaw_deg() const;
+
+  /// Restore yaw in the IMU mean while preserving current roll/pitch.
+  void restore_imu_yaw_deg(double yaw_deg);
+
+  /// Snapshot of all pose yaws that visual updates are allowed to touch.
+  struct PoseYawSnapshot {
+    double imu_yaw_deg = 0.0;
+    std::vector<std::pair<double, double>> clone_yaw_deg;
+  };
+
+  /// Current yaw from a cloned pose orientation, in degrees.
+  double pose_yaw_deg(const std::shared_ptr<ov_type::PoseJPL> &pose) const;
+
+  /// Restore yaw in a cloned pose while preserving current roll/pitch.
+  void restore_pose_yaw_deg(const std::shared_ptr<ov_type::PoseJPL> &pose, double yaw_deg);
+
+  /// Save/restore current IMU + all clone yaws for no-yaw visual A/B runs.
+  PoseYawSnapshot snapshot_vio_pose_yaws() const;
+  void restore_vio_pose_yaws(const PoseYawSnapshot &snapshot);
+
+  /// Write one row to vio_yaw_update_diag_path, if enabled.
+  void log_vio_yaw_update(double timestamp, const std::string &update_type,
+                          double yaw_before_deg, double yaw_after_deg,
+                          double delta_yaw_deg, double bg_z,
+                          int num_features, double chi2, int accepted, int rejected,
+                          int tracking_feature_count);
 
   /**
    * @brief This function will try to initialize the state.
@@ -459,6 +554,8 @@ protected:
 
   // Timing statistic file and variables
   std::ofstream of_statistics;
+  std::ofstream of_vio_yaw_update_diag;
+  double vio_yaw_update_diag_cumsum_deg = 0.0;
   boost::posix_time::ptime rT1, rT2, rT3, rT4, rT5, rT6, rT7;
 
   // Track how much distance we have traveled

@@ -161,6 +161,7 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
   auto pts_left_old = pts_last[cam_id];
   auto ids_left_old = ids_last[cam_id];
   perform_detection_monocular(img_pyramid_last[cam_id], img_mask_last[cam_id], pts_left_old, ids_left_old);
+  int n_newly_detected_this = (int)pts_left_old.size() - pts_before_detect;
   rT3 = boost::posix_time::microsec_clock::local_time();
 
   // Our return success masks, and predicted new features
@@ -285,6 +286,8 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
     for (const auto &kp : good_left)
       pkt.curr_pts_raw.push_back(kp.pt);
     pkt.feature_ids = good_ids_left;
+    pkt.n_klt_attempted = (int)pts_left_old.size();
+    pkt.n_newly_detected = n_newly_detected_this;
     std::lock_guard<std::mutex> lk(mtx_warp_viz_packets_);
     warp_viz_packets_[cam_id] = std::move(pkt);
   }

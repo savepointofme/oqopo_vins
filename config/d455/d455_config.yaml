@@ -1,0 +1,104 @@
+# d455_config.yaml
+#
+# D455 RGB camera + IMU calibration/config for the Python OpenVINS learning code.
+# 所有旋转/平移矩阵都保留 Kalibr 报告的原始含义，避免后面坐标系搞混。
+#
+# Kalibr time shift convention:
+#   t_imu = t_cam + time_shift_cam_to_imu
+
+schema_version: 0.1
+name: d455_rgb_imu_640x480_30hz
+
+# -----------------------------------------------------------------------------
+# ROS topics
+# -----------------------------------------------------------------------------
+topics:
+  imu: /camera/imu
+  cam0: /camera/color/image_raw
+
+# -----------------------------------------------------------------------------
+# Camera intrinsics from camera-only/Kalibr report
+# model: pinhole + radtan, intrinsics order: [fx, fy, cx, cy]
+# distortion order for radtan/Kalibr: [k1, k2, p1, p2]
+# -----------------------------------------------------------------------------
+camera:
+  cam0:
+    rostopic: /camera/color/image_raw
+    camera_model: pinhole
+    distortion_model: radtan
+    intrinsics: [367.4567959235411, 367.1397460471364, 328.6368136147717, 233.58213701688157]
+    distortion_coeffs: [-0.059513850515088895, 0.034926517536683285, -0.0027539606930595275, 7.51756448944016e-05]
+    resolution: [640, 480]
+
+# -----------------------------------------------------------------------------
+# IMU noise from Kalibr IMU/camera calibration config section.
+# These are continuous-time densities/random walks.
+# -----------------------------------------------------------------------------
+imu:
+  rostopic: /camera/imu
+  model: calibrated
+  # Project note:
+  # This handmade-VIO D455 calibration is treated as a 200 Hz IMU setup.
+  # Keep live capture and dataset recording at accel200 + gyro200 unless this
+  # camera-IMU calibration is regenerated. The OpenVINS rs_d455 sample configs
+  # in this repo use update_rate=400 with different intrinsics/extrinsics and
+  # should not be mixed with this d455_config.yaml.
+  update_rate: 200.0
+  T_i_b:
+    - [1.0, 0.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0, 0.0]
+    - [0.0, 0.0, 1.0, 0.0]
+    - [0.0, 0.0, 0.0, 1.0]
+  noise:
+    gyro_noise_density: 0.00057967997          # rad/s/sqrt(Hz)
+    accel_noise_density: 0.00596415652         # m/s^2/sqrt(Hz)
+    gyro_random_walk: 1.2120242262934236e-05   # rad/s^2/sqrt(Hz)
+    accel_random_walk: 0.0006826266703255001   # m/s^3/sqrt(Hz)
+
+# -----------------------------------------------------------------------------
+# Camera-IMU extrinsics from Kalibr report.
+# T_cam_imu / T_ci: p_cam = R_cam_imu * p_imu + t_cam_imu
+# T_imu_cam / T_ic: p_imu = R_imu_cam * p_cam + t_imu_cam
+# -----------------------------------------------------------------------------
+extrinsics:
+  cam0:
+    convention: "T_cam_imu transforms point coordinates from imu0 frame to cam0 frame: p_cam = R_cam_imu @ p_imu + t_cam_imu"
+    T_cam_imu:
+      - [0.99995797, -0.00282896,  0.00872137, -0.02561949]
+      - [-0.00277724, -0.99997852, -0.00593747,  0.03162669]
+      - [0.00873798,  0.00591300, -0.99994434, -0.02768631]
+      - [0.0,         0.0,         0.0,          1.0]
+    inverse_convention: "T_imu_cam transforms point coordinates from cam0 frame to imu0 frame: p_imu = R_imu_cam @ p_cam + t_imu_cam"
+    T_imu_cam:
+      - [0.99995797, -0.00277724,  0.00873798,  0.02594817]
+      - [-0.00282896, -0.99997852,  0.00591300,  0.03171724]
+      - [0.00872137, -0.00593747, -0.99994434, -0.02727355]
+      - [0.0,         0.0,         0.0,          1.0]
+    time_shift_cam_to_imu: 0.00036100228856970673
+    timestamp_relation: "t_imu = t_cam + time_shift_cam_to_imu"
+
+# -----------------------------------------------------------------------------
+# Static initialization. 这里仍然只使用 IMU，不使用相机外参。
+# -----------------------------------------------------------------------------
+initialization:
+  gravity_mag: 9.81
+  init_window_time: 1.0
+  init_imu_thresh: 0.5
+  wait_for_jerk: false
+  initial_covariance_std:
+    dtheta: 0.02
+    dp: 0.05
+    dv: 0.01
+    dbg: 0.02
+    dba: 0.02
+
+# -----------------------------------------------------------------------------
+# Propagation / visualization defaults
+# -----------------------------------------------------------------------------
+propagation:
+  max_dt: 0.05
+  buffer_seconds: 60.0
+  plot_seconds: 30.0
+
+visualization:
+  nominal_state_text_update_period: 1.0

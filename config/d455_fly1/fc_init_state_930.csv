@@ -1,0 +1,4 @@
+# FC-assisted VIO initialization, no continuous GPS/FC fusion
+# FC time parsed as UTC; FC yaw sign -1.0; body_to_imu frd_to_xright_yfwd_zup
+# t_s,qx,qy,qz,qw,vx,vy,vz,px,py,pz,bgx,bgy,bgz,bax,bay,baz
+930.000000,-0.0207702700,0.0214619399,0.8591193185,0.5109031000,-35.691894,-16.874542,1.054701,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0

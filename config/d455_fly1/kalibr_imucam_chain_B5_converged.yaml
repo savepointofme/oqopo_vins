@@ -1,0 +1,20 @@
+%YAML:1.0
+
+# B5 seed: intrinsics, extrinsics, and timeshift taken from B0 (all-calib-free run)
+# converged values at t~1700s of fly1.  Rotation matrix kept from original kalibr report.
+# Use with estimator_config_B5_converged_locked.yaml (all calib flags false).
+cam0:
+  # T_cam_imu from Kalibr report (rotation), translation updated to B0-converged p
+  T_cam_imu:
+    - [0.99995797, -0.00282896,  0.00872137, -0.044000]
+    - [-0.00277724, -0.99997852, -0.00593747,  0.050000]
+    - [0.00873798,  0.00591300, -0.99994434, -0.027000]
+    - [0.0,         0.0,         0.0,          1.0]
+  cam_overlaps: []
+  camera_model: pinhole
+  distortion_coeffs: [-0.037000, 0.031000, -0.0027539606930595275, 7.51756448944016e-05]
+  distortion_model: radtan
+  intrinsics: [379.081, 378.034, 328.483, 238.478]
+  resolution: [640, 480]
+  rostopic: /camera/color/image_raw
+  timeshift_cam_imu: -0.00333

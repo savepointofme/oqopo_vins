@@ -27,12 +27,164 @@
 #include "utils/colors.h"
 #include "utils/print.h"
 
+#include <algorithm>
 #include <boost/math/distributions/chi_squared.hpp>
 #include <set>
 
 using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
+
+namespace {
+
+Eigen::Matrix3d yaw_projection_matrix(const Eigen::Matrix3d &R_GtoI, double scale) {
+  scale = std::max(0.0, std::min(1.0, scale));
+  Eigen::Vector3d g_local = R_GtoI * Eigen::Vector3d::UnitZ();
+  const double n = g_local.norm();
+  if (n < 1e-12)
+    return Eigen::Matrix3d::Identity();
+  g_local /= n;
+  return Eigen::Matrix3d::Identity() - (1.0 - scale) * (g_local * g_local.transpose());
+}
+
+void apply_yaw_projection_to_orientation_columns(Eigen::MatrixXd &H_eff, int col, int var_size,
+                                                 const Eigen::Matrix3d &R_GtoI, double scale) {
+  if (col < 0 || col + 3 > H_eff.cols() || var_size < 3)
+    return;
+  const Eigen::Matrix3d Cq = yaw_projection_matrix(R_GtoI, scale);
+  H_eff.block(0, col, H_eff.rows(), 3) =
+      (H_eff.block(0, col, H_eff.rows(), 3) * Cq).eval();
+}
+
+Eigen::MatrixXd project_per_block_yaw_from_H(std::shared_ptr<State> state,
+                                             const std::vector<std::shared_ptr<Type>> &H_order,
+                                             const std::vector<int> &H_id, const Eigen::MatrixXd &H,
+                                             double scale, bool current_only) {
+  scale = std::max(0.0, std::min(1.0, scale));
+  if (scale >= 1.0 - 1e-12)
+    return H;
+
+  Eigen::MatrixXd H_eff = H;
+  for (size_t i = 0; i < H_order.size(); i++) {
+    const auto &var = H_order[i];
+    const int col = H_id[i];
+
+    if (var == state->_imu || var == state->_imu->pose() || var == state->_imu->q()) {
+      apply_yaw_projection_to_orientation_columns(H_eff, col, var->size(), state->_imu->Rot(), scale);
+      continue;
+    }
+
+    if (current_only)
+      continue;
+
+    for (const auto &clone : state->_clones_IMU) {
+      const auto &pose = clone.second;
+      if (var == pose || var == pose->q()) {
+        apply_yaw_projection_to_orientation_columns(H_eff, col, var->size(), pose->Rot(), scale);
+        break;
+      }
+    }
+  }
+  return H_eff;
+}
+
+Eigen::Vector3d yaw_position_dir(const Eigen::Vector3d &p) {
+  return Eigen::Vector3d::UnitZ().cross(p);
+}
+
+void fill_pose_yaw_gauge(Eigen::VectorXd &n, int col, int size, const Eigen::Matrix3d &R_GtoI,
+                         const Eigen::Vector3d &p_IinG, bool has_velocity, const Eigen::Vector3d &v_IinG) {
+  if (col < 0 || col + size > n.rows())
+    return;
+  if (size >= 3) {
+    n.block(col, 0, 3, 1) = R_GtoI * Eigen::Vector3d::UnitZ();
+  }
+  if (size >= 6) {
+    n.block(col + 3, 0, 3, 1) = yaw_position_dir(p_IinG);
+  }
+  if (has_velocity && size >= 9) {
+    n.block(col + 6, 0, 3, 1) = yaw_position_dir(v_IinG);
+  }
+}
+
+void fill_landmark_yaw_gauge(Eigen::VectorXd &n, int col, const std::shared_ptr<Landmark> &lm) {
+  if (lm == nullptr || col < 0 || col + lm->size() > n.rows())
+    return;
+  if (LandmarkRepresentation::is_relative_representation(lm->_feat_representation))
+    return;
+  if (lm->_feat_representation != LandmarkRepresentation::GLOBAL_3D || lm->size() != 3)
+    return;
+  n.block(col, 0, 3, 1) = yaw_position_dir(lm->get_xyz(false));
+}
+
+Eigen::VectorXd build_global_yaw_gauge_small(std::shared_ptr<State> state, const std::vector<std::shared_ptr<Type>> &H_order,
+                                             const std::vector<int> &H_id, int H_cols) {
+  Eigen::VectorXd n = Eigen::VectorXd::Zero(H_cols);
+  for (size_t i = 0; i < H_order.size(); i++) {
+    const auto &var = H_order[i];
+    const int col = H_id[i];
+
+    if (var == state->_imu) {
+      fill_pose_yaw_gauge(n, col, var->size(), state->_imu->Rot(), state->_imu->pos(), true, state->_imu->vel());
+      continue;
+    }
+    if (var == state->_imu->q()) {
+      fill_pose_yaw_gauge(n, col, var->size(), state->_imu->Rot(), state->_imu->pos(), false, Eigen::Vector3d::Zero());
+      continue;
+    }
+    if (var == state->_imu->p()) {
+      n.block(col, 0, 3, 1) = yaw_position_dir(state->_imu->pos());
+      continue;
+    }
+    if (var == state->_imu->v()) {
+      n.block(col, 0, 3, 1) = yaw_position_dir(state->_imu->vel());
+      continue;
+    }
+    if (var == state->_imu->bg() || var == state->_imu->ba()) {
+      continue;
+    }
+
+    bool matched_clone = false;
+    for (const auto &clone : state->_clones_IMU) {
+      const auto &pose = clone.second;
+      if (var == pose) {
+        fill_pose_yaw_gauge(n, col, var->size(), pose->Rot(), pose->pos(), false, Eigen::Vector3d::Zero());
+        matched_clone = true;
+        break;
+      }
+      if (var == pose->q()) {
+        fill_pose_yaw_gauge(n, col, var->size(), pose->Rot(), pose->pos(), false, Eigen::Vector3d::Zero());
+        matched_clone = true;
+        break;
+      }
+      if (var == pose->p()) {
+        n.block(col, 0, 3, 1) = yaw_position_dir(pose->pos());
+        matched_clone = true;
+        break;
+      }
+    }
+    if (matched_clone)
+      continue;
+
+    fill_landmark_yaw_gauge(n, col, std::dynamic_pointer_cast<Landmark>(var));
+  }
+  return n;
+}
+
+Eigen::MatrixXd project_global_yaw_from_H(std::shared_ptr<State> state, const std::vector<std::shared_ptr<Type>> &H_order,
+                                          const std::vector<int> &H_id, const Eigen::MatrixXd &H, double alpha) {
+  alpha = std::max(0.0, std::min(1.0, alpha));
+  if (alpha <= 1e-12)
+    return H;
+  Eigen::VectorXd n = build_global_yaw_gauge_small(state, H_order, H_id, H.cols());
+  const double n2 = n.squaredNorm();
+  if (n2 < 1e-12)
+    return H;
+  Eigen::VectorXd Hn = H * n;
+  return H - (alpha / n2) * Hn * n.transpose();
+}
+
+} // namespace
 
 void StateHelper::EKFPropagation(std::shared_ptr<State> state, const std::vector<std::shared_ptr<Type>> &order_NEW,
                                  const std::vector<std::shared_ptr<Type>> &order_OLD, const Eigen::MatrixXd &Phi,
@@ -115,7 +267,8 @@ void StateHelper::EKFPropagation(std::shared_ptr<State> state, const std::vector
 }
 
 void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std::shared_ptr<Type>> &H_order, const Eigen::MatrixXd &H,
-                            const Eigen::VectorXd &res, const Eigen::MatrixXd &R) {
+                            const Eigen::VectorXd &res, const Eigen::MatrixXd &R, VisualYawUpdateMode visual_yaw_update_mode,
+                            double visual_yaw_update_scale, double visual_global_yaw_oc_alpha) {
 
   //==========================================================
   //==========================================================
@@ -131,6 +284,14 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
     H_id.push_back(current_it);
     current_it += meas_var->size();
   }
+  Eigen::MatrixXd H_eff = H;
+  if (visual_yaw_update_mode == VisualYawUpdateMode::GLOBAL_YAW_OC_PROJECTION) {
+    H_eff = project_global_yaw_from_H(state, H_order, H_id, H, visual_global_yaw_oc_alpha);
+  } else if (visual_yaw_update_mode == VisualYawUpdateMode::PER_BLOCK_SCALE ||
+             visual_yaw_update_mode == VisualYawUpdateMode::CURRENT_ONLY_SCALE) {
+    H_eff = project_per_block_yaw_from_H(state, H_order, H_id, H, visual_yaw_update_scale,
+                                         visual_yaw_update_mode == VisualYawUpdateMode::CURRENT_ONLY_SCALE);
+  }
 
   //==========================================================
   //==========================================================
@@ -141,7 +302,7 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
     for (size_t i = 0; i < H_order.size(); i++) {
       std::shared_ptr<Type> meas_var = H_order[i];
       M_i.noalias() += state->_Cov.block(var->id(), meas_var->id(), var->size(), meas_var->size()) *
-                       H.block(0, H_id[i], H.rows(), meas_var->size()).transpose();
+                       H_eff.block(0, H_id[i], H_eff.rows(), meas_var->size()).transpose();
     }
     M_a.block(var->id(), 0, var->size(), res.rows()) = M_i;
   }
@@ -153,7 +314,7 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
 
   // Residual covariance S = H*Cov*H' + R
   Eigen::MatrixXd S(R.rows(), R.rows());
-  S.triangularView<Eigen::Upper>() = H * P_small * H.transpose();
+  S.triangularView<Eigen::Upper>() = H_eff * P_small * H_eff.transpose();
   S.triangularView<Eigen::Upper>() += R;
   // Eigen::MatrixXd S = H * P_small * H.transpose() + R;
 
@@ -508,7 +669,9 @@ std::shared_ptr<Type> StateHelper::clone(std::shared_ptr<State> state, std::shar
 
 bool StateHelper::initialize(std::shared_ptr<State> state, std::shared_ptr<Type> new_variable,
                              const std::vector<std::shared_ptr<Type>> &H_order, Eigen::MatrixXd &H_R, Eigen::MatrixXd &H_L,
-                             Eigen::MatrixXd &R, Eigen::VectorXd &res, double chi_2_mult) {
+                             Eigen::MatrixXd &R, Eigen::VectorXd &res, double chi_2_mult,
+                             VisualYawUpdateMode visual_yaw_update_mode, double visual_yaw_update_scale,
+                             double visual_global_yaw_oc_alpha) {
 
   // Check that this new variable is not already initialized
   if (std::find(state->_variables.begin(), state->_variables.end(), new_variable) != state->_variables.end()) {
@@ -592,7 +755,8 @@ bool StateHelper::initialize(std::shared_ptr<State> state, std::shared_ptr<Type>
 
   // Update with updating portion
   if (Hup.rows() > 0) {
-    StateHelper::EKFUpdate(state, H_order, Hup, resup, Rup);
+    StateHelper::EKFUpdate(state, H_order, Hup, resup, Rup, visual_yaw_update_mode,
+                           visual_yaw_update_scale, visual_global_yaw_oc_alpha);
   }
   return true;
 }

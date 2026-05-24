@@ -92,18 +92,26 @@ public:
       if (line.empty() || line[0] == '#')
         continue;
       std::stringstream ss(line);
-      std::array<double, 7> v{};
-      std::string tok;
-      int idx = 0;
-      while (std::getline(ss, tok, ',') && idx < 7) {
-        v[idx++] = std::atof(tok.c_str());
+      // Parse all columns; detect D455 format by column count (>=11 cols)
+      std::vector<double> cols;
+      {
+        std::string tok;
+        while (std::getline(ss, tok, ','))
+          cols.push_back(std::atof(tok.c_str()));
       }
-      if (idx < 7)
-        continue;
       ImuSample s;
-      s.timestamp = 1e-9 * v[0];
-      s.gyro << v[1], v[2], v[3];
-      s.accel << v[4], v[5], v[6];
+      bool d455_imu = (cols.size() >= 11);
+      if (d455_imu) {
+        s.timestamp = 1e-9 * cols[2];          // t_ns
+        s.gyro << cols[5], cols[6], cols[7];   // wx,wy,wz
+        s.accel << cols[8], cols[9], cols[10]; // ax,ay,az
+      } else if (cols.size() >= 7) {
+        s.timestamp = 1e-9 * cols[0];
+        s.gyro << cols[1], cols[2], cols[3];
+        s.accel << cols[4], cols[5], cols[6];
+      } else {
+        continue;
+      }
       out.push_back(s);
     }
     std::sort(out.begin(), out.end(),
@@ -131,17 +139,31 @@ public:
       if (line.empty() || line[0] == '#')
         continue;
       std::stringstream ss(line);
-      std::string ts_str, fname;
-      std::getline(ss, ts_str, ',');
-      std::getline(ss, fname, ',');
-      // trim trailing \r / whitespace
-      while (!fname.empty() && (fname.back() == '\r' || fname.back() == ' ' || fname.back() == '\t'))
-        fname.pop_back();
-      if (ts_str.empty() || fname.empty())
-        continue;
+      // Parse all columns; detect D455 format by column count (>=5 cols)
+      std::vector<std::string> cols;
+      {
+        std::string tok;
+        while (std::getline(ss, tok, ','))
+          cols.push_back(tok);
+      }
+      // Trim trailing \r / whitespace from all columns
+      for (auto &c : cols) {
+        while (!c.empty() && (c.back() == '\r' || c.back() == ' ' || c.back() == '\t'))
+          c.pop_back();
+      }
       CamEntry e;
-      e.timestamp = 1e-9 * std::atof(ts_str.c_str());
-      e.image_path = (data_dir / fname).string();
+      bool d455_cam = (cols.size() >= 5);
+      if (d455_cam) {
+        if (cols.size() < 5 || cols[2].empty() || cols[4].empty())
+          continue;
+        e.timestamp = 1e-9 * std::atof(cols[2].c_str()); // t_ns
+        e.image_path = (data_dir / cols[4]).string();     // filename
+      } else {
+        if (cols.size() < 2 || cols[0].empty() || cols[1].empty())
+          continue;
+        e.timestamp = 1e-9 * std::atof(cols[0].c_str());
+        e.image_path = (data_dir / cols[1]).string();
+      }
       out.push_back(e);
     }
     std::sort(out.begin(), out.end(),

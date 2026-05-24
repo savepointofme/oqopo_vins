@@ -32,6 +32,7 @@
 #include "types/LandmarkRepresentation.h"
 #include "utils/opencv_lambda_body.h"
 #include "utils/print.h"
+#include "utils/quat_ops.h"
 #include "utils/sensor_data.h"
 
 #include "init/InertialInitializer.h"
@@ -46,9 +47,56 @@
 #include "update/UpdaterGroundPlaneFeatureV1.h"
 #include "update/UpdaterZeroVelocity.h"
 
+#include <algorithm>
+
 using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
+
+namespace {
+
+double wrap_degrees(double angle_deg) {
+  while (angle_deg > 180.0)
+    angle_deg -= 360.0;
+  while (angle_deg < -180.0)
+    angle_deg += 360.0;
+  return angle_deg;
+}
+
+Eigen::Vector3d rot_to_rpy(const Eigen::Matrix3d &R) {
+  double pitch = std::asin(std::max(-1.0, std::min(1.0, -R(2, 0))));
+  double roll = 0.0;
+  double yaw = 0.0;
+  if (std::fabs(std::cos(pitch)) > 1e-6) {
+    roll = std::atan2(R(2, 1), R(2, 2));
+    yaw = std::atan2(R(1, 0), R(0, 0));
+  } else {
+    yaw = std::atan2(-R(0, 1), R(1, 1));
+  }
+  return {roll, pitch, yaw};
+}
+
+Eigen::Matrix3d rpy_to_rot(double roll, double pitch, double yaw) {
+  Eigen::AngleAxisd Rz(yaw, Eigen::Vector3d::UnitZ());
+  Eigen::AngleAxisd Ry(pitch, Eigen::Vector3d::UnitY());
+  Eigen::AngleAxisd Rx(roll, Eigen::Vector3d::UnitX());
+  return (Rz * Ry * Rx).toRotationMatrix();
+}
+
+StateHelper::VisualYawUpdateMode visual_yaw_mode_from_string(const std::string &mode) {
+  if (mode == "none" || mode == "original")
+    return StateHelper::VisualYawUpdateMode::ORIGINAL;
+  if (mode == "per_block_scale")
+    return StateHelper::VisualYawUpdateMode::PER_BLOCK_SCALE;
+  if (mode == "global_yaw_oc_projection" || mode == "global_yaw_schmidt")
+    return StateHelper::VisualYawUpdateMode::GLOBAL_YAW_OC_PROJECTION;
+  if (mode == "current_only_scale")
+    return StateHelper::VisualYawUpdateMode::CURRENT_ONLY_SCALE;
+  PRINT_WARNING(YELLOW "[VIO-YAW] unknown vio_yaw_update_mode=%s, using original\n" RESET, mode.c_str());
+  return StateHelper::VisualYawUpdateMode::ORIGINAL;
+}
+
+} // namespace
 
 // =============================================================================
 // [中文] 构造函数
@@ -135,6 +183,10 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
     of_statistics << "re-tri & marg,total" << std::endl;
   }
 
+  if (!params.vio_yaw_update_diag_path.empty()) {
+    set_vio_yaw_update_diag_path(params.vio_yaw_update_diag_path);
+  }
+
   //===================================================================================
   //===================================================================================
   //===================================================================================
@@ -170,6 +222,12 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   // Make the updater!
   updaterMSCKF = std::make_shared<UpdaterMSCKF>(params.msckf_options, params.featinit_options);
   updaterSLAM = std::make_shared<UpdaterSLAM>(params.slam_options, params.aruco_options, params.featinit_options);
+  updaterMSCKF->set_visual_yaw_update_control(visual_yaw_mode_from_string(params.vio_yaw_update_mode),
+                                              params.vio_yaw_update_scale,
+                                              params.vio_global_yaw_oc_alpha);
+  updaterSLAM->set_visual_yaw_update_control(visual_yaw_mode_from_string(params.vio_yaw_update_mode),
+                                             params.vio_yaw_update_scale,
+                                             params.vio_global_yaw_oc_alpha);
 
   // If we are using zero velocity updates, then create the updater
   if (params.try_zupt) {
@@ -690,6 +748,201 @@ void VioManager::enable_gplane_feature_v1(bool dry_run, double sigma_pixel,
              fd_rel_tol_rot, fd_rel_tol_pos, fd_max_abs_rel_tol,
              exclude_used_from_msckf ? 1 : 0,
              dump_first_n);
+}
+
+VioManager::MsckfLastStats VioManager::get_last_msckf_stats() const {
+  const auto &s = updaterMSCKF->get_last_stats();
+  MsckfLastStats out;
+  out.n_features_in     = s.n_features_in;
+  out.n_tri_failed      = s.n_tri_failed;
+  out.n_chi2_rejected   = s.n_chi2_rejected;
+  out.n_accepted        = s.n_accepted;
+  out.chi2_sum_rej      = s.chi2_sum_rej;
+  out.chi2_max_rej      = s.chi2_max_rej;
+  out.chi2_sum_acc      = s.chi2_sum_acc;
+  out.chi2_max_acc      = s.chi2_max_acc;
+  out.track_len_sum_acc = s.track_len_sum_acc;
+  out.track_len_max_acc = s.track_len_max_acc;
+  out.track_len_sum_rej = s.track_len_sum_rej;
+  out.track_len_max_rej = s.track_len_max_rej;
+  const auto &t        = s.tri;
+  out.tri_cond_bad          = t.n_cond_bad;
+  out.tri_depth_near        = t.n_depth_near;
+  out.tri_depth_far         = t.n_depth_far;
+  out.tri_nan               = t.n_nan;
+  out.tri_gn_depth_near     = t.n_gn_depth_near;
+  out.tri_gn_depth_far      = t.n_gn_depth_far;
+  out.tri_gn_baseline_ratio = t.n_gn_baseline_ratio;
+  out.tri_gn_nan            = t.n_gn_nan;
+  out.tri_n_geom            = t.n_geom;
+  out.tri_cond_sum          = t.cond_sum;  out.tri_cond_max  = t.cond_max;
+  out.tri_depth_sum         = t.depth_sum; out.tri_depth_max = t.depth_max;
+  out.tri_base_sum          = t.base_sum;  out.tri_base_max  = t.base_max;
+  out.tri_ratio_sum         = t.ratio_sum; out.tri_ratio_max = t.ratio_max;
+  return out;
+}
+
+void VioManager::set_enable_vio_yaw_update(bool v) {
+  params.enable_vio_yaw_update = v;
+  if (!v)
+    params.vio_yaw_update_mode = "per_block_scale";
+  set_vio_yaw_update_scale(v ? params.vio_yaw_update_scale : 0.0);
+}
+
+void VioManager::set_vio_yaw_update_mode(const std::string &mode) {
+  params.vio_yaw_update_mode = mode;
+  const auto m = visual_yaw_mode_from_string(params.vio_yaw_update_mode);
+  if (updaterMSCKF)
+    updaterMSCKF->set_visual_yaw_update_control(m, params.vio_yaw_update_scale,
+                                                params.vio_global_yaw_oc_alpha);
+  if (updaterSLAM)
+    updaterSLAM->set_visual_yaw_update_control(m, params.vio_yaw_update_scale,
+                                               params.vio_global_yaw_oc_alpha);
+}
+
+void VioManager::set_vio_yaw_update_scale(double scale) {
+  params.vio_yaw_update_scale = std::max(0.0, std::min(1.0, scale));
+  params.enable_vio_yaw_update = (params.vio_yaw_update_mode == "original" || params.vio_yaw_update_scale > 0.0 ||
+                                  params.vio_global_yaw_oc_alpha > 0.0);
+  const auto m = visual_yaw_mode_from_string(params.vio_yaw_update_mode);
+  if (updaterMSCKF)
+    updaterMSCKF->set_visual_yaw_update_control(m, params.vio_yaw_update_scale,
+                                                params.vio_global_yaw_oc_alpha);
+  if (updaterSLAM)
+    updaterSLAM->set_visual_yaw_update_control(m, params.vio_yaw_update_scale,
+                                               params.vio_global_yaw_oc_alpha);
+}
+
+void VioManager::set_vio_global_yaw_oc_alpha(double alpha) {
+  params.vio_global_yaw_oc_alpha = std::max(0.0, std::min(1.0, alpha));
+  const auto m = visual_yaw_mode_from_string(params.vio_yaw_update_mode);
+  if (updaterMSCKF)
+    updaterMSCKF->set_visual_yaw_update_control(m, params.vio_yaw_update_scale,
+                                                params.vio_global_yaw_oc_alpha);
+  if (updaterSLAM)
+    updaterSLAM->set_visual_yaw_update_control(m, params.vio_yaw_update_scale,
+                                               params.vio_global_yaw_oc_alpha);
+}
+
+void VioManager::set_vio_yaw_update_diag_path(const std::string &path) {
+  if (of_vio_yaw_update_diag.is_open())
+    of_vio_yaw_update_diag.close();
+  params.vio_yaw_update_diag_path = path;
+  if (path.empty())
+    return;
+
+  boost::filesystem::path p(path);
+  if (!p.parent_path().empty())
+    boost::filesystem::create_directories(p.parent_path());
+  of_vio_yaw_update_diag.open(path, std::ofstream::out | std::ofstream::trunc);
+  if (!of_vio_yaw_update_diag.is_open()) {
+    PRINT_WARNING(YELLOW "[VIO-YAW-DIAG] failed to open %s\n" RESET, path.c_str());
+    return;
+  }
+  of_vio_yaw_update_diag
+      << "timestamp,update_type,yaw_before_deg,yaw_after_deg,delta_yaw_update_deg,"
+      << "cumsum_delta_yaw_update_deg,vio_yaw_update_mode,vio_yaw_update_scale,"
+      << "vio_global_yaw_oc_alpha,bg_z,num_features,chi2,"
+      << "accepted,rejected,tracking_feature_count\n";
+  of_vio_yaw_update_diag.flush();
+  vio_yaw_update_diag_cumsum_deg = 0.0;
+  PRINT_INFO(GREEN "[VIO-YAW-DIAG] writing %s (mode=%s scale=%.3f alpha=%.3f)\n" RESET,
+             path.c_str(), params.vio_yaw_update_mode.c_str(), params.vio_yaw_update_scale,
+             params.vio_global_yaw_oc_alpha);
+}
+
+double VioManager::current_imu_yaw_deg() const {
+  Eigen::Matrix3d R_ItoG = state->_imu->Rot().transpose();
+  return rot_to_rpy(R_ItoG)(2) * 180.0 / M_PI;
+}
+
+double VioManager::pose_yaw_deg(const std::shared_ptr<ov_type::PoseJPL> &pose) const {
+  Eigen::Matrix3d R_ItoG = pose->Rot().transpose();
+  return rot_to_rpy(R_ItoG)(2) * 180.0 / M_PI;
+}
+
+void VioManager::restore_imu_yaw_deg(double yaw_deg) {
+  Eigen::Matrix3d R_ItoG = state->_imu->Rot().transpose();
+  Eigen::Vector3d rpy = rot_to_rpy(R_ItoG);
+  Eigen::Matrix3d R_ItoG_new = rpy_to_rot(rpy(0), rpy(1), yaw_deg * M_PI / 180.0);
+  Eigen::Matrix<double, 16, 1> new_imu = state->_imu->value();
+  new_imu.block(0, 0, 4, 1) = ov_core::rot_2_quat(R_ItoG_new.transpose());
+  state->_imu->set_value(new_imu);
+}
+
+void VioManager::restore_pose_yaw_deg(const std::shared_ptr<ov_type::PoseJPL> &pose, double yaw_deg) {
+  Eigen::Matrix3d R_ItoG = pose->Rot().transpose();
+  Eigen::Vector3d rpy = rot_to_rpy(R_ItoG);
+  Eigen::Matrix3d R_ItoG_new = rpy_to_rot(rpy(0), rpy(1), yaw_deg * M_PI / 180.0);
+  Eigen::Matrix<double, 7, 1> new_pose = pose->value();
+  new_pose.block(0, 0, 4, 1) = ov_core::rot_2_quat(R_ItoG_new.transpose());
+  pose->set_value(new_pose);
+}
+
+VioManager::PoseYawSnapshot VioManager::snapshot_vio_pose_yaws() const {
+  PoseYawSnapshot out;
+  out.imu_yaw_deg = current_imu_yaw_deg();
+  out.clone_yaw_deg.reserve(state->_clones_IMU.size());
+  for (const auto &clone : state->_clones_IMU) {
+    out.clone_yaw_deg.emplace_back(clone.first, pose_yaw_deg(clone.second));
+  }
+  return out;
+}
+
+void VioManager::restore_vio_pose_yaws(const PoseYawSnapshot &snapshot) {
+  restore_imu_yaw_deg(snapshot.imu_yaw_deg);
+  for (const auto &item : snapshot.clone_yaw_deg) {
+    auto it = state->_clones_IMU.find(item.first);
+    if (it != state->_clones_IMU.end()) {
+      restore_pose_yaw_deg(it->second, item.second);
+    }
+  }
+}
+
+void VioManager::log_vio_yaw_update(double timestamp, const std::string &update_type,
+                                    double yaw_before_deg, double yaw_after_deg,
+                                    double delta_yaw_deg, double bg_z,
+                                    int num_features, double chi2, int accepted, int rejected,
+                                    int tracking_feature_count) {
+  if (!of_vio_yaw_update_diag.is_open())
+    return;
+  vio_yaw_update_diag_cumsum_deg += delta_yaw_deg;
+  of_vio_yaw_update_diag << std::fixed << std::setprecision(9)
+                         << timestamp << "," << update_type << ","
+                         << std::setprecision(6)
+                         << yaw_before_deg << "," << yaw_after_deg << ","
+                         << delta_yaw_deg << "," << vio_yaw_update_diag_cumsum_deg << ","
+                         << params.vio_yaw_update_mode << "," << params.vio_yaw_update_scale << ","
+                         << params.vio_global_yaw_oc_alpha << "," << bg_z << ","
+                         << num_features << "," << chi2 << ","
+                         << accepted << "," << rejected << "," << tracking_feature_count << "\n";
+}
+
+void VioManager::apply_visual_update_with_yaw_diag(const std::string &update_type,
+                                                   const std::function<void()> &update_fn,
+                                                   int num_features,
+                                                   double chi2,
+                                                   int accepted) {
+  const double yaw_before = current_imu_yaw_deg();
+  update_fn();
+
+  if (accepted < 0) {
+    if (update_type == "MSCKF") {
+      const auto &s = updaterMSCKF->get_last_stats();
+      accepted = s.n_accepted;
+      chi2 = (s.n_accepted > 0) ? (s.chi2_sum_acc / s.n_accepted) : -1.0;
+    } else {
+      accepted = num_features;
+    }
+  }
+
+  const double yaw_after = current_imu_yaw_deg();
+  const double delta_yaw = wrap_degrees(yaw_after - yaw_before);
+  const int tracking_count = trackFEATS ? get_feature_database_size() : -1;
+  const int rejected = (accepted >= 0 && num_features >= accepted) ? (num_features - accepted) : -1;
+  log_vio_yaw_update(state->_timestamp, update_type, yaw_before, yaw_after, delta_yaw,
+                     state->_imu->bias_g()(2), num_features, chi2, accepted, rejected,
+                     tracking_count);
 }
 
 void VioManager::print_gps_alt_final_summary() {
@@ -1296,11 +1549,35 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   if (updaterGPlaneFeatureV1 != nullptr && updaterGPlaneRange != nullptr &&
       updaterGPlaneRange->bootstrapped()) {
     double z_g = updaterGPlaneRange->z_ground();
-    updaterGPlaneFeatureV1->try_update(state, trackFEATS->get_feature_database(),
-                                       message.timestamp, z_g);
+    bool v1_fired = updaterGPlaneFeatureV1->try_update(
+        state, trackFEATS->get_feature_database(), message.timestamp, z_g);
+    if (v1_fired && updaterGPlaneFeatureV1->exclude_used_from_msckf()) {
+      const auto &used = updaterGPlaneFeatureV1->last_used_feat_ids();
+      if (!used.empty()) {
+        int n_in = (int)featsup_MSCKF.size();
+        featsup_MSCKF.erase(
+            std::remove_if(
+                featsup_MSCKF.begin(), featsup_MSCKF.end(),
+                [&used](const std::shared_ptr<ov_core::Feature> &f) {
+                  return used.count(f->featid) > 0;
+                }),
+            featsup_MSCKF.end());
+        int n_out = (int)featsup_MSCKF.size();
+        if (n_in != n_out) {
+          PRINT_DEBUG("[GPLANE-V1] dropped %d/%d MSCKF features (already used in v1 update)\n",
+                      n_in - n_out, n_in);
+        }
+      }
+    }
   }
 
-  updaterMSCKF->update(state, featsup_MSCKF);
+  const int n_msckf_features = (int)featsup_MSCKF.size();
+  apply_visual_update_with_yaw_diag(
+      "MSCKF",
+      [&]() {
+        updaterMSCKF->update(state, featsup_MSCKF);
+      },
+      n_msckf_features, -1.0, -1);
   propagator->invalidate_cache();
   rT4 = boost::posix_time::microsec_clock::local_time();
 
@@ -1316,13 +1593,32 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     feats_slam_UPDATE.erase(feats_slam_UPDATE.begin(),
                             feats_slam_UPDATE.begin() + std::min(state->_options.max_slam_in_update, (int)feats_slam_UPDATE.size()));
     // Do the update
+    const int n_slam_features = (int)featsup_TEMP.size();
+    const double yaw_before_slam = current_imu_yaw_deg();
     updaterSLAM->update(state, featsup_TEMP);
+    const int n_slam_accepted = (int)featsup_TEMP.size();
+    const double yaw_after_slam = current_imu_yaw_deg();
+    const int n_slam_rejected = std::max(0, n_slam_features - n_slam_accepted);
+    log_vio_yaw_update(state->_timestamp, "SLAM", yaw_before_slam, yaw_after_slam,
+                       wrap_degrees(yaw_after_slam - yaw_before_slam),
+                       state->_imu->bias_g()(2), n_slam_features, -1.0,
+                       n_slam_accepted, n_slam_rejected, get_feature_database_size());
     feats_slam_UPDATE_TEMP.insert(feats_slam_UPDATE_TEMP.end(), featsup_TEMP.begin(), featsup_TEMP.end());
     propagator->invalidate_cache();
   }
   feats_slam_UPDATE = feats_slam_UPDATE_TEMP;
   rT5 = boost::posix_time::microsec_clock::local_time();
+  const int n_slam_delayed_features = (int)feats_slam_DELAYED.size();
+  const double yaw_before_slam_delay = current_imu_yaw_deg();
   updaterSLAM->delayed_init(state, feats_slam_DELAYED);
+  const int n_slam_delayed_accepted = (int)feats_slam_DELAYED.size();
+  const double yaw_after_slam_delay = current_imu_yaw_deg();
+  const int n_slam_delayed_rejected = std::max(0, n_slam_delayed_features - n_slam_delayed_accepted);
+  log_vio_yaw_update(state->_timestamp, "SLAM_DELAYED", yaw_before_slam_delay,
+                     yaw_after_slam_delay,
+                     wrap_degrees(yaw_after_slam_delay - yaw_before_slam_delay),
+                     state->_imu->bias_g()(2), n_slam_delayed_features, -1.0,
+                     n_slam_delayed_accepted, n_slam_delayed_rejected, get_feature_database_size());
   rT6 = boost::posix_time::microsec_clock::local_time();
 
   //===================================================================================

@@ -112,10 +112,14 @@ bool FeatureInitializer::single_triangulation(std::shared_ptr<Feature> feat,
 
   // If we have a bad condition number, or it is too close
   // Then set the flag for bad (i.e. set z-axis to nan)
-  if (std::abs(condA) > _options.max_cond_number || p_f(2, 0) < _options.min_dist || p_f(2, 0) > _options.max_dist ||
-      std::isnan(p_f.norm())) {
-    return false;
-  }
+  if (std::isnan(p_f.norm())) { tri_stats_.n_nan++;         return false; }
+  if (std::abs(condA) > _options.max_cond_number)           { tri_stats_.n_cond_bad++;   return false; }
+  if (p_f(2, 0) < _options.min_dist)                        { tri_stats_.n_depth_near++; return false; }
+  if (p_f(2, 0) > _options.max_dist)                        { tri_stats_.n_depth_far++;  return false; }
+
+  // Accumulate condA for features that pass the DLT gate
+  tri_stats_.cond_sum += std::abs(condA);
+  tri_stats_.cond_max  = std::max(tri_stats_.cond_max, std::abs(condA));
 
   // Store it in our feature object
   feat->p_FinA = p_f;
@@ -373,13 +377,18 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
   // PRINT_DEBUG(ss.str().c_str());
 
   // Check if this feature is bad or not
-  // 1. If the feature is too close
-  // 2. If the feature is invalid
-  // 3. If the baseline ratio is large
-  if (feat->p_FinA(2) < _options.min_dist || feat->p_FinA(2) > _options.max_dist ||
-      (feat->p_FinA.norm() / base_line_max) > _options.max_baseline || std::isnan(feat->p_FinA.norm())) {
-    return false;
-  }
+  if (std::isnan(feat->p_FinA.norm()))                           { tri_stats_.n_gn_nan++;            return false; }
+  if (feat->p_FinA(2) < _options.min_dist)                       { tri_stats_.n_gn_depth_near++;     return false; }
+  if (feat->p_FinA(2) > _options.max_dist)                       { tri_stats_.n_gn_depth_far++;      return false; }
+  if ((feat->p_FinA.norm() / base_line_max) > _options.max_baseline) { tri_stats_.n_gn_baseline_ratio++; return false; }
+
+  // Accumulate geometry stats for accepted features
+  double depth = feat->p_FinA(2);
+  double ratio = feat->p_FinA.norm() / base_line_max;
+  tri_stats_.n_geom++;
+  tri_stats_.depth_sum += depth;       tri_stats_.depth_max = std::max(tri_stats_.depth_max, depth);
+  tri_stats_.base_sum  += base_line_max; tri_stats_.base_max  = std::max(tri_stats_.base_max,  base_line_max);
+  tri_stats_.ratio_sum += ratio;       tri_stats_.ratio_max = std::max(tri_stats_.ratio_max, ratio);
 
   // Finally get position in global frame
   feat->p_FinG = R_GtoA.transpose() * feat->p_FinA + p_AinG;

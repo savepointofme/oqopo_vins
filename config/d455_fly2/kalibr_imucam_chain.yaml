@@ -1,0 +1,17 @@
+%YAML:1.0
+
+cam0:
+  # T_cam_imu from Kalibr report: p_cam = R_cam_imu * p_imu + t_cam_imu
+  T_cam_imu:
+    - [0.99995797, -0.00282896,  0.00872137, -0.02561949]
+    - [-0.00277724, -0.99997852, -0.00593747,  0.03162669]
+    - [0.00873798,  0.00591300, -0.99994434, -0.02768631]
+    - [0.0,         0.0,         0.0,          1.0]
+  cam_overlaps: []
+  camera_model: pinhole
+  distortion_coeffs: [-0.059513850515088895, 0.034926517536683285, -0.0027539606930595275, 7.51756448944016e-05]
+  distortion_model: radtan
+  intrinsics: [367.4567959235411, 367.1397460471364, 328.6368136147717, 233.58213701688157]
+  resolution: [640, 480]
+  rostopic: /camera/color/image_raw
+  timeshift_cam_imu: 0.00036100228856970673

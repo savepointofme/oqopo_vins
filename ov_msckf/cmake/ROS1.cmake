@@ -150,6 +150,8 @@ install(TARGETS run_simulation
 add_executable(run_serial_msckf_ros_free
         src/run_serial_msckf_ros_free.cpp
         src/ros_free/VizDashboard.cpp
+        src/ros_free/DiagPrinter.cpp
+        src/ros_free/DiagLogger.cpp
 )
 target_link_libraries(run_serial_msckf_ros_free ov_msckf_lib ${thirdparty_libraries})
 install(TARGETS run_serial_msckf_ros_free

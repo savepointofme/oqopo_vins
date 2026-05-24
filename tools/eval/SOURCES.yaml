@@ -1,0 +1,20 @@
+# SOURCES.yaml — canonical truth/GPS sources for eval
+# Generated: 2026-05-19 11:42:42 by tools/workspace_migrate.py
+#
+# WARNING: stereo_pseudo_ref files are DEBUG ONLY — NOT ground truth.
+# NEVER use them as official Z reference.
+#
+# File types:
+#   gps_raw                  — raw ArduPilot GPS (WGS84: Lat,Lng,Alt,TimeUS in microseconds)
+#   gps_aligned_cam_time     — GPS aligned to camera time (ENU XYZ)
+#   gps_aligned_imu_time     — GPS aligned to IMU time (ENU XYZ)
+#   stereo_pseudo_ref        — stereo VIO output (DEBUG ONLY, not truth)
+#
+files:
+  evaluate_by_li.py:
+    original_path: "lilili\evaluate_vio_gps.py"
+    type: "unknown"
+    note: "Copy from lilili\evaluate_vio_gps.py → evaluate_by_li.py"
+    size_bytes: 16135
+    rows: 418
+    sha256: "4b8a57d7abac3a7d7a4ad24a36eae99b5a26b89f32085c73d0b7317b416ab66e"

@@ -1,0 +1,23 @@
+%YAML:1.0
+
+# B8 seed: intrinsics from B0-converged values, extrinsics/timeshift from original kalibr report.
+# Used with estimator_config_B8_converged_intrinsics_locked.yaml
+# (calib_cam_intrinsics: false, calib_cam_extrinsics: true, calib_cam_timeoffset: true)
+# Rationale: kalibr intrinsics (fx=367.45) were ~11px off from B0-converged (fx=379.08).
+# Seeding with converged intrinsics eliminates that initial bias while still allowing
+# extrinsics and timeoffset to refine online.
+
+cam0:
+  T_cam_imu:
+    - [0.99995797, -0.00282896,  0.00872137, -0.02561949]
+    - [-0.00277724, -0.99997852, -0.00593747,  0.03162669]
+    - [0.00873798,  0.00591300, -0.99994434, -0.02768631]
+    - [0.0,         0.0,         0.0,          1.0]
+  cam_overlaps: []
+  camera_model: pinhole
+  distortion_coeffs: [-0.037000, 0.031000, -0.0027539606930595275, 7.51756448944016e-05]
+  distortion_model: radtan
+  intrinsics: [379.081, 378.034, 328.483, 238.478]
+  resolution: [640, 480]
+  rostopic: /camera/color/image_raw
+  timeshift_cam_imu: 0.00036100228856970673

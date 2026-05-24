@@ -75,6 +75,77 @@ void VioManager::initialize_with_gt(Eigen::Matrix<double, 17, 1> imustate) {
   PRINT_DEBUG(GREEN "[INIT]: position = %.4f, %.4f, %.4f\n" RESET, state->_imu->pos()(0), state->_imu->pos()(1), state->_imu->pos()(2));
 }
 
+void VioManager::initialize_with_fc_state(const FCInitState &fc,
+                                          double sigma_att_rad,
+                                          double sigma_vel,
+                                          double sigma_pos,
+                                          double sigma_bg,
+                                          double sigma_ba,
+                                          double camera_timestamp) {
+
+  if (is_initialized_vio) {
+    PRINT_WARNING(YELLOW "[FC-INIT]: requested but VIO is already initialized; ignoring\n" RESET);
+    return;
+  }
+
+  Eigen::Matrix<double, 16, 1> imu_state;
+  imu_state.setZero();
+  imu_state.block(0, 0, 4, 1) = fc.q_GtoI;
+  imu_state.block(4, 0, 3, 1) = fc.p_IinG;
+  imu_state.block(7, 0, 3, 1) = fc.v_IinG;
+  imu_state.block(10, 0, 3, 1) = fc.bg;
+  imu_state.block(13, 0, 3, 1) = fc.ba;
+  state->_imu->set_value(imu_state);
+  state->_imu->set_fej(imu_state);
+
+  std::vector<std::shared_ptr<ov_type::Type>> order = {state->_imu};
+  Eigen::MatrixXd Cov = Eigen::MatrixXd::Zero(state->_imu->size(), state->_imu->size());
+  Cov.block(0, 0, 3, 3) = std::pow(sigma_att_rad, 2) * Eigen::Matrix3d::Identity();
+  Cov.block(3, 3, 3, 3) = std::pow(sigma_pos, 2) * Eigen::Matrix3d::Identity();
+  Cov.block(6, 6, 3, 3) = std::pow(sigma_vel, 2) * Eigen::Matrix3d::Identity();
+  Cov.block(9, 9, 3, 3) = std::pow(sigma_bg, 2) * Eigen::Matrix3d::Identity();
+  Cov.block(12, 12, 3, 3) = std::pow(sigma_ba, 2) * Eigen::Matrix3d::Identity();
+  StateHelper::set_initial_covariance(state, Cov, order);
+
+  // The ros-free runner trims IMU samples before --start-time. The first
+  // camera after trimming is usually a few tens of ms after the requested
+  // start time, while the FC state row is exactly at --start-time. The runner
+  // uses this first camera only to seed the EKF and then feeds the next camera
+  // normally, so the first propagated interval has real IMU coverage.
+  double init_timestamp = camera_timestamp;
+  state->_timestamp = init_timestamp;
+  startup_time = init_timestamp;
+  is_initialized_vio = true;
+  thread_init_success = true;
+  thread_init_running = false;
+  has_moved_since_zupt = (state->_imu->vel().norm() > params.zupt_max_velocity);
+
+  trackFEATS->get_feature_database()->cleanup_measurements(state->_timestamp);
+  trackFEATS->set_num_features(std::floor((double)params.num_pts / (double)params.state_options.num_cameras));
+  if (trackARUCO != nullptr) {
+    trackARUCO->get_feature_database()->cleanup_measurements(state->_timestamp);
+  }
+  camera_queue_init.clear();
+  propagator->invalidate_cache();
+
+  PRINT_INFO(GREEN "[FC-INIT]: FC-assisted VIO initialization, no continuous GPS/FC fusion\n" RESET);
+  PRINT_INFO(GREEN "[FC-INIT]: DynamicInitializer bypassed: yes\n" RESET);
+  PRINT_INFO(GREEN "[FC-INIT]: EKF init timestamp %.6f, FC state timestamp %.6f, camera timestamp %.6f, dt_fc_to_camera %.6f\n" RESET,
+             init_timestamp, fc.timestamp, camera_timestamp, fc.timestamp - camera_timestamp);
+  PRINT_INFO(GREEN "[FC-INIT]: q_GtoI = %.6f, %.6f, %.6f, %.6f\n" RESET,
+             state->_imu->quat()(0), state->_imu->quat()(1), state->_imu->quat()(2), state->_imu->quat()(3));
+  PRINT_INFO(GREEN "[FC-INIT]: p_IinG = %.3f, %.3f, %.3f\n" RESET,
+             state->_imu->pos()(0), state->_imu->pos()(1), state->_imu->pos()(2));
+  PRINT_INFO(GREEN "[FC-INIT]: v_IinG = %.3f, %.3f, %.3f | speed = %.3f m/s\n" RESET,
+             state->_imu->vel()(0), state->_imu->vel()(1), state->_imu->vel()(2), state->_imu->vel().norm());
+  PRINT_INFO(GREEN "[FC-INIT]: bg = %.5f, %.5f, %.5f | ba = %.5f, %.5f, %.5f\n" RESET,
+             state->_imu->bias_g()(0), state->_imu->bias_g()(1), state->_imu->bias_g()(2),
+             state->_imu->bias_a()(0), state->_imu->bias_a()(1), state->_imu->bias_a()(2));
+  PRINT_INFO(GREEN "[FC-INIT]: P diag attitude=%.6g velocity=%.6g position=%.6g bg=%.6g ba=%.6g\n" RESET,
+             std::pow(sigma_att_rad, 2), std::pow(sigma_vel, 2), std::pow(sigma_pos, 2),
+             std::pow(sigma_bg, 2), std::pow(sigma_ba, 2));
+}
+
 // =============================================================================
 // [中文] try_to_initialize
 //  初始化全过程:
@@ -449,6 +520,12 @@ std::vector<Eigen::Vector3d> VioManager::get_features_SLAM() {
     }
   }
   return slam_feats;
+}
+
+int VioManager::get_feature_database_size() {
+  if (trackFEATS == nullptr || trackFEATS->get_feature_database() == nullptr)
+    return 0;
+  return (int)trackFEATS->get_feature_database()->size();
 }
 
 std::vector<Eigen::Vector3d> VioManager::get_features_ARUCO() {

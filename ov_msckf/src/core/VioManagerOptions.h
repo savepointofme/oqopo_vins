@@ -23,6 +23,7 @@
 #define OV_MSCKF_VIOMANAGEROPTIONS_H
 
 #include <Eigen/Eigen>
+#include <algorithm>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -116,6 +117,23 @@ struct VioManagerOptions {
   /// The path to the file we will record the timing information into
   std::string record_timing_filepath = "ov_msckf_timing.txt";
 
+  /// If false, set visual yaw update scale to zero for VIO visual updates.
+  bool enable_vio_yaw_update = true;
+
+  /// Visual yaw update control mode:
+  /// original, per_block_scale, global_yaw_oc_projection, current_only_scale.
+  std::string vio_yaw_update_mode = "original";
+
+  /// Scale for the gravity-axis component of visual orientation updates.
+  /// 1.0 is the original EKF update; 0.0 removes visual yaw correction.
+  double vio_yaw_update_scale = 1.0;
+
+  /// Alpha for global-yaw OC H projection. 0.0 original, 1.0 full suppression.
+  double vio_global_yaw_oc_alpha = 0.0;
+
+  /// If non-empty, write per-visual-update yaw deltas to this CSV file.
+  std::string vio_yaw_update_diag_path = "";
+
   /**
    * @brief This function will load print out all estimator settings loaded.
    * This allows for visual checking that everything was loaded properly from ROS/CMD parsers.
@@ -137,7 +155,21 @@ struct VioManagerOptions {
       parser->parse_config("gps_time_offset", gps_time_offset, false);
       parser->parse_config("record_timing_information", record_timing_information);
       parser->parse_config("record_timing_filepath", record_timing_filepath);
+      parser->parse_config("enable_vio_yaw_update", enable_vio_yaw_update, false);
+      parser->parse_config("vio_yaw_update_mode", vio_yaw_update_mode, false);
+      parser->parse_config("vio_yaw_update_scale", vio_yaw_update_scale, false);
+      parser->parse_config("vio_global_yaw_oc_alpha", vio_global_yaw_oc_alpha, false);
+      parser->parse_config("vio_global_yaw_schmidt_alpha", vio_global_yaw_oc_alpha, false);
+      parser->parse_config("vio_yaw_update_diag_path", vio_yaw_update_diag_path, false);
     }
+    if (!enable_vio_yaw_update) {
+      vio_yaw_update_mode = "per_block_scale";
+      vio_yaw_update_scale = 0.0;
+    } else if (vio_yaw_update_mode == "original" && std::fabs(vio_yaw_update_scale - 1.0) > 1e-12) {
+      vio_yaw_update_mode = "per_block_scale";
+    }
+    vio_yaw_update_scale = std::max(0.0, std::min(1.0, vio_yaw_update_scale));
+    vio_global_yaw_oc_alpha = std::max(0.0, std::min(1.0, vio_global_yaw_oc_alpha));
     PRINT_DEBUG("  - dt_slam_delay: %.1f\n", dt_slam_delay);
     PRINT_DEBUG("  - zero_velocity_update: %d\n", try_zupt);
     PRINT_DEBUG("  - zupt_max_velocity: %.2f\n", zupt_max_velocity);
@@ -148,6 +180,11 @@ struct VioManagerOptions {
     PRINT_DEBUG("  - gps_time_offset: %+.3f s (0=disabled)\n", gps_time_offset);
     PRINT_DEBUG("  - record timing?: %d\n", (int)record_timing_information);
     PRINT_DEBUG("  - record timing filepath: %s\n", record_timing_filepath.c_str());
+    PRINT_DEBUG("  - enable VIO yaw update?: %d\n", (int)enable_vio_yaw_update);
+    PRINT_DEBUG("  - VIO yaw update mode: %s\n", vio_yaw_update_mode.c_str());
+    PRINT_DEBUG("  - VIO yaw update scale: %.3f\n", vio_yaw_update_scale);
+    PRINT_DEBUG("  - VIO global yaw OC alpha: %.3f\n", vio_global_yaw_oc_alpha);
+    PRINT_DEBUG("  - VIO yaw update diag path: %s\n", vio_yaw_update_diag_path.c_str());
   }
 
   // NOISE / CHI2 ============================

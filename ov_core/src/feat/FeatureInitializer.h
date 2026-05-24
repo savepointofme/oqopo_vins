@@ -81,6 +81,29 @@ public:
     const Eigen::Matrix<double, 3, 1> &pos() { return _pos; }
   };
 
+  /// Per-batch triangulation rejection breakdown (reset by caller before each MSCKF batch).
+  struct TriBatchStats {
+    // DLT stage (single_triangulation) rejection reasons
+    int n_cond_bad = 0;      // condA > max_cond_number (near-parallel rays)
+    int n_depth_near = 0;    // depth < min_dist
+    int n_depth_far = 0;     // depth > max_dist
+    int n_nan = 0;           // NaN in DLT solution
+    // GN stage (single_gaussnewton) rejection reasons
+    int n_gn_depth_near = 0;    // depth < min_dist after GN
+    int n_gn_depth_far = 0;     // depth > max_dist after GN
+    int n_gn_baseline_ratio = 0; // p.norm()/base_line_max > max_baseline
+    int n_gn_nan = 0;           // NaN after GN
+    // Geometry samples from features that passed both stages (condA from DLT, rest from GN)
+    int    n_geom = 0;
+    double cond_sum = 0, cond_max = 0;   // condition number (DLT matrix A)
+    double depth_sum = 0, depth_max = 0; // p_FinA.z
+    double base_sum = 0,  base_max = 0;  // base_line_max (m)
+    double ratio_sum = 0, ratio_max = 0; // p.norm() / base_line_max
+  };
+
+  void reset_tri_stats() { tri_stats_ = TriBatchStats{}; }
+  const TriBatchStats &get_tri_stats() const { return tri_stats_; }
+
   /**
    * @brief Default constructor
    * @param options Options for the initializer
@@ -130,6 +153,9 @@ public:
 protected:
   /// Contains options for the initializer process
   FeatureInitializerOptions _options;
+
+  /// Accumulated per-batch triangulation diagnostics (reset by reset_tri_stats())
+  TriBatchStats tri_stats_;
 
   /**
    * @brief Helper function for the gauss newton method that computes error of the given estimate

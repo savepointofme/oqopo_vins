@@ -45,9 +45,11 @@
 #include <Eigen/Eigen>
 #include <memory>
 
+#include "feat/FeatureInitializer.h"
 #include "feat/FeatureInitializerOptions.h"
 
 #include "UpdaterOptions.h"
+#include "state/StateHelper.h"
 
 namespace ov_core {
 class Feature;
@@ -94,6 +96,32 @@ public:
    */
   void update(std::shared_ptr<State> state, std::vector<std::shared_ptr<ov_core::Feature>> &feature_vec);
 
+  void set_visual_yaw_update_control(StateHelper::VisualYawUpdateMode mode, double scale, double global_alpha) {
+    visual_yaw_update_mode_ = mode;
+    visual_yaw_update_scale_ = scale;
+    visual_global_yaw_oc_alpha_ = global_alpha;
+  }
+
+  struct LastStats {
+    int n_features_in = 0;
+    int n_tri_failed = 0;
+    int n_chi2_rejected = 0;
+    int n_accepted = 0;
+    // Per-feature chi2 statistics (the chi2 statistic, not pixel residual)
+    double chi2_sum_rej = 0.0;
+    double chi2_max_rej = 0.0;
+    double chi2_sum_acc = 0.0;
+    double chi2_max_acc = 0.0;
+    // Feature track length statistics
+    int track_len_sum_acc = 0;
+    int track_len_max_acc = 0;
+    int track_len_sum_rej = 0;
+    int track_len_max_rej = 0;
+    // Triangulation rejection breakdown (from FeatureInitializer)
+    ov_core::FeatureInitializer::TriBatchStats tri;
+  };
+  const LastStats &get_last_stats() const { return last_stats_; }
+
 protected:
   /// Options used during update
   UpdaterOptions _options;
@@ -103,6 +131,12 @@ protected:
 
   /// Chi squared 95th percentile table (lookup would be size of residual)
   std::map<int, double> chi_squared_table;
+
+  LastStats last_stats_;
+
+  StateHelper::VisualYawUpdateMode visual_yaw_update_mode_ = StateHelper::VisualYawUpdateMode::ORIGINAL;
+  double visual_yaw_update_scale_ = 1.0;
+  double visual_global_yaw_oc_alpha_ = 0.0;
 };
 
 } // namespace ov_msckf

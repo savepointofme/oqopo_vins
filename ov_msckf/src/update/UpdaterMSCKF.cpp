@@ -71,6 +71,8 @@ UpdaterMSCKF::UpdaterMSCKF(UpdaterOptions &options, ov_core::FeatureInitializerO
 void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_ptr<Feature>> &feature_vec) {
 
   // Return if no features
+  last_stats_ = LastStats{};
+  last_stats_.n_features_in = (int)feature_vec.size();
   if (feature_vec.empty())
     return;
 
@@ -131,6 +133,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
 
   // 3. Try to triangulate all MSCKF or new SLAM features that have measurements
   // [中文] 依次三角化特征, 再可选地用高斯牛顿在多视角上精化 p_FinG
+  initializer_feat->reset_tri_stats();
   auto it1 = feature_vec.begin();
   while (it1 != feature_vec.end()) {
 
@@ -152,11 +155,13 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     if (!success_tri || !success_refine) {
       (*it1)->to_delete = true;
       it1 = feature_vec.erase(it1);
+      last_stats_.n_tri_failed++;
       continue;
     }
     it1++;
   }
   rT2 = boost::posix_time::microsec_clock::local_time();
+  last_stats_.tri = initializer_feat->get_tri_stats();
 
   // Calculate the max possible measurement size
   size_t max_meas_size = 0;
@@ -230,6 +235,11 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     S.diagonal() += _options.sigma_pix_sq * Eigen::VectorXd::Ones(S.rows());
     double chi2 = res.dot(S.llt().solve(res));
 
+    // Feature track length (total observations across all cameras)
+    int track_len = 0;
+    for (const auto &tp : feat.timestamps)
+      track_len += (int)tp.second.size();
+
     // Get our threshold (we precompute up to 500 but handle the case that it is more)
     double chi2_check;
     if (res.rows() < 500) {
@@ -244,13 +254,19 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     if (chi2 > _options.chi2_multipler * chi2_check) {
       (*it2)->to_delete = true;
       it2 = feature_vec.erase(it2);
-      // PRINT_DEBUG("featid = %d\n", feat.featid);
-      // PRINT_DEBUG("chi2 = %f > %f\n", chi2, _options.chi2_multipler*chi2_check);
-      // std::stringstream ss;
-      // ss << "res = " << std::endl << res.transpose() << std::endl;
-      // PRINT_DEBUG(ss.str().c_str());
+      last_stats_.n_chi2_rejected++;
+      last_stats_.chi2_sum_rej += chi2;
+      last_stats_.chi2_max_rej = std::max(last_stats_.chi2_max_rej, chi2);
+      last_stats_.track_len_sum_rej += track_len;
+      last_stats_.track_len_max_rej = std::max(last_stats_.track_len_max_rej, track_len);
       continue;
     }
+
+    // Accepted — accumulate stats
+    last_stats_.chi2_sum_acc += chi2;
+    last_stats_.chi2_max_acc = std::max(last_stats_.chi2_max_acc, chi2);
+    last_stats_.track_len_sum_acc += track_len;
+    last_stats_.track_len_max_acc = std::max(last_stats_.track_len_max_acc, track_len);
 
     // We are good!!! Append to our large H vector
     size_t ct_hx = 0;
@@ -277,6 +293,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
 
   // We have appended all features to our Hx_big, res_big
   // Delete it so we do not reuse information
+  last_stats_.n_accepted = (int)feature_vec.size();
   for (size_t f = 0; f < feature_vec.size(); f++) {
     feature_vec[f]->to_delete = true;
   }
@@ -302,8 +319,11 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
   Eigen::MatrixXd R_big = _options.sigma_pix_sq * Eigen::MatrixXd::Identity(res_big.rows(), res_big.rows());
 
   // 6. With all good features update the state
-  // [中文] 标准 EKF 更新: K = PH^T (HPH^T + R)^-1, x <- x + K r, P <- (I-KH) P (I-KH)^T + K R K^T
-  StateHelper::EKFUpdate(state, Hx_order_big, Hx_big, res_big, R_big);
+  // [中文] 标准 OpenVINS EKF 更新: K = PH^T (HPH^T + R)^-1, x <- x + K r,
+  //       P <- P - K (PH^T)^T.
+  StateHelper::EKFUpdate(state, Hx_order_big, Hx_big, res_big, R_big,
+                         visual_yaw_update_mode_, visual_yaw_update_scale_,
+                         visual_global_yaw_oc_alpha_);
   rT5 = boost::posix_time::microsec_clock::local_time();
 
   // Debug print timing information
