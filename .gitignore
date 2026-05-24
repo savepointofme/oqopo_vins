@@ -24,3 +24,42 @@ __pycache__/
 !20260509_fly*/result/**/metrics_*.txt
 # Local Claude scratchpad
 .claude/
+
+# Local experiment outputs and generated reports
+\!
+archive/
+comparison_plots/
+evaluation_iwt5_vs_iwt2/
+experiments/
+openvins_flight_skills/
+pr20_final_package/
+scratch/
+skills/
+truth/
+
+# One-off migration/audit artifacts generated in the workspace root
+FILE_CLASSIFICATION.csv
+MIGRATION_DRY_RUN.md
+MIGRATION_PLAN.md
+PHASE0_BASELINE_snapshot.md
+PR20_RESULTS_SUMMARY.md
+TARGET_LAYOUT.md
+WORKSPACE_AUDIT.md
+migration_manifest.json
+toffset_sweep.sh
+traj_ros_free.txt
+traj_ros_free.txt.bias
+
+# Local throwaway scripts / malformed command scratch
+test.sh
+
+# Generated media and packaged outputs
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.zip
