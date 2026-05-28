@@ -49,6 +49,7 @@
 #include "feat/FeatureInitializerOptions.h"
 
 #include "UpdaterOptions.h"
+#include "VisualObservabilityPolicy.h"
 #include "state/StateHelper.h"
 
 namespace ov_core {
@@ -102,6 +103,23 @@ public:
     visual_global_yaw_oc_alpha_ = global_alpha;
   }
 
+  void set_visual_observability_policy(std::shared_ptr<VisualObservabilityPolicy> policy) {
+    vop_ = policy;
+  }
+
+  // Aggregated OC diagnostics for the last update() call (over all features).
+  struct OcBatchDiag {
+    int n_features = 0;
+    double sum_norm_HN_before = 0.0;
+    double sum_norm_HN_after = 0.0;
+    double sum_rel_HN_before = 0.0;
+    double sum_rel_HN_after = 0.0;
+    double sum_chi2_before = 0.0; // chi2 computed on raw H
+    double sum_chi2_after = 0.0;  // chi2 computed on projected H
+    bool projection_applied = false;
+  };
+  const OcBatchDiag &get_last_oc_diag() const { return last_oc_diag_; }
+
   struct LastStats {
     int n_features_in = 0;
     int n_tri_failed = 0;
@@ -133,10 +151,13 @@ protected:
   std::map<int, double> chi_squared_table;
 
   LastStats last_stats_;
+  OcBatchDiag last_oc_diag_;
 
   StateHelper::VisualYawUpdateMode visual_yaw_update_mode_ = StateHelper::VisualYawUpdateMode::ORIGINAL;
   double visual_yaw_update_scale_ = 1.0;
   double visual_global_yaw_oc_alpha_ = 0.0;
+
+  std::shared_ptr<VisualObservabilityPolicy> vop_;
 };
 
 } // namespace ov_msckf

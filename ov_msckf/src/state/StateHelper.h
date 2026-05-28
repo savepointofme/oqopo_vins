@@ -23,11 +23,22 @@
 #define OV_MSCKF_STATE_HELPER_H
 
 #include <Eigen/Eigen>
+#include <functional>
 #include <memory>
+#include <vector>
 
 namespace ov_type {
 class Type;
 } // namespace ov_type
+
+// Callback type used by StateHelper::initialize() to optionally apply a
+// pre-chi2 OC projection to the updating (Hup) portion before the chi-square
+// gate.  Signature: (H, H_order, H_id) -> projected_H.
+// When nullptr the function behaves as before (no pre-chi2 projection).
+using VisualOcFn = std::function<Eigen::MatrixXd(
+    const Eigen::MatrixXd &,
+    const std::vector<std::shared_ptr<ov_type::Type>> &,
+    const std::vector<int> &)>;
 
 namespace ov_msckf {
 
@@ -49,7 +60,16 @@ public:
     ORIGINAL = 0,
     PER_BLOCK_SCALE = 1,
     GLOBAL_YAW_OC_PROJECTION = 2,
-    CURRENT_ONLY_SCALE = 3
+    CURRENT_ONLY_SCALE = 3,
+    HARD_GYRO_YAW = 4,
+    A_STRICT_YAW_DX0 = 5
+  };
+
+  struct YawDxProjectionDiag {
+    bool valid = false;
+    VisualYawUpdateMode mode = VisualYawUpdateMode::ORIGINAL;
+    double dx_yaw_before_projection_deg = 0.0;
+    double dx_yaw_after_projection_deg = 0.0;
   };
 
   /**
@@ -97,6 +117,10 @@ public:
                         VisualYawUpdateMode visual_yaw_update_mode = VisualYawUpdateMode::ORIGINAL,
                         double visual_yaw_update_scale = 1.0,
                         double visual_global_yaw_oc_alpha = 0.0);
+
+  static void reset_last_yaw_dx_projection_diag();
+
+  static YawDxProjectionDiag get_last_yaw_dx_projection_diag();
 
   /**
    * @brief Consider-Filter (Schmidt-KF) update.
@@ -252,7 +276,8 @@ public:
                          Eigen::MatrixXd &R, Eigen::VectorXd &res, double chi_2_mult,
                          VisualYawUpdateMode visual_yaw_update_mode = VisualYawUpdateMode::ORIGINAL,
                          double visual_yaw_update_scale = 1.0,
-                         double visual_global_yaw_oc_alpha = 0.0);
+                         double visual_global_yaw_oc_alpha = 0.0,
+                         VisualOcFn oc_fn = nullptr);
 
   /**
    * @brief Initializes new variable into covariance (H_L must be invertible)

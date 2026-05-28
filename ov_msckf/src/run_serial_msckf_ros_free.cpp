@@ -139,7 +139,8 @@ struct Args {
   double vio_yaw_update_scale = std::numeric_limits<double>::quiet_NaN();
   double vio_global_yaw_oc_alpha = std::numeric_limits<double>::quiet_NaN();
   double vio_yaw_control_start_after_init = 0.0; // seconds; 0 = apply requested yaw control immediately
-  std::string vio_yaw_diag_path;  // per-visual-update yaw CSV
+  std::string vio_yaw_diag_path;           // per-visual-update yaw CSV
+  std::string visual_obs_diag_path;        // VisualObservabilityPolicy per-update CSV
   // Diagnostic overrides
   double cam_toff_override = std::numeric_limits<double>::quiet_NaN(); // override timeshift_cam_imu; disables online calib
   int diag_chi2_trigger = 5;    // trigger detailed diagnostics when chi2_rej >= this in one frame
@@ -216,11 +217,15 @@ void print_help() {
                "                        Keeps all panels. Reduces render time ~5-10x.\n"
                "  --verbose             Print per-frame timing\n"
                "  --no-vio-yaw-update   Alias for --vio-yaw-update-scale 0.0\n"
-               "  --vio-yaw-update-mode M   original|per_block_scale|global_yaw_oc_projection|current_only_scale\n"
+               "  --vio-yaw-update-mode M   original|per_block_scale|global_yaw_oc_projection|current_only_scale|hard_gyro_yaw|a_strict_yaw_dx0\n"
                "  --vio-yaw-update-scale S  Scale visual yaw correction for *_scale modes (1=orig, 0=off)\n"
                "  --vio-global-yaw-oc-alpha A  H-projection alpha for global_yaw_oc_projection (0=orig, 1=full)\n"
                "  --vio-yaw-control-start-after-init S  Delay requested visual yaw control until S seconds after init\n"
                "  --vio-yaw-diag PATH   Write per-MSCKF/SLAM yaw update CSV\n"
+               "  --visual-obs-diag PATH  Write VisualObservabilityPolicy diagnostics CSV\n"
+               "  Modes for --vio-yaw-update-mode (new pre-chi2 OC modes):\n"
+               "    global_yaw_oc_fej_prechi2  1-D FEJ yaw OC applied before chi2 gating\n"
+               "    visual_4d_oc_fej_prechi2   4-D FEJ (yaw+xyz) OC applied before chi2 gating\n"
                "\n"
                "\n"
                "Diagnostic logging (all off by default; independent of --verbose):\n"
@@ -302,6 +307,7 @@ bool parse_args(int argc, char **argv, Args &a) {
     else if (s == "--vio-global-yaw-schmidt-alpha") a.vio_global_yaw_oc_alpha = std::atof(next("--vio-global-yaw-schmidt-alpha").c_str());
     else if (s == "--vio-yaw-control-start-after-init") a.vio_yaw_control_start_after_init = std::atof(next("--vio-yaw-control-start-after-init").c_str());
     else if (s == "--vio-yaw-diag") a.vio_yaw_diag_path = next("--vio-yaw-diag");
+    else if (s == "--visual-obs-diag") a.visual_obs_diag_path = next("--visual-obs-diag");
     else if (s == "--cam-toff") a.cam_toff_override = std::atof(next("--cam-toff").c_str());
     else if (s == "--diag-chi2-trigger") a.diag_chi2_trigger = std::atoi(next("--diag-chi2-trigger").c_str());
     else if (s == "--diag-window") a.diag_window = std::atoi(next("--diag-window").c_str());
@@ -381,7 +387,11 @@ int main(int argc, char **argv) {
       PRINT_INFO(CYAN "[ros-free] CLI override: vio_yaw_update_mode=per_block_scale (scale specified)\n" RESET);
     }
     params.vio_yaw_update_scale = std::max(0.0, std::min(1.0, args.vio_yaw_update_scale));
-    params.enable_vio_yaw_update = params.vio_yaw_update_scale > 0.0;
+    params.enable_vio_yaw_update = (params.vio_yaw_update_mode == "original" ||
+                                    params.vio_yaw_update_mode == "a_strict_yaw_dx0" ||
+                                    params.vio_yaw_update_mode == "strict_yaw_dx0" ||
+                                    params.vio_yaw_update_scale > 0.0 ||
+                                    params.vio_global_yaw_oc_alpha > 0.0);
     PRINT_INFO(CYAN "[ros-free] CLI override: vio_yaw_update_scale=%.3f\n" RESET,
                params.vio_yaw_update_scale);
   }
@@ -394,6 +404,11 @@ int main(int argc, char **argv) {
     params.vio_yaw_update_diag_path = args.vio_yaw_diag_path;
     PRINT_INFO(CYAN "[ros-free] CLI override: vio_yaw_update_diag_path=%s\n" RESET,
                args.vio_yaw_diag_path.c_str());
+  }
+  if (!args.visual_obs_diag_path.empty()) {
+    params.visual_obs_diag_path = args.visual_obs_diag_path;
+    PRINT_INFO(CYAN "[ros-free] CLI override: visual_obs_diag_path=%s\n" RESET,
+               args.visual_obs_diag_path.c_str());
   }
 
   if (!parser->successful()) {
@@ -674,9 +689,10 @@ int main(int argc, char **argv) {
     double align_tol = gt_pos_map.empty() ? 0.15 : 0.03;
     TrajectoryAligner::build_pairs(vio_for_align, align_map, align_tol, pv, pg);
     if (pv.size() >= 10) {
-      if (aligner.solve(pv, pg)) {
-        PRINT_INFO(GREEN "[ros-free] SE3 alignment solved using %zu pairs (%s)\n" RESET,
-                   pv.size(), gt_pos_map.empty() ? "GPS" : "GT");
+      if (aligner.solve_xy_yaw(pv, pg)) {
+        const double yaw_deg = std::atan2(aligner.R()(1, 0), aligner.R()(0, 0)) * 180.0 / M_PI;
+        PRINT_INFO(GREEN "[ros-free] XY yaw alignment solved using %zu pairs (%s), yaw=%.2f deg\n" RESET,
+                   pv.size(), gt_pos_map.empty() ? "GPS" : "GT", yaw_deg);
         dash.set_alignment(aligner.R(), aligner.t(), true);
         align_fit_count = (int)pv.size();
       }

@@ -22,6 +22,7 @@
 #include "UpdaterMSCKF.h"
 
 #include "UpdaterHelper.h"
+#include "VisualObservabilityPolicy.h"
 
 #include "feat/Feature.h"
 #include "feat/FeatureInitializer.h"
@@ -72,6 +73,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
 
   // Return if no features
   last_stats_ = LastStats{};
+  last_oc_diag_ = OcBatchDiag{};
   last_stats_.n_features_in = (int)feature_vec.size();
   if (feature_vec.empty())
     return;
@@ -188,6 +190,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
 
   // 4. Compute linear system for each feature, nullspace project, and reject
   // [中文] 单特征线性系统 + 左零空间投影 + 卡方检验
+  const bool vop_active = vop_ && vop_->is_active();
   auto it2 = feature_vec.begin();
   while (it2 != feature_vec.end()) {
 
@@ -229,11 +232,37 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     //        后的线性系统只关系状态, 不用为特征状态开协方差列
     UpdaterHelper::nullspace_project_inplace(H_f, H_x, res);
 
-    /// Chi2 distance check
+    // VisualObservabilityPolicy: project H_x to remove unobservable directions
+    // before chi-square gating (pre-chi2 modes only).
+    // For the old GLOBAL_YAW_OC_PROJECTION mode the projection happens inside
+    // EKFUpdate, so we pass the raw H_x here and to the accumulation below.
+    Eigen::MatrixXd H_x_for_gate = H_x;
+    if (vop_active) {
+      std::vector<int> H_id = VisualObservabilityPolicy::build_H_id(Hx_order);
+      VisualObservabilityPolicy::Diag oc_diag;
+      H_x_for_gate = vop_->apply(H_x, Hx_order, H_id, state, &oc_diag);
+      // Accumulate batch diagnostics
+      last_oc_diag_.n_features++;
+      last_oc_diag_.sum_norm_HN_before += oc_diag.norm_HN_before;
+      last_oc_diag_.sum_norm_HN_after += oc_diag.norm_HN_after;
+      last_oc_diag_.sum_rel_HN_before += oc_diag.rel_norm_HN_before;
+      last_oc_diag_.sum_rel_HN_after += oc_diag.rel_norm_HN_after;
+      last_oc_diag_.projection_applied = oc_diag.projection_applied;
+    }
+
+    /// Chi2 distance check (uses H_x_for_gate — OC-projected if vop active)
     Eigen::MatrixXd P_marg = StateHelper::get_marginal_covariance(state, Hx_order);
-    Eigen::MatrixXd S = H_x * P_marg * H_x.transpose();
+    if (vop_active) {
+      // Also track chi2 on raw H for before/after comparison
+      Eigen::MatrixXd S_raw = H_x * P_marg * H_x.transpose();
+      S_raw.diagonal() += _options.sigma_pix_sq * Eigen::VectorXd::Ones(S_raw.rows());
+      last_oc_diag_.sum_chi2_before += res.dot(S_raw.llt().solve(res));
+    }
+    Eigen::MatrixXd S = H_x_for_gate * P_marg * H_x_for_gate.transpose();
     S.diagonal() += _options.sigma_pix_sq * Eigen::VectorXd::Ones(S.rows());
     double chi2 = res.dot(S.llt().solve(res));
+    if (vop_active)
+      last_oc_diag_.sum_chi2_after += chi2;
 
     // Feature track length (total observations across all cameras)
     int track_len = 0;
@@ -268,7 +297,9 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     last_stats_.track_len_sum_acc += track_len;
     last_stats_.track_len_max_acc = std::max(last_stats_.track_len_max_acc, track_len);
 
-    // We are good!!! Append to our large H vector
+    // We are good!!! Append to our large H vector.
+    // Use H_x_for_gate (OC-projected when vop active, else raw H_x) so that
+    // the subsequent EKF update operates on the already-projected Jacobian.
     size_t ct_hx = 0;
     for (const auto &var : Hx_order) {
 
@@ -280,7 +311,8 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
       }
 
       // Append to our large Jacobian
-      Hx_big.block(ct_meas, Hx_mapping[var], H_x.rows(), var->size()) = H_x.block(0, ct_hx, H_x.rows(), var->size());
+      Hx_big.block(ct_meas, Hx_mapping[var], H_x_for_gate.rows(), var->size()) =
+          H_x_for_gate.block(0, ct_hx, H_x_for_gate.rows(), var->size());
       ct_hx += var->size();
     }
 
@@ -318,12 +350,18 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
   // Our noise is isotropic, so make it here after our compression
   Eigen::MatrixXd R_big = _options.sigma_pix_sq * Eigen::MatrixXd::Identity(res_big.rows(), res_big.rows());
 
-  // 6. With all good features update the state
-  // [中文] 标准 OpenVINS EKF 更新: K = PH^T (HPH^T + R)^-1, x <- x + K r,
-  //       P <- P - K (PH^T)^T.
-  StateHelper::EKFUpdate(state, Hx_order_big, Hx_big, res_big, R_big,
-                         visual_yaw_update_mode_, visual_yaw_update_scale_,
-                         visual_global_yaw_oc_alpha_);
+  // 6. With all good features update the state.
+  // When VOP is active, H in Hx_big is already OC-projected; pass ORIGINAL
+  // to EKFUpdate to avoid double-application.
+  // When VOP is inactive, fall back to the legacy visual_yaw_update_mode_.
+  if (vop_active) {
+    StateHelper::EKFUpdate(state, Hx_order_big, Hx_big, res_big, R_big,
+                           StateHelper::VisualYawUpdateMode::ORIGINAL, 1.0, 0.0);
+  } else {
+    StateHelper::EKFUpdate(state, Hx_order_big, Hx_big, res_big, R_big,
+                           visual_yaw_update_mode_, visual_yaw_update_scale_,
+                           visual_global_yaw_oc_alpha_);
+  }
   rT5 = boost::posix_time::microsec_clock::local_time();
 
   // Debug print timing information

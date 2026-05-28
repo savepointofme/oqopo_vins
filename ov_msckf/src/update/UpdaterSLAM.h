@@ -28,6 +28,7 @@
 #include "feat/FeatureInitializerOptions.h"
 
 #include "UpdaterOptions.h"
+#include "VisualObservabilityPolicy.h"
 #include "state/StateHelper.h"
 
 namespace ov_core {
@@ -76,6 +77,10 @@ public:
     visual_global_yaw_oc_alpha_ = global_alpha;
   }
 
+  void set_visual_observability_policy(std::shared_ptr<VisualObservabilityPolicy> policy) {
+    vop_ = policy;
+  }
+
   /**
    * @brief Given max track features, this will try to use them to initialize them in the state.
    * @param state State of the filter
@@ -119,6 +124,8 @@ protected:
   StateHelper::VisualYawUpdateMode visual_yaw_update_mode_ = StateHelper::VisualYawUpdateMode::ORIGINAL;
   double visual_yaw_update_scale_ = 1.0;
   double visual_global_yaw_oc_alpha_ = 0.0;
+
+  std::shared_ptr<VisualObservabilityPolicy> vop_;
 };
 
 } // namespace ov_msckf

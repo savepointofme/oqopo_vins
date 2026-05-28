@@ -232,6 +232,9 @@ public:
   /// Open/replace the per-visual-update yaw diagnostic CSV.
   void set_vio_yaw_update_diag_path(const std::string &path);
 
+  /// Open/replace the visual observability diagnostic CSV.
+  void set_visual_obs_diag_path(const std::string &path);
+
   /// Per-call diagnostic snapshot populated by every GPS altitude update.
   struct GpsAltLastUpdate {
     double t = -1.0;
@@ -462,6 +465,16 @@ protected:
                           int num_features, double chi2, int accepted, int rejected,
                           int tracking_feature_count);
 
+  /// Write one row to visual_observability_diag CSV, if enabled.
+  void log_visual_obs_diag(double timestamp, const std::string &update_type,
+                           int n_in, int n_accepted, int n_rejected,
+                           double norm_HN_before, double norm_HN_after,
+                           double rel_HN_before, double rel_HN_after,
+                           int rank_N, double condition_N,
+                           bool projection_applied, bool used_fej,
+                           double yaw_delta_deg,
+                           double chi2_before, double chi2_after);
+
   /**
    * @brief This function will try to initialize the state.
    *
@@ -556,6 +569,8 @@ protected:
   std::ofstream of_statistics;
   std::ofstream of_vio_yaw_update_diag;
   double vio_yaw_update_diag_cumsum_deg = 0.0;
+  std::ofstream of_visual_obs_diag;
+  double visual_obs_diag_cumsum_yaw_deg = 0.0;
   boost::posix_time::ptime rT1, rT2, rT3, rT4, rT5, rT6, rT7;
 
   // Track how much distance we have traveled

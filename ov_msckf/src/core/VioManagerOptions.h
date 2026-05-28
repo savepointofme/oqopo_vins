@@ -121,7 +121,8 @@ struct VioManagerOptions {
   bool enable_vio_yaw_update = true;
 
   /// Visual yaw update control mode:
-  /// original, per_block_scale, global_yaw_oc_projection, current_only_scale.
+    /// original, per_block_scale, global_yaw_oc_projection, current_only_scale,
+    /// hard_gyro_yaw, a_strict_yaw_dx0.
   std::string vio_yaw_update_mode = "original";
 
   /// Scale for the gravity-axis component of visual orientation updates.
@@ -133,6 +134,9 @@ struct VioManagerOptions {
 
   /// If non-empty, write per-visual-update yaw deltas to this CSV file.
   std::string vio_yaw_update_diag_path = "";
+
+  /// If non-empty, write VisualObservabilityPolicy per-update diagnostics here.
+  std::string visual_obs_diag_path = "";
 
   /**
    * @brief This function will load print out all estimator settings loaded.

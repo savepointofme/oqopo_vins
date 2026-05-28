@@ -22,6 +22,7 @@
 #include "UpdaterSLAM.h"
 
 #include "UpdaterHelper.h"
+#include "VisualObservabilityPolicy.h"
 
 #include "feat/Feature.h"
 #include "feat/FeatureInitializer.h"
@@ -227,12 +228,24 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
         ((int)feat.featid < state->_options.max_aruco_features) ? _options_aruco.sigma_pix_sq : _options_slam.sigma_pix_sq;
     Eigen::MatrixXd R = sigma_pix_sq * Eigen::MatrixXd::Identity(res.rows(), res.rows());
 
-    // Try to initialize, delete new pointer if we failed
+    // Try to initialize, delete new pointer if we failed.
+    // For pre-chi2 VOP modes pass a lambda that projects Hup before the gate.
     double chi2_multipler =
         ((int)feat.featid < state->_options.max_aruco_features) ? _options_aruco.chi2_multipler : _options_slam.chi2_multipler;
+    VisualOcFn oc_fn_delayed = nullptr;
+    if (vop_ && vop_->is_active()) {
+      auto vop_copy = vop_; // capture by value so the lambda is self-contained
+      auto state_copy = state;
+      oc_fn_delayed = [vop_copy, state_copy](
+          const Eigen::MatrixXd &H,
+          const std::vector<std::shared_ptr<ov_type::Type>> &H_order,
+          const std::vector<int> &H_id) -> Eigen::MatrixXd {
+        return vop_copy->apply(H, H_order, H_id, state_copy);
+      };
+    }
     if (StateHelper::initialize(state, landmark, Hx_order, H_x, H_f, R, res, chi2_multipler,
                                 visual_yaw_update_mode_, visual_yaw_update_scale_,
-                                visual_global_yaw_oc_alpha_)) {
+                                visual_global_yaw_oc_alpha_, oc_fn_delayed)) {
       state->_features_SLAM.insert({(*it2)->featid, landmark});
       (*it2)->to_delete = true;
       it2++;
@@ -320,6 +333,7 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
   size_t ct_meas = 0;
 
   // 4. Compute linear system for each feature, nullspace project, and reject
+  const bool vop_active = vop_ && vop_->is_active();
   auto it2 = feature_vec.begin();
   while (it2 != feature_vec.end()) {
 
@@ -388,11 +402,18 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
     std::vector<std::shared_ptr<Type>> Hxf_order = Hx_order;
     Hxf_order.push_back(landmark);
 
-    // Chi2 distance check
-    Eigen::MatrixXd P_marg = StateHelper::get_marginal_covariance(state, Hxf_order);
-    Eigen::MatrixXd S = H_xf * P_marg * H_xf.transpose();
+    // Optionally apply VOP projection before chi2 gating.
+    Eigen::MatrixXd H_xf_for_gate = H_xf;
+    if (vop_active) {
+      std::vector<int> H_id = VisualObservabilityPolicy::build_H_id(Hxf_order);
+      H_xf_for_gate = vop_->apply(H_xf, Hxf_order, H_id, state);
+    }
+
+    // Chi2 distance check (uses OC-projected H when vop active)
     double sigma_pix_sq =
         ((int)feat.featid < state->_options.max_aruco_features) ? _options_aruco.sigma_pix_sq : _options_slam.sigma_pix_sq;
+    Eigen::MatrixXd P_marg = StateHelper::get_marginal_covariance(state, Hxf_order);
+    Eigen::MatrixXd S = H_xf_for_gate * P_marg * H_xf_for_gate.transpose();
     S.diagonal() += sigma_pix_sq * Eigen::VectorXd::Ones(S.rows());
     double chi2 = res.dot(S.llt().solve(res));
 
@@ -426,7 +447,8 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
       PRINT_DEBUG("[SLAM-UP]: accepted aruco tag %d for chi2 thresh (%.3f < %.3f)\n", (int)feat.featid, chi2, chi2_multipler * chi2_check);
     }
 
-    // We are good!!! Append to our large H vector
+    // We are good!!! Append to our large H vector.
+    // Use H_xf_for_gate (OC-projected when vop active, else raw H_xf).
     size_t ct_hx = 0;
     for (const auto &var : Hxf_order) {
 
@@ -438,7 +460,8 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
       }
 
       // Append to our large Jacobian
-      Hx_big.block(ct_meas, Hx_mapping[var], H_xf.rows(), var->size()) = H_xf.block(0, ct_hx, H_xf.rows(), var->size());
+      Hx_big.block(ct_meas, Hx_mapping[var], H_xf_for_gate.rows(), var->size()) =
+          H_xf_for_gate.block(0, ct_hx, H_xf_for_gate.rows(), var->size());
       ct_hx += var->size();
     }
 
@@ -468,10 +491,16 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
   Hx_big.conservativeResize(ct_meas, ct_jacob);
   R_big.conservativeResize(ct_meas, ct_meas);
 
-  // 5. With all good SLAM features update the state
-  StateHelper::EKFUpdate(state, Hx_order_big, Hx_big, res_big, R_big,
-                         visual_yaw_update_mode_, visual_yaw_update_scale_,
-                         visual_global_yaw_oc_alpha_);
+  // 5. With all good SLAM features update the state.
+  // VOP already projected H into Hx_big — use ORIGINAL to avoid double application.
+  if (vop_active) {
+    StateHelper::EKFUpdate(state, Hx_order_big, Hx_big, res_big, R_big,
+                           StateHelper::VisualYawUpdateMode::ORIGINAL, 1.0, 0.0);
+  } else {
+    StateHelper::EKFUpdate(state, Hx_order_big, Hx_big, res_big, R_big,
+                           visual_yaw_update_mode_, visual_yaw_update_scale_,
+                           visual_global_yaw_oc_alpha_);
+  }
   rT3 = boost::posix_time::microsec_clock::local_time();
 
   // Debug print timing information

@@ -37,6 +37,8 @@ using namespace ov_msckf;
 
 namespace {
 
+StateHelper::YawDxProjectionDiag last_yaw_dx_projection_diag;
+
 Eigen::Matrix3d yaw_projection_matrix(const Eigen::Matrix3d &R_GtoI, double scale) {
   scale = std::max(0.0, std::min(1.0, scale));
   Eigen::Vector3d g_local = R_GtoI * Eigen::Vector3d::UnitZ();
@@ -184,7 +186,56 @@ Eigen::MatrixXd project_global_yaw_from_H(std::shared_ptr<State> state, const st
   return H - (alpha / n2) * Hn * n.transpose();
 }
 
+void remove_yaw_dx_component(Eigen::VectorXd &dx, const std::shared_ptr<Type> &q_var,
+                             const Eigen::Matrix3d &R_GtoI) {
+  if (q_var == nullptr || q_var->id() < 0 || q_var->id() + 3 > dx.rows())
+    return;
+  Eigen::Vector3d g_local = R_GtoI * Eigen::Vector3d::UnitZ();
+  const double n = g_local.norm();
+  if (n < 1e-12)
+    return;
+  g_local /= n;
+  const Eigen::Matrix3d P_no_yaw = Eigen::Matrix3d::Identity() - g_local * g_local.transpose();
+  dx.segment(q_var->id(), 3) = (P_no_yaw * dx.segment(q_var->id(), 3)).eval();
+}
+
+double yaw_dx_component_deg(std::shared_ptr<State> state, const Eigen::VectorXd &dx) {
+  const auto &q_var = state->_imu->q();
+  if (q_var == nullptr || q_var->id() < 0 || q_var->id() + 3 > dx.rows())
+    return 0.0;
+  Eigen::Vector3d g_local = state->_imu->Rot() * Eigen::Vector3d::UnitZ();
+  const double n = g_local.norm();
+  if (n < 1e-12)
+    return 0.0;
+  g_local /= n;
+  constexpr double rad_to_deg = 180.0 / 3.14159265358979323846;
+  return g_local.dot(dx.segment(q_var->id(), 3)) * rad_to_deg;
+}
+
+void zero_visual_yaw_dx(std::shared_ptr<State> state, Eigen::VectorXd &dx, bool protect_bg_z) {
+  remove_yaw_dx_component(dx, state->_imu->q(), state->_imu->Rot());
+
+  for (const auto &clone : state->_clones_IMU) {
+    const auto &pose = clone.second;
+    remove_yaw_dx_component(dx, pose->q(), pose->Rot());
+  }
+
+  if (protect_bg_z && state->_imu->bg() != nullptr) {
+    const int bg_id = state->_imu->bg()->id();
+    if (bg_id >= 0 && bg_id + 2 < dx.rows())
+      dx(bg_id + 2) = 0.0;
+  }
+}
+
 } // namespace
+
+void StateHelper::reset_last_yaw_dx_projection_diag() {
+  last_yaw_dx_projection_diag = YawDxProjectionDiag();
+}
+
+StateHelper::YawDxProjectionDiag StateHelper::get_last_yaw_dx_projection_diag() {
+  return last_yaw_dx_projection_diag;
+}
 
 void StateHelper::EKFPropagation(std::shared_ptr<State> state, const std::vector<std::shared_ptr<Type>> &order_NEW,
                                  const std::vector<std::shared_ptr<Type>> &order_OLD, const Eigen::MatrixXd &Phi,
@@ -287,6 +338,10 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
   Eigen::MatrixXd H_eff = H;
   if (visual_yaw_update_mode == VisualYawUpdateMode::GLOBAL_YAW_OC_PROJECTION) {
     H_eff = project_global_yaw_from_H(state, H_order, H_id, H, visual_global_yaw_oc_alpha);
+  } else if (visual_yaw_update_mode == VisualYawUpdateMode::HARD_GYRO_YAW) {
+    H_eff = project_global_yaw_from_H(state, H_order, H_id, H, 1.0);
+  } else if (visual_yaw_update_mode == VisualYawUpdateMode::A_STRICT_YAW_DX0) {
+    H_eff = project_per_block_yaw_from_H(state, H_order, H_id, H, 0.0, false);
   } else if (visual_yaw_update_mode == VisualYawUpdateMode::PER_BLOCK_SCALE ||
              visual_yaw_update_mode == VisualYawUpdateMode::CURRENT_ONLY_SCALE) {
     H_eff = project_per_block_yaw_from_H(state, H_order, H_id, H, visual_yaw_update_scale,
@@ -345,6 +400,15 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
 
   // Calculate our delta and update all our active states
   Eigen::VectorXd dx = K * res;
+  last_yaw_dx_projection_diag.valid = true;
+  last_yaw_dx_projection_diag.mode = visual_yaw_update_mode;
+  last_yaw_dx_projection_diag.dx_yaw_before_projection_deg = yaw_dx_component_deg(state, dx);
+  if (visual_yaw_update_mode == VisualYawUpdateMode::HARD_GYRO_YAW) {
+    zero_visual_yaw_dx(state, dx, true);
+  } else if (visual_yaw_update_mode == VisualYawUpdateMode::A_STRICT_YAW_DX0) {
+    zero_visual_yaw_dx(state, dx, false);
+  }
+  last_yaw_dx_projection_diag.dx_yaw_after_projection_deg = yaw_dx_component_deg(state, dx);
   for (size_t i = 0; i < state->_variables.size(); i++) {
     state->_variables.at(i)->update(dx.block(state->_variables.at(i)->id(), 0, state->_variables.at(i)->size(), 1));
   }
@@ -671,7 +735,7 @@ bool StateHelper::initialize(std::shared_ptr<State> state, std::shared_ptr<Type>
                              const std::vector<std::shared_ptr<Type>> &H_order, Eigen::MatrixXd &H_R, Eigen::MatrixXd &H_L,
                              Eigen::MatrixXd &R, Eigen::VectorXd &res, double chi_2_mult,
                              VisualYawUpdateMode visual_yaw_update_mode, double visual_yaw_update_scale,
-                             double visual_global_yaw_oc_alpha) {
+                             double visual_global_yaw_oc_alpha, VisualOcFn oc_fn) {
 
   // Check that this new variable is not already initialized
   if (std::find(state->_variables.begin(), state->_variables.end(), new_variable) != state->_variables.end()) {
@@ -734,11 +798,26 @@ bool StateHelper::initialize(std::shared_ptr<State> state, std::shared_ptr<Type>
   //==========================================================
   //==========================================================
 
+  // Optionally apply pre-chi2 OC projection to the updating (Hup) portion.
+  // When oc_fn is provided (new pre-chi2 modes), we project Hup before the
+  // Mahalanobis gate so the gate operates on the OC-consistent Jacobian.
+  // In that case EKFUpdate is called with ORIGINAL mode (no re-application).
+  Eigen::MatrixXd Hup_for_gate = Hup;
+  if (oc_fn && Hup.rows() > 0) {
+    int cur = 0;
+    std::vector<int> H_id_up;
+    for (const auto &meas_var : H_order) {
+      H_id_up.push_back(cur);
+      cur += meas_var->size();
+    }
+    Hup_for_gate = oc_fn(Hup, H_order, H_id_up);
+  }
+
   // Do mahalanobis distance testing
   Eigen::MatrixXd P_up = get_marginal_covariance(state, H_order);
-  assert(Rup.rows() == Hup.rows());
-  assert(Hup.cols() == P_up.cols());
-  Eigen::MatrixXd S = Hup * P_up * Hup.transpose() + Rup;
+  assert(Rup.rows() == Hup_for_gate.rows());
+  assert(Hup_for_gate.cols() == P_up.cols());
+  Eigen::MatrixXd S = Hup_for_gate * P_up * Hup_for_gate.transpose() + Rup;
   double chi2 = resup.dot(S.llt().solve(resup));
 
   // Get what our threshold should be
@@ -753,10 +832,18 @@ bool StateHelper::initialize(std::shared_ptr<State> state, std::shared_ptr<Type>
   // Finally, initialize it in our state
   StateHelper::initialize_invertible(state, new_variable, H_order, Hxinit, H_finit, Rinit, resinit);
 
-  // Update with updating portion
+  // Update with updating portion.
+  // If oc_fn was used, Hup_for_gate already carries the OC projection and
+  // we call EKFUpdate with ORIGINAL (no second application).
+  // Otherwise fall back to the legacy visual_yaw_update_mode path.
   if (Hup.rows() > 0) {
-    StateHelper::EKFUpdate(state, H_order, Hup, resup, Rup, visual_yaw_update_mode,
-                           visual_yaw_update_scale, visual_global_yaw_oc_alpha);
+    if (oc_fn) {
+      StateHelper::EKFUpdate(state, H_order, Hup_for_gate, resup, Rup,
+                             VisualYawUpdateMode::ORIGINAL, 1.0, 0.0);
+    } else {
+      StateHelper::EKFUpdate(state, H_order, Hup, resup, Rup, visual_yaw_update_mode,
+                             visual_yaw_update_scale, visual_global_yaw_oc_alpha);
+    }
   }
   return true;
 }
