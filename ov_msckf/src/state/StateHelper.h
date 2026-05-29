@@ -63,9 +63,10 @@ public:
     CURRENT_ONLY_SCALE = 3,
     HARD_GYRO_YAW = 4,
     A_STRICT_YAW_DX0 = 5,
-    VISUAL_YAW_SCHMIDT_CURRENT_GAUGE = 6,   // K-space: K_eff = (I-qq^T)K_std
+    VISUAL_YAW_SCHMIDT_CURRENT_GAUGE = 6,   // K-space: K_eff = (I-qq^T)K_std, gauge built from current state
     VISUAL_YAW_H_PROJECTION_CURRENT   = 7,  // H-space: H_eff = H - (Hq)q^T, then standard EKF
-    VISUAL_YAW_SCHMIDT_GUARDED        = 8   // Schmidt + pre-update guard: R-inflate or reject suspicious updates
+    VISUAL_YAW_SCHMIDT_GUARDED        = 8,  // Schmidt + pre-update guard: R-inflate or reject suspicious updates
+    VISUAL_YAW_SCHMIDT_FEJ_GAUGE      = 9   // K-space: same Schmidt math as mode 6, gauge built from FEJ state
   };
 
   // Thresholds for VISUAL_YAW_SCHMIDT_GUARDED mode (all configurable via CLI)
@@ -97,6 +98,7 @@ public:
     double timestamp = 0.0;
     std::string update_type;
     std::string mode = "visual_yaw_schmidt_current_gauge";
+    std::string gauge_source;   // "current" or "fej" — set by the gauge builder
     int H_rows = 0;
     int H_cols = 0;
     int N_cols = 1;
@@ -257,7 +259,8 @@ public:
       const Eigen::VectorXd &res,
       const Eigen::MatrixXd &R,
       const std::string &update_type = "visual",
-      SchmidtYawDiag *diag_out = nullptr);
+      SchmidtYawDiag *diag_out = nullptr,
+      bool use_fej = false);
 
   /// Open (or re-open) the per-update Schmidt yaw diagnostic CSV.
   static void open_schmidt_yaw_diag_csv(const std::string &path);

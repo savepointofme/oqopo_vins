@@ -112,37 +112,46 @@ void fill_pose_yaw_gauge(Eigen::VectorXd &n, int col, int size, const Eigen::Mat
   }
 }
 
-void fill_landmark_yaw_gauge(Eigen::VectorXd &n, int col, const std::shared_ptr<Landmark> &lm) {
+void fill_landmark_yaw_gauge(Eigen::VectorXd &n, int col, const std::shared_ptr<Landmark> &lm,
+                             bool use_fej = false) {
   if (lm == nullptr || col < 0 || col + lm->size() > n.rows())
     return;
   if (LandmarkRepresentation::is_relative_representation(lm->_feat_representation))
     return;
   if (lm->_feat_representation != LandmarkRepresentation::GLOBAL_3D || lm->size() != 3)
     return;
-  n.block(col, 0, 3, 1) = yaw_position_dir(lm->get_xyz(false));
+  n.block(col, 0, 3, 1) = yaw_position_dir(lm->get_xyz(use_fej));
 }
 
 Eigen::VectorXd build_global_yaw_gauge_small(std::shared_ptr<State> state, const std::vector<std::shared_ptr<Type>> &H_order,
-                                             const std::vector<int> &H_id, int H_cols) {
+                                             const std::vector<int> &H_id, int H_cols,
+                                             bool use_fej = false) {
   Eigen::VectorXd n = Eigen::VectorXd::Zero(H_cols);
   for (size_t i = 0; i < H_order.size(); i++) {
     const auto &var = H_order[i];
     const int col = H_id[i];
 
     if (var == state->_imu) {
-      fill_pose_yaw_gauge(n, col, var->size(), state->_imu->Rot(), state->_imu->pos(), true, state->_imu->vel());
+      fill_pose_yaw_gauge(n, col, var->size(),
+                          use_fej ? state->_imu->Rot_fej() : state->_imu->Rot(),
+                          use_fej ? state->_imu->pos_fej() : state->_imu->pos(),
+                          true,
+                          use_fej ? state->_imu->vel_fej() : state->_imu->vel());
       continue;
     }
     if (var == state->_imu->q()) {
-      fill_pose_yaw_gauge(n, col, var->size(), state->_imu->Rot(), state->_imu->pos(), false, Eigen::Vector3d::Zero());
+      fill_pose_yaw_gauge(n, col, var->size(),
+                          use_fej ? state->_imu->Rot_fej() : state->_imu->Rot(),
+                          use_fej ? state->_imu->pos_fej() : state->_imu->pos(),
+                          false, Eigen::Vector3d::Zero());
       continue;
     }
     if (var == state->_imu->p()) {
-      n.block(col, 0, 3, 1) = yaw_position_dir(state->_imu->pos());
+      n.block(col, 0, 3, 1) = yaw_position_dir(use_fej ? state->_imu->pos_fej() : state->_imu->pos());
       continue;
     }
     if (var == state->_imu->v()) {
-      n.block(col, 0, 3, 1) = yaw_position_dir(state->_imu->vel());
+      n.block(col, 0, 3, 1) = yaw_position_dir(use_fej ? state->_imu->vel_fej() : state->_imu->vel());
       continue;
     }
     if (var == state->_imu->bg() || var == state->_imu->ba()) {
@@ -153,17 +162,23 @@ Eigen::VectorXd build_global_yaw_gauge_small(std::shared_ptr<State> state, const
     for (const auto &clone : state->_clones_IMU) {
       const auto &pose = clone.second;
       if (var == pose) {
-        fill_pose_yaw_gauge(n, col, var->size(), pose->Rot(), pose->pos(), false, Eigen::Vector3d::Zero());
+        fill_pose_yaw_gauge(n, col, var->size(),
+                            use_fej ? pose->Rot_fej() : pose->Rot(),
+                            use_fej ? pose->pos_fej() : pose->pos(),
+                            false, Eigen::Vector3d::Zero());
         matched_clone = true;
         break;
       }
       if (var == pose->q()) {
-        fill_pose_yaw_gauge(n, col, var->size(), pose->Rot(), pose->pos(), false, Eigen::Vector3d::Zero());
+        fill_pose_yaw_gauge(n, col, var->size(),
+                            use_fej ? pose->Rot_fej() : pose->Rot(),
+                            use_fej ? pose->pos_fej() : pose->pos(),
+                            false, Eigen::Vector3d::Zero());
         matched_clone = true;
         break;
       }
       if (var == pose->p()) {
-        n.block(col, 0, 3, 1) = yaw_position_dir(pose->pos());
+        n.block(col, 0, 3, 1) = yaw_position_dir(use_fej ? pose->pos_fej() : pose->pos());
         matched_clone = true;
         break;
       }
@@ -171,13 +186,14 @@ Eigen::VectorXd build_global_yaw_gauge_small(std::shared_ptr<State> state, const
     if (matched_clone)
       continue;
 
-    fill_landmark_yaw_gauge(n, col, std::dynamic_pointer_cast<Landmark>(var));
+    fill_landmark_yaw_gauge(n, col, std::dynamic_pointer_cast<Landmark>(var), use_fej);
   }
   return n;
 }
 
-// Once-per-process flag for the gauge-coverage diagnostic print.
+// Once-per-process flags for gauge-coverage diagnostic print (one per source).
 bool g_gauge_full_diag_printed = false;
+bool g_gauge_full_fej_diag_printed = false;
 
 // Build the global yaw gauge over the FULL state vector.
 // Unlike build_global_yaw_gauge_small (which only covers H_order variables), this version
@@ -193,7 +209,8 @@ bool g_gauge_full_diag_printed = false;
 //
 // On the first call a summary is printed via PRINT_INFO to confirm coverage and flag any
 // composite-variable duplication.
-Eigen::VectorXd build_global_yaw_gauge_full(std::shared_ptr<State> state, int N) {
+Eigen::VectorXd build_global_yaw_gauge_full(std::shared_ptr<State> state, int N,
+                                            bool use_fej = false) {
   Eigen::VectorXd n = Eigen::VectorXd::Zero(N);
 
   bool imu_covered  = false;
@@ -202,14 +219,12 @@ Eigen::VectorXd build_global_yaw_gauge_full(std::shared_ptr<State> state, int N)
   int  n_slam_skip  = 0;   // relative/anchored landmarks (gauge not defined)
 
   // IMU state (q + p + v + bg + ba).
-  // fill_pose_yaw_gauge with has_velocity=true fills q(3), p(3), v(3); bg and ba remain 0.
-  // The IMU composite variable id() points to the start of its 15-DOF block.
-  // No sub-variables (q/p/v/bg/ba individually) appear in _variables when the composite is used,
-  // so there is no risk of double-fill.
   if (state->_imu != nullptr) {
     fill_pose_yaw_gauge(n, state->_imu->id(), state->_imu->size(),
-                        state->_imu->Rot(), state->_imu->pos(),
-                        true, state->_imu->vel());
+                        use_fej ? state->_imu->Rot_fej() : state->_imu->Rot(),
+                        use_fej ? state->_imu->pos_fej() : state->_imu->pos(),
+                        true,
+                        use_fej ? state->_imu->vel_fej() : state->_imu->vel());
     imu_covered = true;
   }
 
@@ -218,20 +233,20 @@ Eigen::VectorXd build_global_yaw_gauge_full(std::shared_ptr<State> state, int N)
     const auto &pose = clone_pair.second;
     if (pose == nullptr) continue;
     fill_pose_yaw_gauge(n, pose->id(), pose->size(),
-                        pose->Rot(), pose->pos(),
+                        use_fej ? pose->Rot_fej() : pose->Rot(),
+                        use_fej ? pose->pos_fej() : pose->pos(),
                         false, Eigen::Vector3d::Zero());
     n_clones++;
   }
 
   // SLAM features.
-  // fill_landmark_yaw_gauge internally skips relative representations.
   for (const auto &feat_pair : state->_features_SLAM) {
     const auto &lm = feat_pair.second;
     if (lm == nullptr) continue;
     if (LandmarkRepresentation::is_relative_representation(lm->_feat_representation)) {
       n_slam_skip++;
     } else {
-      fill_landmark_yaw_gauge(n, lm->id(), lm);
+      fill_landmark_yaw_gauge(n, lm->id(), lm, use_fej);
       n_slam++;
     }
   }
@@ -241,8 +256,9 @@ Eigen::VectorXd build_global_yaw_gauge_full(std::shared_ptr<State> state, int N)
   // Calibration scalars (IMU intrinsics): gauge = 0 by the same reasoning.
 
   // ---- one-time diagnostic summary ----------------------------------------
-  if (!g_gauge_full_diag_printed) {
-    g_gauge_full_diag_printed = true;
+  bool &printed_flag = use_fej ? g_gauge_full_fej_diag_printed : g_gauge_full_diag_printed;
+  if (!printed_flag) {
+    printed_flag = true;
 
     // Count nonzero entries in n to confirm actual fill.
     int n_nonzero = 0;
@@ -264,7 +280,7 @@ Eigen::VectorXd build_global_yaw_gauge_full(std::shared_ptr<State> state, int N)
         n_slam_skip_dof += fp.second->size();
 
     PRINT_INFO(GREEN
-               "[SCHMIDT-YAW] gauge_full first-call summary:\n"
+               "[SCHMIDT-YAW] gauge_full first-call summary (source=%s):\n"
                "  cov_dim N         = %d\n"
                "  q_full nonzero    = %d\n"
                "  IMU covered       = %s  (id=%d size=%d)\n"
@@ -274,6 +290,7 @@ Eigen::VectorXd build_global_yaw_gauge_full(std::shared_ptr<State> state, int N)
                "  cam_extr/intr/dt  = 0 (gauge=0, %d DOF)\n"
                "  q_full norm       = %.6f\n"
                RESET,
+               use_fej ? "fej" : "current",
                N, n_nonzero,
                imu_covered ? "YES" : "NO",
                state->_imu ? state->_imu->id() : -1,
@@ -347,7 +364,7 @@ bool g_schmidt_yaw_diag_header_written = false;
 
 void write_schmidt_yaw_diag_header() {
   g_schmidt_yaw_diag_csv
-      << "timestamp,update_type,mode,H_rows,H_cols,N_cols,rank_Q,norm_Q,norm_H,condition_N,"
+      << "timestamp,update_type,mode,gauge_source,H_rows,H_cols,N_cols,rank_Q,norm_Q,norm_H,condition_N,"
       << "norm_HQ,rel_norm_HQ,normal_dx_s_coeff_before,schmidt_dx_s_coeff_after,"
       << "norm_dx_normal,norm_dx_schmidt,norm_delta_dx,"
       << "Pss_norm_before,Pss_norm_after,Pss_norm_after_new_q,Pss_change_norm,Pas_change_norm,"
@@ -370,6 +387,7 @@ void flush_schmidt_yaw_diag(const StateHelper::SchmidtYawDiag &d) {
       << std::fixed << std::setprecision(9) << d.timestamp << ","
       << d.update_type << ","
       << d.mode << ","
+      << d.gauge_source << ","
       << d.H_rows << "," << d.H_cols << "," << d.N_cols << ","
       << d.rank_Q << ","
       << std::setprecision(6) << d.norm_Q << ","
@@ -508,11 +526,21 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
                             const Eigen::VectorXd &res, const Eigen::MatrixXd &R, VisualYawUpdateMode visual_yaw_update_mode,
                             double visual_yaw_update_scale, double visual_global_yaw_oc_alpha) {
 
-  // Dispatch: mode B — full-state current-yaw-gauge projected-gain update (K-space)
+  // Dispatch: mode B_current — Schmidt, gauge from current state
   if (visual_yaw_update_mode == VisualYawUpdateMode::VISUAL_YAW_SCHMIDT_CURRENT_GAUGE) {
     SchmidtYawDiag diag;
     diag.timestamp = state->_timestamp;
-    EKFUpdateSchmidtYawCurrentGauge(state, H_order, H, res, R, "visual", &diag);
+    diag.mode = "visual_yaw_schmidt_current_gauge";
+    EKFUpdateSchmidtYawCurrentGauge(state, H_order, H, res, R, "visual", &diag, false);
+    flush_schmidt_yaw_diag(diag);
+    return;
+  }
+  // Dispatch: mode B_FEJ — same Schmidt math, gauge from FEJ state
+  if (visual_yaw_update_mode == VisualYawUpdateMode::VISUAL_YAW_SCHMIDT_FEJ_GAUGE) {
+    SchmidtYawDiag diag;
+    diag.timestamp = state->_timestamp;
+    diag.mode = "visual_yaw_schmidt_fej_gauge";
+    EKFUpdateSchmidtYawCurrentGauge(state, H_order, H, res, R, "visual", &diag, true);
     flush_schmidt_yaw_diag(diag);
     return;
   }
@@ -729,7 +757,8 @@ void StateHelper::EKFUpdateSchmidtYawCurrentGauge(
     const Eigen::VectorXd &res,
     const Eigen::MatrixXd &R,
     const std::string &update_type,
-    SchmidtYawDiag *diag_out) {
+    SchmidtYawDiag *diag_out,
+    bool use_fej) {
 
   // =========================================================================
   // Full-state Schmidt / consider-state Kalman update.
@@ -779,7 +808,10 @@ void StateHelper::EKFUpdateSchmidtYawCurrentGauge(
   // Non-H_order variables contribute to the gauge but their H_full columns are
   // zero, so they don't affect the innovation; they DO receive corrections through
   // cross-covariance (the active subspace includes them).
-  Eigen::VectorXd Q_full = build_global_yaw_gauge_full(state, N);
+  if (diag_out)
+    diag_out->gauge_source = use_fej ? "fej" : "current";
+
+  Eigen::VectorXd Q_full = build_global_yaw_gauge_full(state, N, use_fej);
   double norm_Q = Q_full.norm();
 
   if (norm_Q < 1e-8) {
@@ -955,7 +987,7 @@ void StateHelper::EKFUpdateSchmidtYawCurrentGauge(
   // After applying dx_eff the IMU orientation has changed, so the yaw-gauge
   // direction q_new differs from q.  q_new^T P_plus q_new measures whether the
   // updated covariance still has low variance in the NEW gauge direction.
-  Eigen::VectorXd Q_full_new = build_global_yaw_gauge_full(state, N);
+  Eigen::VectorXd Q_full_new = build_global_yaw_gauge_full(state, N, use_fej);
   double norm_Q_new = Q_full_new.norm();
   double Pss_after_new_q = 0.0;
   if (norm_Q_new > 1e-8) {
