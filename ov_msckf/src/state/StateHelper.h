@@ -138,6 +138,10 @@ public:
     bool projection_applied = false;
     bool schmidt_applied = false;
     std::string skipped_reason;
+    // Cross-gauge diagnostics: "alt" = opposite source (current if FEJ mode, FEJ if current mode)
+    double rel_norm_Hq_alt    = 0.0;  // ||H q_alt_Horder|| / ||H||
+    double q_alt_dot_dx_eff   = 0.0;  // q_alt^T dx_eff (leakage into unprotected direction)
+    double angle_q_alt_deg    = 0.0;  // angle between q_used and q_alt (degrees)
   };
 
   /**

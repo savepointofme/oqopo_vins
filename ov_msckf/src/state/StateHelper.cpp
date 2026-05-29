@@ -373,7 +373,8 @@ void write_schmidt_yaw_diag_header() {
       << "q_energy_imu_ori,q_energy_imu_pos,q_energy_imu_vel,"
       << "q_energy_clone_ori,q_energy_clone_pos,q_energy_slam,q_energy_bias_calib,"
       << "neg_diag_clamp_count,min_cov_diag_before_clamp,min_cov_diag_after_update,"
-      << "projection_applied,schmidt_applied,skipped_reason\n";
+      << "projection_applied,schmidt_applied,skipped_reason,"
+      << "rel_norm_Hq_alt,q_alt_dot_dx_eff,angle_q_alt_deg\n";
   g_schmidt_yaw_diag_csv.flush();
   g_schmidt_yaw_diag_header_written = true;
 }
@@ -422,7 +423,10 @@ void flush_schmidt_yaw_diag(const StateHelper::SchmidtYawDiag &d) {
       << d.min_cov_diag_after_update << ","
       << (int)d.projection_applied << ","
       << (int)d.schmidt_applied << ","
-      << d.skipped_reason << "\n";
+      << d.skipped_reason << ","
+      << d.rel_norm_Hq_alt << ","
+      << d.q_alt_dot_dx_eff << ","
+      << d.angle_q_alt_deg << "\n";
   g_schmidt_yaw_diag_csv.flush();
 }
 
@@ -929,6 +933,29 @@ void StateHelper::EKFUpdateSchmidtYawCurrentGauge(
     if (diag_out) { diag_out->skipped_reason = "dx_eff_nan_inf"; }
     EKFUpdate(state, H_order, H, res, R, VisualYawUpdateMode::ORIGINAL, 1.0, 0.0);
     return;
+  }
+
+  // -- Cross-gauge diagnostics: build alt gauge (opposite source) -----------
+  // alt = current if using FEJ; alt = FEJ if using current.
+  // Must be computed before state is mutated (var->update).
+  if (diag_out) {
+    Eigen::VectorXd Q_alt = build_global_yaw_gauge_full(state, N, !use_fej);
+    double norm_Q_alt = Q_alt.norm();
+    if (norm_Q_alt > 1e-8) {
+      Eigen::VectorXd q_alt = Q_alt / norm_Q_alt;
+      // angle between q_used and q_alt
+      double cos_a = std::max(-1.0, std::min(1.0, q.dot(q_alt)));
+      diag_out->angle_q_alt_deg   = std::acos(cos_a) * (180.0 / M_PI);
+      // projection of dx_eff onto alt gauge (leakage)
+      diag_out->q_alt_dot_dx_eff  = q_alt.dot(dx_eff);
+      // ||H q_alt_Horder|| / ||H||
+      Eigen::VectorXd q_alt_Horder(n_H);
+      for (size_t k = 0; k < H_order.size(); k++)
+        q_alt_Horder.segment(H_id[k], H_order[k]->size()) =
+            q_alt.segment(H_order[k]->id(), H_order[k]->size());
+      double norm_Hq_alt = (H * q_alt_Horder).norm();
+      diag_out->rel_norm_Hq_alt = (norm_H > 1e-12) ? norm_Hq_alt / norm_H : 0.0;
+    }
   }
 
   // -- Pss and Pas diagnostics BEFORE update ---------------------------------
