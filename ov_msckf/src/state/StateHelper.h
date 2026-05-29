@@ -142,6 +142,19 @@ public:
     double rel_norm_Hq_alt    = 0.0;  // ||H q_alt_Horder|| / ||H||
     double q_alt_dot_dx_eff   = 0.0;  // q_alt^T dx_eff (leakage into unprotected direction)
     double angle_q_alt_deg    = 0.0;  // angle between q_used and q_alt (degrees)
+    // Three-gauge comparison: q_cur (current), q_fej (FEJ), q_mix (IMU-current + clone-FEJ)
+    double angle_q_cur_fej_deg  = 0.0; // angle(q_current, q_fej) — explicit, always current vs fej
+    double angle_q_cur_mix_deg  = 0.0; // angle(q_current, q_mixed)
+    double angle_q_fej_mix_deg  = 0.0; // angle(q_fej, q_mixed)
+    double q_mix_rel_norm_Hq    = 0.0; // ||H q_mixed|| / ||H||
+    double q_mix_dot_dx_eff     = 0.0; // q_mixed^T dx_eff
+    double q_mix_energy_imu_ori    = 0.0;
+    double q_mix_energy_imu_pos    = 0.0;
+    double q_mix_energy_imu_vel    = 0.0;
+    double q_mix_energy_clone_ori  = 0.0;
+    double q_mix_energy_clone_pos  = 0.0;
+    double q_mix_energy_slam       = 0.0;
+    double q_mix_energy_bias_calib = 0.0;
   };
 
   /**

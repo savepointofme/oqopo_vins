@@ -304,6 +304,31 @@ Eigen::VectorXd build_global_yaw_gauge_full(std::shared_ptr<State> state, int N,
   return n;
 }
 
+// Mixed gauge: IMU from current state, clones and landmarks from FEJ.
+// Used as a diagnostic probe to separate IMU-FEJ vs clone-FEJ contributions.
+Eigen::VectorXd build_global_yaw_gauge_mixed(std::shared_ptr<State> state, int N) {
+  Eigen::VectorXd n = Eigen::VectorXd::Zero(N);
+  if (state->_imu != nullptr) {
+    fill_pose_yaw_gauge(n, state->_imu->id(), state->_imu->size(),
+                        state->_imu->Rot(), state->_imu->pos(),   // IMU: current
+                        true, state->_imu->vel());
+  }
+  for (const auto &clone_pair : state->_clones_IMU) {
+    const auto &pose = clone_pair.second;
+    if (pose == nullptr) continue;
+    fill_pose_yaw_gauge(n, pose->id(), pose->size(),
+                        pose->Rot_fej(), pose->pos_fej(),          // clones: FEJ
+                        false, Eigen::Vector3d::Zero());
+  }
+  for (const auto &feat_pair : state->_features_SLAM) {
+    const auto &lm = feat_pair.second;
+    if (lm == nullptr) continue;
+    if (!LandmarkRepresentation::is_relative_representation(lm->_feat_representation))
+      fill_landmark_yaw_gauge(n, lm->id(), lm, true);             // landmarks: FEJ
+  }
+  return n;
+}
+
 Eigen::MatrixXd project_global_yaw_from_H(std::shared_ptr<State> state, const std::vector<std::shared_ptr<Type>> &H_order,
                                           const std::vector<int> &H_id, const Eigen::MatrixXd &H, double alpha) {
   alpha = std::max(0.0, std::min(1.0, alpha));
@@ -374,7 +399,12 @@ void write_schmidt_yaw_diag_header() {
       << "q_energy_clone_ori,q_energy_clone_pos,q_energy_slam,q_energy_bias_calib,"
       << "neg_diag_clamp_count,min_cov_diag_before_clamp,min_cov_diag_after_update,"
       << "projection_applied,schmidt_applied,skipped_reason,"
-      << "rel_norm_Hq_alt,q_alt_dot_dx_eff,angle_q_alt_deg\n";
+      << "rel_norm_Hq_alt,q_alt_dot_dx_eff,angle_q_alt_deg,"
+      << "angle_q_cur_fej_deg,angle_q_cur_mix_deg,angle_q_fej_mix_deg,"
+      << "q_mix_rel_norm_Hq,q_mix_dot_dx_eff,"
+      << "q_mix_energy_imu_ori,q_mix_energy_imu_pos,q_mix_energy_imu_vel,"
+      << "q_mix_energy_clone_ori,q_mix_energy_clone_pos,"
+      << "q_mix_energy_slam,q_mix_energy_bias_calib\n";
   g_schmidt_yaw_diag_csv.flush();
   g_schmidt_yaw_diag_header_written = true;
 }
@@ -426,7 +456,19 @@ void flush_schmidt_yaw_diag(const StateHelper::SchmidtYawDiag &d) {
       << d.skipped_reason << ","
       << d.rel_norm_Hq_alt << ","
       << d.q_alt_dot_dx_eff << ","
-      << d.angle_q_alt_deg << "\n";
+      << d.angle_q_alt_deg << ","
+      << d.angle_q_cur_fej_deg << ","
+      << d.angle_q_cur_mix_deg << ","
+      << d.angle_q_fej_mix_deg << ","
+      << d.q_mix_rel_norm_Hq << ","
+      << d.q_mix_dot_dx_eff << ","
+      << d.q_mix_energy_imu_ori << ","
+      << d.q_mix_energy_imu_pos << ","
+      << d.q_mix_energy_imu_vel << ","
+      << d.q_mix_energy_clone_ori << ","
+      << d.q_mix_energy_clone_pos << ","
+      << d.q_mix_energy_slam << ","
+      << d.q_mix_energy_bias_calib << "\n";
   g_schmidt_yaw_diag_csv.flush();
 }
 
@@ -935,27 +977,79 @@ void StateHelper::EKFUpdateSchmidtYawCurrentGauge(
     return;
   }
 
-  // -- Cross-gauge diagnostics: build alt gauge (opposite source) -----------
-  // alt = current if using FEJ; alt = FEJ if using current.
-  // Must be computed before state is mutated (var->update).
+  // -- Three-gauge comparison block (before state mutation) -----------------
+  // q_cur = full-state current gauge
+  // q_fej = full-state FEJ gauge
+  // q_mix = IMU-current + clone-FEJ + landmark-FEJ (isolates IMU-FEJ effect)
   if (diag_out) {
-    Eigen::VectorXd Q_alt = build_global_yaw_gauge_full(state, N, !use_fej);
-    double norm_Q_alt = Q_alt.norm();
-    if (norm_Q_alt > 1e-8) {
-      Eigen::VectorXd q_alt = Q_alt / norm_Q_alt;
-      // angle between q_used and q_alt
-      double cos_a = std::max(-1.0, std::min(1.0, q.dot(q_alt)));
-      diag_out->angle_q_alt_deg   = std::acos(cos_a) * (180.0 / M_PI);
-      // projection of dx_eff onto alt gauge (leakage)
-      diag_out->q_alt_dot_dx_eff  = q_alt.dot(dx_eff);
-      // ||H q_alt_Horder|| / ||H||
-      Eigen::VectorXd q_alt_Horder(n_H);
-      for (size_t k = 0; k < H_order.size(); k++)
-        q_alt_Horder.segment(H_id[k], H_order[k]->size()) =
-            q_alt.segment(H_order[k]->id(), H_order[k]->size());
-      double norm_Hq_alt = (H * q_alt_Horder).norm();
-      diag_out->rel_norm_Hq_alt = (norm_H > 1e-12) ? norm_Hq_alt / norm_H : 0.0;
+    Eigen::VectorXd Q_cur = build_global_yaw_gauge_full(state, N, false);
+    Eigen::VectorXd Q_fej = build_global_yaw_gauge_full(state, N, true);
+    Eigen::VectorXd Q_mix = build_global_yaw_gauge_mixed(state, N);
+
+    double n_cur = Q_cur.norm(), n_fej = Q_fej.norm(), n_mix = Q_mix.norm();
+    if (n_cur < 1e-8 || n_fej < 1e-8) goto skip_three_gauge;
+    {
+      Eigen::VectorXd q_cur = Q_cur / n_cur;
+      Eigen::VectorXd q_fej = Q_fej / n_fej;
+
+      auto angle_deg_fn = [](const Eigen::VectorXd &a, const Eigen::VectorXd &b) {
+        return std::acos(std::max(-1.0, std::min(1.0, a.dot(b)))) * (180.0 / M_PI);
+      };
+      auto rel_norm_Hq_fn = [&](const Eigen::VectorXd &qn) {
+        Eigen::VectorXd qH(n_H);
+        for (size_t k = 0; k < H_order.size(); k++)
+          qH.segment(H_id[k], H_order[k]->size()) =
+              qn.segment(H_order[k]->id(), H_order[k]->size());
+        return (norm_H > 1e-12) ? (H * qH).norm() / norm_H : 0.0;
+      };
+
+      // backward-compat alt-gauge fields (alt = opposite of used gauge)
+      const Eigen::VectorXd &q_alt = use_fej ? q_cur : q_fej;
+      diag_out->angle_q_alt_deg  = angle_deg_fn(q, q_alt);
+      diag_out->q_alt_dot_dx_eff = q_alt.dot(dx_eff);
+      diag_out->rel_norm_Hq_alt  = rel_norm_Hq_fn(q_alt);
+
+      // explicit current-vs-FEJ angle (same as angle_q_alt_deg in magnitude,
+      // but always labeled as current-vs-fej regardless of mode)
+      diag_out->angle_q_cur_fej_deg = angle_deg_fn(q_cur, q_fej);
+
+      if (n_mix > 1e-8) {
+        Eigen::VectorXd q_mix = Q_mix / n_mix;
+        diag_out->angle_q_cur_mix_deg = angle_deg_fn(q_cur, q_mix);
+        diag_out->angle_q_fej_mix_deg = angle_deg_fn(q_fej, q_mix);
+        diag_out->q_mix_dot_dx_eff    = q_mix.dot(dx_eff);
+        diag_out->q_mix_rel_norm_Hq   = rel_norm_Hq_fn(q_mix);
+
+        // q_mix energy decomposition
+        double &ei = diag_out->q_mix_energy_imu_ori,
+               &ep = diag_out->q_mix_energy_imu_pos,
+               &ev = diag_out->q_mix_energy_imu_vel,
+               &co = diag_out->q_mix_energy_clone_ori,
+               &cp = diag_out->q_mix_energy_clone_pos,
+               &sl = diag_out->q_mix_energy_slam,
+               &bc = diag_out->q_mix_energy_bias_calib;
+        ei = ep = ev = co = cp = sl = bc = 0.0;
+        if (state->_imu) {
+          int id = state->_imu->id();
+          ei = q_mix.segment(id,   3).squaredNorm();
+          ep = q_mix.segment(id+3, 3).squaredNorm();
+          ev = q_mix.segment(id+6, 3).squaredNorm();
+        }
+        for (const auto &pr : state->_clones_IMU) {
+          const auto &pose = pr.second;
+          if (!pose || pose->id() < 0) continue;
+          co += q_mix.segment(pose->id(),   3).squaredNorm();
+          cp += q_mix.segment(pose->id()+3, 3).squaredNorm();
+        }
+        for (const auto &pr : state->_features_SLAM) {
+          const auto &lm = pr.second;
+          if (!lm || lm->id() < 0 || lm->id() + lm->size() > N) continue;
+          sl += q_mix.segment(lm->id(), lm->size()).squaredNorm();
+        }
+        bc = std::max(0.0, 1.0 - ei - ep - ev - co - cp - sl);
+      }
     }
+    skip_three_gauge:;
   }
 
   // -- Pss and Pas diagnostics BEFORE update ---------------------------------
