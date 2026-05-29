@@ -141,6 +141,10 @@ struct Args {
   double vio_yaw_update_scale = std::numeric_limits<double>::quiet_NaN();
   double vio_global_yaw_oc_alpha = std::numeric_limits<double>::quiet_NaN();
   double vio_yaw_control_start_after_init = 0.0; // seconds; 0 = apply requested yaw control immediately
+  // Timed B→A staged switch (D variants)
+  std::string vio_yaw_switch_mode;              // --vio-yaw-switch-mode: switch to this mode at vio_yaw_switch_time
+  double vio_yaw_switch_time = -1.0;            // --vio-yaw-switch-time: absolute timestamp (s) for switch
+  double vio_yaw_switch_alpha = std::numeric_limits<double>::quiet_NaN(); // --vio-yaw-switch-alpha
   std::string vio_yaw_diag_path;           // per-visual-update yaw CSV
   std::string visual_obs_diag_path;        // VisualObservabilityPolicy per-update CSV
   std::string schmidt_yaw_diag_path;       // Schmidt yaw update diagnostics CSV
@@ -229,9 +233,13 @@ void print_help() {
                "  --verbose             Print per-frame timing\n"
                "  --no-vio-yaw-update   Alias for --vio-yaw-update-scale 0.0\n"
                "  --vio-yaw-update-mode M   original|per_block_scale|global_yaw_oc_projection|current_only_scale|hard_gyro_yaw|a_strict_yaw_dx0\n"
+               "                            visual_yaw_schmidt_current_gauge|visual_yaw_schmidt_fej_gauge\n"
                "  --vio-yaw-update-scale S  Scale visual yaw correction for *_scale modes (1=orig, 0=off)\n"
                "  --vio-global-yaw-oc-alpha A  H-projection alpha for global_yaw_oc_projection (0=orig, 1=full)\n"
                "  --vio-yaw-control-start-after-init S  Delay requested visual yaw control until S seconds after init\n"
+               "  --vio-yaw-switch-mode M   After --vio-yaw-switch-time, switch to this mode (staged B→A)\n"
+               "  --vio-yaw-switch-time T   Absolute timestamp (s) to switch yaw mode (D1–D4 variants)\n"
+               "  --vio-yaw-switch-alpha A  Alpha for the switched-to mode (e.g. 1.0 for global_yaw_oc_projection)\n"
                "  --vio-yaw-diag PATH   Write per-MSCKF/SLAM yaw update CSV\n"
                "  --visual-obs-diag PATH  Write VisualObservabilityPolicy diagnostics CSV\n"
                "  --visual-update-skip-window T0 T1  Skip visual EKF updates in [T0,T1] seconds (ablation)\n"
@@ -321,6 +329,9 @@ bool parse_args(int argc, char **argv, Args &a) {
     else if (s == "--vio-global-yaw-oc-alpha") a.vio_global_yaw_oc_alpha = std::atof(next("--vio-global-yaw-oc-alpha").c_str());
     else if (s == "--vio-global-yaw-schmidt-alpha") a.vio_global_yaw_oc_alpha = std::atof(next("--vio-global-yaw-schmidt-alpha").c_str());
     else if (s == "--vio-yaw-control-start-after-init") a.vio_yaw_control_start_after_init = std::atof(next("--vio-yaw-control-start-after-init").c_str());
+    else if (s == "--vio-yaw-switch-mode") a.vio_yaw_switch_mode = next("--vio-yaw-switch-mode");
+    else if (s == "--vio-yaw-switch-time") a.vio_yaw_switch_time = std::atof(next("--vio-yaw-switch-time").c_str());
+    else if (s == "--vio-yaw-switch-alpha") a.vio_yaw_switch_alpha = std::atof(next("--vio-yaw-switch-alpha").c_str());
     else if (s == "--vio-yaw-diag") a.vio_yaw_diag_path = next("--vio-yaw-diag");
     else if (s == "--visual-obs-diag") a.visual_obs_diag_path = next("--visual-obs-diag");
     else if (s == "--schmidt-yaw-diag") a.schmidt_yaw_diag_path = next("--schmidt-yaw-diag");
@@ -474,6 +485,12 @@ int main(int argc, char **argv) {
   }
   auto sys = std::make_shared<VioManager>(params);
   bool delayed_vio_yaw_control_applied = !delayed_vio_yaw_control;
+  bool timed_yaw_switch_applied = args.vio_yaw_switch_mode.empty() || args.vio_yaw_switch_time < 0.0;
+  if (!timed_yaw_switch_applied) {
+    PRINT_INFO(CYAN "[ros-free] timed yaw switch: at t=%.3f switch to mode=%s alpha=%.3f\n" RESET,
+               args.vio_yaw_switch_time, args.vio_yaw_switch_mode.c_str(),
+               std::isnan(args.vio_yaw_switch_alpha) ? -1.0 : args.vio_yaw_switch_alpha);
+  }
 
   // Visual update guard (--visual-update-skip-window / --visual-update-guard-log / --visual-update-reject-topn-file)
   if (args.visual_skip_t0 >= 0.0 && args.visual_skip_t1 > args.visual_skip_t0) {
@@ -854,6 +871,15 @@ int main(int argc, char **argv) {
         PRINT_INFO(CYAN "[ros-free] delayed VIO yaw control ENABLED at t=%.3f (dt_init=%.1fs): mode=%s scale=%.3f alpha=%.3f\n" RESET,
                    t_cam, t_cam - t_init_done, delayed_vio_yaw_mode.c_str(),
                    delayed_vio_yaw_scale, delayed_vio_yaw_alpha);
+      }
+      if (!timed_yaw_switch_applied && t_cam >= args.vio_yaw_switch_time) {
+        sys->set_vio_yaw_update_mode(args.vio_yaw_switch_mode);
+        if (!std::isnan(args.vio_yaw_switch_alpha))
+          sys->set_vio_global_yaw_oc_alpha(args.vio_yaw_switch_alpha);
+        timed_yaw_switch_applied = true;
+        PRINT_INFO(CYAN "[ros-free] TIMED YAW SWITCH at t=%.3f -> mode=%s alpha=%.3f\n" RESET,
+                   t_cam, args.vio_yaw_switch_mode.c_str(),
+                   std::isnan(args.vio_yaw_switch_alpha) ? -1.0 : args.vio_yaw_switch_alpha);
       }
 
       // [中文] GPS 高度 EKF 更新: 仅在 --gps-alt-update 开启且加载了 GPS 数据时
