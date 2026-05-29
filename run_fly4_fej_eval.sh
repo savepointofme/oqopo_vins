@@ -11,8 +11,8 @@ FC=$BASE/canonical_offsetm202p2_start904p4/fc_init_state_904p4_offsetm202p2.csv
 CONFIG=/mnt/d/vscode_dir/open_vins/config/d455_fly2/estimator_config_cond_1e5.yaml
 BIN=./build_ov_msckf/run_serial_msckf_ros_free
 IMU=$DATASET/imu0/data.csv
-RUN_START=904.4    # matches FC init timestamp
-EVAL_T0=924.4      # skip 20s init transient in eval
+RUN_START=924.4
+EVAL_T0=924.4
 UNTIL=2816
 
 # Reuse existing A baseline (already run from 904.4 based on dir name)
@@ -20,7 +20,7 @@ DIR_A=$BASE/yaw_method_ablation_offsetm202p2_start904p4_gpsz_viz/global_oc_alpha
 # Reuse existing B_current (run from 924.4 — note start mismatch vs A; diagnostic only)
 DIR_B=$BASE/fly4_schmidt_B_offsetm202p2_start924p4_until2816
 # New B_FEJ run (from 904.4 to match A)
-DIR_BFEJ=$BASE/fly4_B_fej_gauge_start904p4_until2816
+DIR_BFEJ=$BASE/fly4_B_fej_gauge_start924p4_until2816
 
 echo "[fly4-fej] start $(date)  HEAD=$(git rev-parse HEAD)"
 
@@ -73,7 +73,7 @@ else
 fi
 
 # Also run B_current from 904.4 for fair comparison with B_FEJ
-DIR_BCUR=$BASE/fly4_B_current_gauge_start904p4_until2816
+DIR_BCUR=$BASE/fly4_B_current_gauge_start924p4_until2816
 if traj_complete "$DIR_BCUR"; then
   echo "[skip B_current/904.4] complete"
 else
@@ -123,9 +123,9 @@ UNTIL = 2816.0
 
 DIRS = {
   'A (904.4)':         f'{BASE}/yaw_method_ablation_offsetm202p2_start904p4_gpsz_viz/global_oc_alpha1',
-  'B_current (924.4)': f'{BASE}/fly4_schmidt_B_offsetm202p2_start924p4_until2816',
-  'B_current (904.4)': f'{BASE}/fly4_B_current_gauge_start904p4_until2816',
-  'B_FEJ (904.4)':     f'{BASE}/fly4_B_fej_gauge_start904p4_until2816',
+  'B_current_orig':    f'{BASE}/fly4_schmidt_B_offsetm202p2_start924p4_until2816',
+  'B_current (924.4)': f'{BASE}/fly4_B_current_gauge_start924p4_until2816',
+  'B_FEJ (924.4)':     f'{BASE}/fly4_B_fej_gauge_start924p4_until2816',
 }
 
 print(f"{'Run':22s}  {'lines':>7s}  {'last_t':>8s}  {'complete':>10s}")
