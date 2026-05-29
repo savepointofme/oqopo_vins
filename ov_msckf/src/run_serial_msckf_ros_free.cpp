@@ -141,6 +141,7 @@ struct Args {
   double vio_yaw_update_scale = std::numeric_limits<double>::quiet_NaN();
   double vio_global_yaw_oc_alpha = std::numeric_limits<double>::quiet_NaN();
   double vio_yaw_control_start_after_init = 0.0; // seconds; 0 = apply requested yaw control immediately
+  double visual_bgz_update_scale = 1.0;          // --visual-bgz-update-scale: scale bg_z row of visual K
   // Timed B→A staged switch (D variants)
   std::string vio_yaw_switch_mode;              // --vio-yaw-switch-mode: switch to this mode at vio_yaw_switch_time
   double vio_yaw_switch_time = -1.0;            // --vio-yaw-switch-time: absolute timestamp (s) for switch
@@ -237,6 +238,7 @@ void print_help() {
                "  --vio-yaw-update-scale S  Scale visual yaw correction for *_scale modes (1=orig, 0=off)\n"
                "  --vio-global-yaw-oc-alpha A  H-projection alpha for global_yaw_oc_projection (0=orig, 1=full)\n"
                "  --vio-yaw-control-start-after-init S  Delay requested visual yaw control until S seconds after init\n"
+               "  --visual-bgz-update-scale S  Scale bg_z row of visual K_eff (1.0=normal, 0.0=freeze bg_z from visual)\n"
                "  --vio-yaw-switch-mode M   After --vio-yaw-switch-time, switch to this mode (staged B→A)\n"
                "  --vio-yaw-switch-time T   Absolute timestamp (s) to switch yaw mode (D1–D4 variants)\n"
                "  --vio-yaw-switch-alpha A  Alpha for the switched-to mode (e.g. 1.0 for global_yaw_oc_projection)\n"
@@ -329,6 +331,7 @@ bool parse_args(int argc, char **argv, Args &a) {
     else if (s == "--vio-global-yaw-oc-alpha") a.vio_global_yaw_oc_alpha = std::atof(next("--vio-global-yaw-oc-alpha").c_str());
     else if (s == "--vio-global-yaw-schmidt-alpha") a.vio_global_yaw_oc_alpha = std::atof(next("--vio-global-yaw-schmidt-alpha").c_str());
     else if (s == "--vio-yaw-control-start-after-init") a.vio_yaw_control_start_after_init = std::atof(next("--vio-yaw-control-start-after-init").c_str());
+    else if (s == "--visual-bgz-update-scale") a.visual_bgz_update_scale = std::atof(next("--visual-bgz-update-scale").c_str());
     else if (s == "--vio-yaw-switch-mode") a.vio_yaw_switch_mode = next("--vio-yaw-switch-mode");
     else if (s == "--vio-yaw-switch-time") a.vio_yaw_switch_time = std::atof(next("--vio-yaw-switch-time").c_str());
     else if (s == "--vio-yaw-switch-alpha") a.vio_yaw_switch_alpha = std::atof(next("--vio-yaw-switch-alpha").c_str());
@@ -448,6 +451,11 @@ int main(int argc, char **argv) {
     params.vio_global_yaw_oc_alpha = std::max(0.0, std::min(1.0, args.vio_global_yaw_oc_alpha));
     PRINT_INFO(CYAN "[ros-free] CLI override: vio_global_yaw_oc_alpha=%.3f\n" RESET,
                params.vio_global_yaw_oc_alpha);
+  }
+  if (args.visual_bgz_update_scale < 1.0 - 1e-12) {
+    params.visual_bgz_update_scale = std::max(0.0, std::min(1.0, args.visual_bgz_update_scale));
+    PRINT_INFO(CYAN "[ros-free] CLI override: visual_bgz_update_scale=%.4f\n" RESET,
+               params.visual_bgz_update_scale);
   }
   if (!args.vio_yaw_diag_path.empty()) {
     params.vio_yaw_update_diag_path = args.vio_yaw_diag_path;

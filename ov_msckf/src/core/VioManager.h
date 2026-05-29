@@ -228,6 +228,7 @@ public:
   void set_vio_yaw_update_mode(const std::string &mode);
   void set_vio_yaw_update_scale(double scale);
   void set_vio_global_yaw_oc_alpha(double alpha);
+  void set_visual_bgz_update_scale(double scale);
 
   /// Open/replace the per-visual-update yaw diagnostic CSV.
   void set_vio_yaw_update_diag_path(const std::string &path);

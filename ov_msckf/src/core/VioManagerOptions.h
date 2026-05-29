@@ -132,6 +132,9 @@ struct VioManagerOptions {
   /// Alpha for global-yaw OC H projection. 0.0 original, 1.0 full suppression.
   double vio_global_yaw_oc_alpha = 0.0;
 
+  /// Scale for the bg_z row of visual-update gain K.  1.0=normal, 0.0=freeze bg_z from visual updates.
+  double visual_bgz_update_scale = 1.0;
+
   /// If non-empty, write per-visual-update yaw deltas to this CSV file.
   std::string vio_yaw_update_diag_path = "";
 

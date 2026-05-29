@@ -570,14 +570,15 @@ void StateHelper::EKFPropagation(std::shared_ptr<State> state, const std::vector
 
 void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std::shared_ptr<Type>> &H_order, const Eigen::MatrixXd &H,
                             const Eigen::VectorXd &res, const Eigen::MatrixXd &R, VisualYawUpdateMode visual_yaw_update_mode,
-                            double visual_yaw_update_scale, double visual_global_yaw_oc_alpha) {
+                            double visual_yaw_update_scale, double visual_global_yaw_oc_alpha,
+                            double visual_bgz_update_scale) {
 
   // Dispatch: mode B_current — Schmidt, gauge from current state
   if (visual_yaw_update_mode == VisualYawUpdateMode::VISUAL_YAW_SCHMIDT_CURRENT_GAUGE) {
     SchmidtYawDiag diag;
     diag.timestamp = state->_timestamp;
     diag.mode = "visual_yaw_schmidt_current_gauge";
-    EKFUpdateSchmidtYawCurrentGauge(state, H_order, H, res, R, "visual", &diag, false);
+    EKFUpdateSchmidtYawCurrentGauge(state, H_order, H, res, R, "visual", &diag, false, visual_bgz_update_scale);
     flush_schmidt_yaw_diag(diag);
     return;
   }
@@ -586,7 +587,7 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
     SchmidtYawDiag diag;
     diag.timestamp = state->_timestamp;
     diag.mode = "visual_yaw_schmidt_fej_gauge";
-    EKFUpdateSchmidtYawCurrentGauge(state, H_order, H, res, R, "visual", &diag, true);
+    EKFUpdateSchmidtYawCurrentGauge(state, H_order, H, res, R, "visual", &diag, true, visual_bgz_update_scale);
     flush_schmidt_yaw_diag(diag);
     return;
   }
@@ -663,6 +664,14 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
   S.selfadjointView<Eigen::Upper>().llt().solveInPlace(Sinv);
   Eigen::MatrixXd K = M_a * Sinv.selfadjointView<Eigen::Upper>();
   // Eigen::MatrixXd K = M_a * S.inverse();
+
+  // Scale bg_z row of K for visual bg_z ablation (default scale=1.0 = no change)
+  if (visual_bgz_update_scale < 1.0 - 1e-12 &&
+      state->_imu != nullptr && state->_imu->bg() != nullptr) {
+    int bgz_row = state->_imu->bg()->id() + 2;
+    if (bgz_row >= 0 && bgz_row < (int)K.rows())
+      K.row(bgz_row) *= visual_bgz_update_scale;
+  }
 
   // Update Covariance
   state->_Cov.triangularView<Eigen::Upper>() -= K * M_a.transpose();
@@ -804,7 +813,8 @@ void StateHelper::EKFUpdateSchmidtYawCurrentGauge(
     const Eigen::MatrixXd &R,
     const std::string &update_type,
     SchmidtYawDiag *diag_out,
-    bool use_fej) {
+    bool use_fej,
+    double bgz_scale) {
 
   // =========================================================================
   // Full-state Schmidt / consider-state Kalman update.
@@ -957,6 +967,14 @@ void StateHelper::EKFUpdateSchmidtYawCurrentGauge(
   Eigen::RowVectorXd qT_Kstd = q.transpose() * K_std;   // 1 × m
   Eigen::MatrixXd K_eff = K_std;
   K_eff.noalias() -= q * qT_Kstd;   // N × m
+
+  // Scale bg_z row (visual bg_z ablation; bgz_scale=1.0 = no change)
+  if (bgz_scale < 1.0 - 1e-12 &&
+      state->_imu != nullptr && state->_imu->bg() != nullptr) {
+    int bgz_row = state->_imu->bg()->id() + 2;
+    if (bgz_row >= 0 && bgz_row < N)
+      K_eff.row(bgz_row) *= bgz_scale;
+  }
 
   // -- Diagnostics: normal EKF dx_s coefficient (what standard EKF would give)
   Eigen::VectorXd dx_normal   = K_std * res;

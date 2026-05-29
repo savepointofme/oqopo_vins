@@ -281,6 +281,10 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   updaterSLAM = std::make_shared<UpdaterSLAM>(params.slam_options, params.aruco_options, params.featinit_options);
   apply_yaw_control_to_updaters(params.vio_yaw_update_mode, params.vio_yaw_update_scale,
                                 params.vio_global_yaw_oc_alpha, updaterMSCKF, updaterSLAM);
+  if (params.visual_bgz_update_scale < 1.0 - 1e-12) {
+    updaterMSCKF->set_visual_bgz_update_scale(params.visual_bgz_update_scale);
+    updaterSLAM->set_visual_bgz_update_scale(params.visual_bgz_update_scale);
+  }
 
   // If we are using zero velocity updates, then create the updater
   if (params.try_zupt) {
@@ -932,6 +936,15 @@ void VioManager::set_vio_global_yaw_oc_alpha(double alpha) {
   if (updaterGPlaneFeatureV1)
     updaterGPlaneFeatureV1->set_visual_yaw_update_control(m, params.vio_yaw_update_scale,
                                                           params.vio_global_yaw_oc_alpha);
+}
+
+void VioManager::set_visual_bgz_update_scale(double scale) {
+  params.visual_bgz_update_scale = std::max(0.0, std::min(1.0, scale));
+  if (updaterMSCKF)
+    updaterMSCKF->set_visual_bgz_update_scale(params.visual_bgz_update_scale);
+  if (updaterSLAM)
+    updaterSLAM->set_visual_bgz_update_scale(params.visual_bgz_update_scale);
+  PRINT_INFO(CYAN "[VioManager] visual_bgz_update_scale=%.4f\n" RESET, params.visual_bgz_update_scale);
 }
 
 void VioManager::set_vio_yaw_update_diag_path(const std::string &path) {

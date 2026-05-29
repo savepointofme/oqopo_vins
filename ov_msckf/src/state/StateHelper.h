@@ -201,7 +201,8 @@ public:
                         const Eigen::VectorXd &res, const Eigen::MatrixXd &R,
                         VisualYawUpdateMode visual_yaw_update_mode = VisualYawUpdateMode::ORIGINAL,
                         double visual_yaw_update_scale = 1.0,
-                        double visual_global_yaw_oc_alpha = 0.0);
+                        double visual_global_yaw_oc_alpha = 0.0,
+                        double visual_bgz_update_scale = 1.0);
 
   static void reset_last_yaw_dx_projection_diag();
 
@@ -277,7 +278,8 @@ public:
       const Eigen::MatrixXd &R,
       const std::string &update_type = "visual",
       SchmidtYawDiag *diag_out = nullptr,
-      bool use_fej = false);
+      bool use_fej = false,
+      double bgz_scale = 1.0);
 
   /// Open (or re-open) the per-update Schmidt yaw diagnostic CSV.
   static void open_schmidt_yaw_diag_csv(const std::string &path);

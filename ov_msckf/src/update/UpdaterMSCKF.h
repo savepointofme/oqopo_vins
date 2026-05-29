@@ -102,6 +102,7 @@ public:
     visual_yaw_update_scale_ = scale;
     visual_global_yaw_oc_alpha_ = global_alpha;
   }
+  void set_visual_bgz_update_scale(double s) { visual_bgz_update_scale_ = s; }
 
   void set_visual_observability_policy(std::shared_ptr<VisualObservabilityPolicy> policy) {
     vop_ = policy;
@@ -156,6 +157,7 @@ protected:
   StateHelper::VisualYawUpdateMode visual_yaw_update_mode_ = StateHelper::VisualYawUpdateMode::ORIGINAL;
   double visual_yaw_update_scale_ = 1.0;
   double visual_global_yaw_oc_alpha_ = 0.0;
+  double visual_bgz_update_scale_ = 1.0;
 
   std::shared_ptr<VisualObservabilityPolicy> vop_;
 };
