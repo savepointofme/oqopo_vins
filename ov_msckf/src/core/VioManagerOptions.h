@@ -138,6 +138,9 @@ struct VioManagerOptions {
   /// If non-empty, write VisualObservabilityPolicy per-update diagnostics here.
   std::string visual_obs_diag_path = "";
 
+  /// If non-empty, write per-visual-update Schmidt yaw diagnostics to this CSV file.
+  std::string schmidt_yaw_diag_path = "";
+
   /**
    * @brief This function will load print out all estimator settings loaded.
    * This allows for visual checking that everything was loaded properly from ROS/CMD parsers.
@@ -165,6 +168,7 @@ struct VioManagerOptions {
       parser->parse_config("vio_global_yaw_oc_alpha", vio_global_yaw_oc_alpha, false);
       parser->parse_config("vio_global_yaw_schmidt_alpha", vio_global_yaw_oc_alpha, false);
       parser->parse_config("vio_yaw_update_diag_path", vio_yaw_update_diag_path, false);
+      parser->parse_config("schmidt_yaw_diag_path", schmidt_yaw_diag_path, false);
     }
     if (!enable_vio_yaw_update) {
       vio_yaw_update_mode = "per_block_scale";

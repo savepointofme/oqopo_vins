@@ -235,6 +235,9 @@ public:
   /// Open/replace the visual observability diagnostic CSV.
   void set_visual_obs_diag_path(const std::string &path);
 
+  /// Open/replace the Schmidt yaw diagnostic CSV.
+  void set_schmidt_yaw_diag_path(const std::string &path);
+
   /// Per-call diagnostic snapshot populated by every GPS altitude update.
   struct GpsAltLastUpdate {
     double t = -1.0;

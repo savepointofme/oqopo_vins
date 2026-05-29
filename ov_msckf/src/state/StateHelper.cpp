@@ -28,7 +28,10 @@
 #include "utils/print.h"
 
 #include <algorithm>
+#include <boost/filesystem.hpp>
 #include <boost/math/distributions/chi_squared.hpp>
+#include <fstream>
+#include <iomanip>
 #include <set>
 
 using namespace ov_core;
@@ -173,6 +176,117 @@ Eigen::VectorXd build_global_yaw_gauge_small(std::shared_ptr<State> state, const
   return n;
 }
 
+// Once-per-process flag for the gauge-coverage diagnostic print.
+bool g_gauge_full_diag_printed = false;
+
+// Build the global yaw gauge over the FULL state vector.
+// Unlike build_global_yaw_gauge_small (which only covers H_order variables), this version
+// covers every variable in the filter so that the Schmidt subspace is properly defined
+// in the complete N-dimensional state space.
+//
+// N is passed in (= state->_Cov.rows()) since _Cov is private and this function
+// lives in the anonymous namespace.  The caller (a StateHelper static member) can
+// access it.
+//
+// Iteration order: IMU, all clones, all SLAM features.
+// Camera extrinsics / intrinsics / time-offset: gauge = 0 (relative/scalar quantities).
+//
+// On the first call a summary is printed via PRINT_INFO to confirm coverage and flag any
+// composite-variable duplication.
+Eigen::VectorXd build_global_yaw_gauge_full(std::shared_ptr<State> state, int N) {
+  Eigen::VectorXd n = Eigen::VectorXd::Zero(N);
+
+  bool imu_covered  = false;
+  int  n_clones     = 0;
+  int  n_slam       = 0;
+  int  n_slam_skip  = 0;   // relative/anchored landmarks (gauge not defined)
+
+  // IMU state (q + p + v + bg + ba).
+  // fill_pose_yaw_gauge with has_velocity=true fills q(3), p(3), v(3); bg and ba remain 0.
+  // The IMU composite variable id() points to the start of its 15-DOF block.
+  // No sub-variables (q/p/v/bg/ba individually) appear in _variables when the composite is used,
+  // so there is no risk of double-fill.
+  if (state->_imu != nullptr) {
+    fill_pose_yaw_gauge(n, state->_imu->id(), state->_imu->size(),
+                        state->_imu->Rot(), state->_imu->pos(),
+                        true, state->_imu->vel());
+    imu_covered = true;
+  }
+
+  // All camera clones (PoseJPL, 6-DOF: q + p).
+  for (const auto &clone_pair : state->_clones_IMU) {
+    const auto &pose = clone_pair.second;
+    if (pose == nullptr) continue;
+    fill_pose_yaw_gauge(n, pose->id(), pose->size(),
+                        pose->Rot(), pose->pos(),
+                        false, Eigen::Vector3d::Zero());
+    n_clones++;
+  }
+
+  // SLAM features.
+  // fill_landmark_yaw_gauge internally skips relative representations.
+  for (const auto &feat_pair : state->_features_SLAM) {
+    const auto &lm = feat_pair.second;
+    if (lm == nullptr) continue;
+    if (LandmarkRepresentation::is_relative_representation(lm->_feat_representation)) {
+      n_slam_skip++;
+    } else {
+      fill_landmark_yaw_gauge(n, lm->id(), lm);
+      n_slam++;
+    }
+  }
+
+  // Camera extrinsics (relative sensor transform), intrinsics, time offset:
+  // gauge contribution = 0.  These are already zeroed in n; nothing to do.
+  // Calibration scalars (IMU intrinsics): gauge = 0 by the same reasoning.
+
+  // ---- one-time diagnostic summary ----------------------------------------
+  if (!g_gauge_full_diag_printed) {
+    g_gauge_full_diag_printed = true;
+
+    // Count nonzero entries in n to confirm actual fill.
+    int n_nonzero = 0;
+    for (int i = 0; i < N; i++)
+      if (n(i) != 0.0) n_nonzero++;
+
+    // Count extrinsic / intrinsic / time-offset DOFs (zero gauge).
+    int n_zero_calib_dof = 0;
+    for (const auto &kv : state->_calib_IMUtoCAM)
+      if (kv.second) n_zero_calib_dof += kv.second->size();
+    for (const auto &kv : state->_cam_intrinsics)
+      if (kv.second) n_zero_calib_dof += kv.second->size();
+    if (state->_calib_dt_CAMtoIMU)
+      n_zero_calib_dof += state->_calib_dt_CAMtoIMU->size();
+    int n_slam_skip_dof = 0;
+    for (const auto &fp : state->_features_SLAM)
+      if (fp.second && LandmarkRepresentation::is_relative_representation(
+                           fp.second->_feat_representation))
+        n_slam_skip_dof += fp.second->size();
+
+    PRINT_INFO(GREEN
+               "[SCHMIDT-YAW] gauge_full first-call summary:\n"
+               "  cov_dim N         = %d\n"
+               "  q_full nonzero    = %d\n"
+               "  IMU covered       = %s  (id=%d size=%d)\n"
+               "  clone count       = %d\n"
+               "  SLAM global       = %d (filled)\n"
+               "  SLAM relative     = %d (skipped, gauge=0, %d DOF)\n"
+               "  cam_extr/intr/dt  = 0 (gauge=0, %d DOF)\n"
+               "  q_full norm       = %.6f\n"
+               RESET,
+               N, n_nonzero,
+               imu_covered ? "YES" : "NO",
+               state->_imu ? state->_imu->id() : -1,
+               state->_imu ? state->_imu->size() : 0,
+               n_clones,
+               n_slam, n_slam_skip, n_slam_skip_dof,
+               n_zero_calib_dof,
+               n.norm());
+  }
+
+  return n;
+}
+
 Eigen::MatrixXd project_global_yaw_from_H(std::shared_ptr<State> state, const std::vector<std::shared_ptr<Type>> &H_order,
                                           const std::vector<int> &H_id, const Eigen::MatrixXd &H, double alpha) {
   alpha = std::max(0.0, std::min(1.0, alpha));
@@ -225,6 +339,63 @@ void zero_visual_yaw_dx(std::shared_ptr<State> state, Eigen::VectorXd &dx, bool 
     if (bg_id >= 0 && bg_id + 2 < dx.rows())
       dx(bg_id + 2) = 0.0;
   }
+}
+
+// ---- Schmidt yaw diagnostics CSV ----
+std::ofstream g_schmidt_yaw_diag_csv;
+bool g_schmidt_yaw_diag_header_written = false;
+
+void write_schmidt_yaw_diag_header() {
+  g_schmidt_yaw_diag_csv
+      << "timestamp,update_type,mode,H_rows,H_cols,N_cols,rank_Q,norm_Q,condition_N,"
+      << "norm_HQ,rel_norm_HQ,normal_dx_s_coeff_before,schmidt_dx_s_coeff_after,"
+      << "norm_dx_normal,norm_dx_schmidt,norm_delta_dx,"
+      << "Pss_norm_before,Pss_norm_after,Pss_change_norm,Pas_change_norm,"
+      << "yaw_before_update,yaw_after_update,delta_yaw_update,"
+      << "bg_z_before,bg_z_after,projection_applied,schmidt_applied,skipped_reason\n";
+  g_schmidt_yaw_diag_csv.flush();
+  g_schmidt_yaw_diag_header_written = true;
+}
+
+void flush_schmidt_yaw_diag(const StateHelper::SchmidtYawDiag &d) {
+  if (!g_schmidt_yaw_diag_csv.is_open())
+    return;
+  if (!g_schmidt_yaw_diag_header_written)
+    write_schmidt_yaw_diag_header();
+  g_schmidt_yaw_diag_csv
+      << std::fixed << std::setprecision(9) << d.timestamp << ","
+      << d.update_type << ","
+      << d.mode << ","
+      << d.H_rows << "," << d.H_cols << "," << d.N_cols << ","
+      << d.rank_Q << ","
+      << std::setprecision(6) << d.norm_Q << ","
+      << d.condition_N << ","
+      << d.norm_HQ << ","
+      << d.rel_norm_HQ << ","
+      << d.normal_dx_s_coeff_before << ","
+      << d.schmidt_dx_s_coeff_after << ","
+      << d.norm_dx_normal << ","
+      << d.norm_dx_schmidt << ","
+      << d.norm_delta_dx << ","
+      << d.Pss_norm_before << ","
+      << d.Pss_norm_after << ","
+      << d.Pss_change_norm << ","
+      << d.Pas_change_norm << ","
+      << d.yaw_before_update << ","
+      << d.yaw_after_update << ","
+      << d.delta_yaw_update << ","
+      << d.bg_z_before << ","
+      << d.bg_z_after << ","
+      << (int)d.projection_applied << ","
+      << (int)d.schmidt_applied << ","
+      << d.skipped_reason << "\n";
+  g_schmidt_yaw_diag_csv.flush();
+}
+
+double extract_imu_yaw_rad(std::shared_ptr<State> state) {
+  Eigen::Matrix3d R_GtoI = state->_imu->Rot();
+  Eigen::Matrix3d R_ItoG = R_GtoI.transpose();
+  return std::atan2(R_ItoG(1, 0), R_ItoG(0, 0));
 }
 
 } // namespace
@@ -320,6 +491,15 @@ void StateHelper::EKFPropagation(std::shared_ptr<State> state, const std::vector
 void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std::shared_ptr<Type>> &H_order, const Eigen::MatrixXd &H,
                             const Eigen::VectorXd &res, const Eigen::MatrixXd &R, VisualYawUpdateMode visual_yaw_update_mode,
                             double visual_yaw_update_scale, double visual_global_yaw_oc_alpha) {
+
+  // Dispatch to Schmidt update for the new mode — handles MSCKF, SLAM, and delayed-init Hup
+  if (visual_yaw_update_mode == VisualYawUpdateMode::VISUAL_YAW_SCHMIDT_CURRENT_GAUGE) {
+    SchmidtYawDiag diag;
+    diag.timestamp = state->_timestamp;
+    EKFUpdateSchmidtYawCurrentGauge(state, H_order, H, res, R, "visual", &diag);
+    flush_schmidt_yaw_diag(diag);
+    return;
+  }
 
   //==========================================================
   //==========================================================
@@ -491,6 +671,245 @@ void StateHelper::EKFUpdateSchmidt(std::shared_ptr<State> state,
   }
   if (found_neg) {
     std::exit(EXIT_FAILURE);
+  }
+}
+
+void StateHelper::open_schmidt_yaw_diag_csv(const std::string &path) {
+  if (g_schmidt_yaw_diag_csv.is_open())
+    g_schmidt_yaw_diag_csv.close();
+  g_schmidt_yaw_diag_header_written = false;
+  if (path.empty())
+    return;
+  boost::filesystem::path p(path);
+  if (!p.parent_path().empty())
+    boost::filesystem::create_directories(p.parent_path());
+  g_schmidt_yaw_diag_csv.open(path, std::ios::out | std::ios::trunc);
+  if (!g_schmidt_yaw_diag_csv.is_open()) {
+    PRINT_WARNING(YELLOW "[SCHMIDT-YAW] failed to open diag CSV: %s\n" RESET, path.c_str());
+    return;
+  }
+  PRINT_INFO(GREEN "[SCHMIDT-YAW] writing diag CSV: %s\n" RESET, path.c_str());
+}
+
+void StateHelper::EKFUpdateSchmidtYawCurrentGauge(
+    std::shared_ptr<State> state,
+    const std::vector<std::shared_ptr<Type>> &H_order,
+    const Eigen::MatrixXd &H,
+    const Eigen::VectorXd &res,
+    const Eigen::MatrixXd &R,
+    const std::string &update_type,
+    SchmidtYawDiag *diag_out) {
+
+  // =========================================================================
+  // Full-state Schmidt / consider-state Kalman update.
+  //
+  // The protected subspace is a single direction q (the global yaw gauge)
+  // in the FULL N_state-dimensional state space — not just the H_order-local
+  // subspace.  Every other direction is "active" and receives corrections
+  // including through cross-covariance from non-H_order variables.
+  //
+  // Key identities used (q = q_full, unit norm):
+  //   K_eff = (I - q q^T) K_std        [standard gain with yaw direction removed]
+  //   q^T K_eff = 0                    [by construction]
+  //   dx_eff = K_eff r                 [q^T dx_eff = 0 ✓]
+  //   P_plus = P - K_eff M_a^T - M_a K_eff^T + K_eff S K_eff^T  [Joseph form]
+  //   q^T P_plus q = q^T P q           [Pss unchanged ✓]
+  //   P_as changes                     [cross-covariance updated ✓]
+  // =========================================================================
+
+  assert(res.rows() == R.rows());
+  assert(H.rows() == res.rows());
+
+  const int m   = (int)H.rows();
+  const int n_H = (int)H.cols();
+  const int N   = (int)state->_Cov.rows();  // full state dimension
+
+  // -- H_id: column offsets of H_order variables in H -----------------------
+  int cur_it = 0;
+  std::vector<int> H_id;
+  H_id.reserve(H_order.size());
+  for (const auto &v : H_order) { H_id.push_back(cur_it); cur_it += v->size(); }
+  assert(cur_it == n_H);
+
+  // -- Pre-update diagnostics ------------------------------------------------
+  double yaw_before  = extract_imu_yaw_rad(state);
+  double bg_z_before = (state->_imu->bg() != nullptr) ? state->_imu->bg()->value()(2) : 0.0;
+
+  if (diag_out) {
+    diag_out->H_rows          = m;
+    diag_out->H_cols          = n_H;
+    diag_out->N_cols          = 1;
+    diag_out->yaw_before_update = yaw_before * (180.0 / M_PI);
+    diag_out->bg_z_before     = bg_z_before;
+  }
+
+  // -- Build FULL-STATE global yaw gauge Q_full (N × 1) ----------------------
+  // Covers ALL variables (IMU, all clones, all SLAM features, etc.).
+  // Non-H_order variables contribute to the gauge but their H_full columns are
+  // zero, so they don't affect the innovation; they DO receive corrections through
+  // cross-covariance (the active subspace includes them).
+  Eigen::VectorXd Q_full = build_global_yaw_gauge_full(state, N);
+  double norm_Q = Q_full.norm();
+
+  if (norm_Q < 1e-8) {
+    PRINT_WARNING(YELLOW "[SCHMIDT-YAW] norm_Q_full=%.2e < 1e-8, falling back to standard EKFUpdate\n" RESET, norm_Q);
+    if (diag_out) { diag_out->skipped_reason = "norm_Q_full_below_threshold"; }
+    EKFUpdate(state, H_order, H, res, R, VisualYawUpdateMode::ORIGINAL, 1.0, 0.0);
+    return;
+  }
+
+  Eigen::VectorXd q = Q_full / norm_Q;   // N × 1, unit full-state gauge
+
+  // -- H restricted to H_order columns: H_q = H * q[H_order section] --------
+  // This equals H_full * q (non-H_order H_full columns are zero).
+  Eigen::VectorXd q_Horder(n_H);
+  for (size_t k = 0; k < H_order.size(); k++)
+    q_Horder.segment(H_id[k], H_order[k]->size()) =
+        q.segment(H_order[k]->id(), H_order[k]->size());
+  Eigen::VectorXd HQ       = H * q_Horder;   // m × 1
+  double norm_HQ           = HQ.norm();
+  double norm_H            = H.norm();
+  double rel_norm_HQ       = (norm_H > 1e-12) ? norm_HQ / norm_H : 0.0;
+
+  if (diag_out) {
+    diag_out->rank_Q      = 1;
+    diag_out->norm_Q      = 1.0;   // normalized by construction
+    diag_out->condition_N = 1.0;
+    diag_out->norm_HQ     = norm_HQ;
+    diag_out->rel_norm_HQ = rel_norm_HQ;
+  }
+
+  // -- M_a = P * H_full^T  (same loop as standard EKFUpdate) ----------------
+  // M_a[var] = sum_k P(var, H_order[k]) * H[:,k_cols]^T
+  Eigen::MatrixXd M_a = Eigen::MatrixXd::Zero(N, m);
+  for (const auto &var : state->_variables) {
+    Eigen::MatrixXd M_i = Eigen::MatrixXd::Zero(var->size(), m);
+    for (size_t k = 0; k < H_order.size(); k++) {
+      M_i.noalias() +=
+          state->_Cov.block(var->id(), H_order[k]->id(), var->size(), H_order[k]->size()) *
+          H.block(0, H_id[k], m, H_order[k]->size()).transpose();
+    }
+    M_a.block(var->id(), 0, var->size(), m) = M_i;
+  }
+
+  // -- S = H P_H H^T + R (innovation covariance; identical to standard) ------
+  Eigen::MatrixXd P_small = StateHelper::get_marginal_covariance(state, H_order);
+  Eigen::MatrixXd S(m, m);
+  S.triangularView<Eigen::Upper>() = H * P_small * H.transpose();
+  S.triangularView<Eigen::Upper>() += R;
+  Eigen::MatrixXd Sinv = Eigen::MatrixXd::Identity(m, m);
+  S.selfadjointView<Eigen::Upper>().llt().solveInPlace(Sinv);
+
+  // -- Standard Kalman gain K_std = M_a * S^{-1}  (N × m) -------------------
+  Eigen::MatrixXd K_std = M_a * Sinv.selfadjointView<Eigen::Upper>();
+
+  // -- Schmidt gain K_eff = (I - q q^T) K_std --------------------------------
+  // Subtracts the yaw-gauge component from the standard gain.
+  // q^T K_eff = 0 by construction → q^T dx_eff = 0.
+  Eigen::RowVectorXd qT_Kstd = q.transpose() * K_std;   // 1 × m
+  Eigen::MatrixXd K_eff = K_std;
+  K_eff.noalias() -= q * qT_Kstd;   // N × m
+
+  // -- Diagnostics: normal EKF dx_s coefficient (what standard EKF would give)
+  Eigen::VectorXd dx_normal   = K_std * res;
+  double normal_dx_s_coeff    = q.dot(dx_normal);   // nonzero in general
+
+  // -- Schmidt mean update ---------------------------------------------------
+  Eigen::VectorXd dx_eff      = K_eff * res;         // = dx_normal - q*(q.dot(dx_normal))
+  double schmidt_dx_s_coeff   = q.dot(dx_eff);       // should be ≈ 0
+
+  double norm_dx_normal  = dx_normal.norm();
+  double norm_dx_schmidt = dx_eff.norm();
+  double norm_delta_dx   = (dx_normal - dx_eff).norm();
+
+  if (!dx_eff.allFinite()) {
+    PRINT_WARNING(YELLOW "[SCHMIDT-YAW] dx_eff contains NaN/Inf, falling back to standard EKFUpdate\n" RESET);
+    if (diag_out) { diag_out->skipped_reason = "dx_eff_nan_inf"; }
+    EKFUpdate(state, H_order, H, res, R, VisualYawUpdateMode::ORIGINAL, 1.0, 0.0);
+    return;
+  }
+
+  // -- Pss and Pas diagnostics BEFORE update ---------------------------------
+  // Pss = q^T P q  (scalar — full-state yaw-gauge variance)
+  // Pas = (I - qq^T) P q  (N×1 — cross-covariance between active and Schmidt subspaces)
+  Eigen::VectorXd Pq_before = state->_Cov.selfadjointView<Eigen::Upper>() * q;
+  double Pss_before          = q.dot(Pq_before);
+  Eigen::VectorXd Pas_before_vec = Pq_before - q * Pss_before;
+
+  // -- Apply dx_eff to ALL state variables -----------------------------------
+  // Non-H_order variables receive nonzero corrections through cross-covariance.
+  for (const auto &var : state->_variables) {
+    var->update(dx_eff.segment(var->id(), var->size()));
+  }
+
+  // -- Covariance update: Joseph form ----------------------------------------
+  // P_plus = P - K_eff M_a^T - M_a K_eff^T + K_eff S K_eff^T
+  //
+  // Proof that Pss is unchanged:
+  //   q^T K_eff = 0 → q^T (K_eff M_a^T) = 0,  (M_a K_eff^T) q = 0,
+  //               q^T (K_eff S K_eff^T) q = 0
+  //   → q^T P_plus q = q^T P q = Pss_before ✓
+  Eigen::MatrixXd KM  = K_eff * M_a.transpose();   // N × N
+  Eigen::MatrixXd KSK = K_eff * S.selfadjointView<Eigen::Upper>() * K_eff.transpose();  // N × N
+
+  state->_Cov -= KM + KM.transpose() - KSK;
+  state->_Cov = 0.5 * (state->_Cov + state->_Cov.transpose());
+
+  // -- Check for negative diagonals ------------------------------------------
+  {
+    Eigen::VectorXd diags = state->_Cov.diagonal();
+    bool found_neg = false;
+    for (int i = 0; i < diags.rows(); i++) {
+      if (diags(i) < 0.0) {
+        PRINT_WARNING(YELLOW "[SCHMIDT-YAW] negative diag at %d = %.6f\n" RESET, i, diags(i));
+        if (state->_Cov(i, i) < 0.0) state->_Cov(i, i) = 1e-12;
+        found_neg = true;
+      }
+    }
+    (void)found_neg;
+  }
+
+  // -- Pss and Pas AFTER update ----------------------------------------------
+  Eigen::VectorXd Pq_after = state->_Cov.selfadjointView<Eigen::Upper>() * q;
+  double Pss_after          = q.dot(Pq_after);
+  Eigen::VectorXd Pas_after_vec = Pq_after - q * Pss_after;
+  double Pas_change_norm    = (Pas_after_vec - Pas_before_vec).norm();
+  double Pss_change_norm    = std::abs(Pss_after - Pss_before);
+
+  if (Pss_change_norm > 1e-6 * std::max(1.0, std::abs(Pss_before))) {
+    PRINT_WARNING(YELLOW "[SCHMIDT-YAW] Pss_change=%.3e (before=%.6f after=%.6f) — Schmidt property violated\n" RESET,
+                  Pss_change_norm, Pss_before, Pss_after);
+  }
+
+  // -- Post-update diagnostics -----------------------------------------------
+  double yaw_after  = extract_imu_yaw_rad(state);
+  double bg_z_after = (state->_imu->bg() != nullptr) ? state->_imu->bg()->value()(2) : 0.0;
+
+  if (diag_out) {
+    diag_out->normal_dx_s_coeff_before = normal_dx_s_coeff;
+    diag_out->schmidt_dx_s_coeff_after = schmidt_dx_s_coeff;
+    diag_out->norm_dx_normal           = norm_dx_normal;
+    diag_out->norm_dx_schmidt          = norm_dx_schmidt;
+    diag_out->norm_delta_dx            = norm_delta_dx;
+    diag_out->Pss_norm_before          = Pss_before;
+    diag_out->Pss_norm_after           = Pss_after;
+    diag_out->Pss_change_norm          = Pss_change_norm;
+    diag_out->Pas_change_norm          = Pas_change_norm;
+    diag_out->yaw_before_update        = yaw_before * (180.0 / M_PI);
+    diag_out->yaw_after_update         = yaw_after  * (180.0 / M_PI);
+    diag_out->delta_yaw_update         = (yaw_after - yaw_before) * (180.0 / M_PI);
+    diag_out->bg_z_before              = bg_z_before;
+    diag_out->bg_z_after               = bg_z_after;
+    diag_out->projection_applied       = true;
+    diag_out->schmidt_applied          = true;
+    diag_out->update_type              = update_type;
+  }
+
+  // Camera intrinsic calibration sync (mirrors EKFUpdate)
+  if (state->_options.do_calib_camera_intrinsics) {
+    for (auto const &calib : state->_cam_intrinsics) {
+      state->_cam_intrinsics_cameras.at(calib.first)->set_value(calib.second->value());
+    }
   }
 }
 

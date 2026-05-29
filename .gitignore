@@ -63,3 +63,5 @@ test.sh
 *.jpeg
 *.webp
 *.zip
+imu_window_fly3*.csv
+imu_window*.csv

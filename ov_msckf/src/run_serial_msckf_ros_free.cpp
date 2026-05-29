@@ -85,6 +85,7 @@ struct Args {
   int video_fps = 20;
   double align_seconds = 8.0;    // [中文] 初始化完成后收集多少秒数据再做 SE3 对齐
   double start_time = 0.0;       // [中文] 跳过前 N 秒数据 (相对 bag 第一条 IMU), 用于复现 ROS bag_start 行为
+  double until_time = std::numeric_limits<double>::infinity(); // stop processing when cam timestamp exceeds this
   bool stereo = false;           // [中文] 使用 cam1 配对
   bool gps_alt_update = false;   // [中文] 使用 GPS 高度作为 VIO EKF 1D 观测 (锁 z 漂移)
   double gps_alt_sigma = 2.0;    // [中文] GPS 高度观测噪声 stddev (meters)
@@ -141,6 +142,7 @@ struct Args {
   double vio_yaw_control_start_after_init = 0.0; // seconds; 0 = apply requested yaw control immediately
   std::string vio_yaw_diag_path;           // per-visual-update yaw CSV
   std::string visual_obs_diag_path;        // VisualObservabilityPolicy per-update CSV
+  std::string schmidt_yaw_diag_path;       // Schmidt yaw update diagnostics CSV
   // Diagnostic overrides
   double cam_toff_override = std::numeric_limits<double>::quiet_NaN(); // override timeshift_cam_imu; disables online calib
   int diag_chi2_trigger = 5;    // trigger detailed diagnostics when chi2_rej >= this in one frame
@@ -256,6 +258,7 @@ bool parse_args(int argc, char **argv, Args &a) {
     else if (s == "--video-fps") a.video_fps = std::atoi(next("--video-fps").c_str());
     else if (s == "--align-seconds") a.align_seconds = std::atof(next("--align-seconds").c_str());
     else if (s == "--start-time") a.start_time = std::atof(next("--start-time").c_str());
+    else if (s == "--until-time") a.until_time = std::atof(next("--until-time").c_str());
     else if (s == "--stereo") a.stereo = true;
     else if (s == "--gps-alt-update") a.gps_alt_update = true;
     else if (s == "--gps-alt-sigma") a.gps_alt_sigma = std::atof(next("--gps-alt-sigma").c_str());
@@ -308,6 +311,7 @@ bool parse_args(int argc, char **argv, Args &a) {
     else if (s == "--vio-yaw-control-start-after-init") a.vio_yaw_control_start_after_init = std::atof(next("--vio-yaw-control-start-after-init").c_str());
     else if (s == "--vio-yaw-diag") a.vio_yaw_diag_path = next("--vio-yaw-diag");
     else if (s == "--visual-obs-diag") a.visual_obs_diag_path = next("--visual-obs-diag");
+    else if (s == "--schmidt-yaw-diag") a.schmidt_yaw_diag_path = next("--schmidt-yaw-diag");
     else if (s == "--cam-toff") a.cam_toff_override = std::atof(next("--cam-toff").c_str());
     else if (s == "--diag-chi2-trigger") a.diag_chi2_trigger = std::atoi(next("--diag-chi2-trigger").c_str());
     else if (s == "--diag-window") a.diag_window = std::atoi(next("--diag-window").c_str());
@@ -409,6 +413,11 @@ int main(int argc, char **argv) {
     params.visual_obs_diag_path = args.visual_obs_diag_path;
     PRINT_INFO(CYAN "[ros-free] CLI override: visual_obs_diag_path=%s\n" RESET,
                args.visual_obs_diag_path.c_str());
+  }
+  if (!args.schmidt_yaw_diag_path.empty()) {
+    params.schmidt_yaw_diag_path = args.schmidt_yaw_diag_path;
+    PRINT_INFO(CYAN "[ros-free] CLI override: schmidt_yaw_diag_path=%s\n" RESET,
+               args.schmidt_yaw_diag_path.c_str());
   }
 
   if (!parser->successful()) {
@@ -702,6 +711,7 @@ int main(int argc, char **argv) {
   while (!g_stop.load() && (imu_i < imu.size() || cam_i < cam0.size())) {
     double t_imu = imu_i < imu.size() ? imu[imu_i].timestamp : INF;
     double t_cam = cam_i < cam0.size() ? cam0[cam_i].timestamp : INF;
+    if (t_cam > args.until_time && t_imu > args.until_time) break;
 
     if (t_imu <= t_cam) {
       ov_core::ImuData m;

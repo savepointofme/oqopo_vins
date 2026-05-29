@@ -97,6 +97,8 @@ StateHelper::VisualYawUpdateMode visual_yaw_mode_from_string(const std::string &
     return StateHelper::VisualYawUpdateMode::HARD_GYRO_YAW;
   if (mode == "a_strict_yaw_dx0" || mode == "strict_yaw_dx0")
     return StateHelper::VisualYawUpdateMode::A_STRICT_YAW_DX0;
+  if (mode == "visual_yaw_schmidt_current_gauge")
+    return StateHelper::VisualYawUpdateMode::VISUAL_YAW_SCHMIDT_CURRENT_GAUGE;
   PRINT_WARNING(YELLOW "[VIO-YAW] unknown vio_yaw_update_mode=%s, using original\n" RESET, mode.c_str());
   return StateHelper::VisualYawUpdateMode::ORIGINAL;
 }
@@ -118,8 +120,10 @@ void apply_yaw_control_to_updaters(
     std::shared_ptr<UpdaterSLAM> &slam) {
   auto sh_mode = visual_yaw_mode_from_string(mode);
   auto vop = make_vop(mode);
-  // For pre-chi2 modes, the EKFUpdate mode is ORIGINAL (OC done pre-chi2).
-  // For legacy modes, sh_mode carries the projection.
+  // For pre-chi2 VOP modes, EKFUpdate runs ORIGINAL (OC already applied pre-chi2).
+  // For visual_yaw_schmidt_current_gauge, EKFUpdate dispatches to the Schmidt path —
+  //   no VOP is used, and the mode is passed through directly.
+  // For all other (legacy) modes, sh_mode carries the projection.
   auto ekf_mode = vop ? StateHelper::VisualYawUpdateMode::ORIGINAL : sh_mode;
   double ekf_scale = vop ? 1.0 : scale;
   double ekf_alpha = vop ? 0.0 : alpha;
@@ -225,6 +229,9 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   }
   if (!params.visual_obs_diag_path.empty()) {
     set_visual_obs_diag_path(params.visual_obs_diag_path);
+  }
+  if (!params.schmidt_yaw_diag_path.empty()) {
+    set_schmidt_yaw_diag_path(params.schmidt_yaw_diag_path);
   }
 
   //===================================================================================
@@ -880,6 +887,7 @@ void VioManager::set_vio_yaw_update_scale(double scale) {
   params.enable_vio_yaw_update = (params.vio_yaw_update_mode == "original" ||
                                   params.vio_yaw_update_mode == "a_strict_yaw_dx0" ||
                                   params.vio_yaw_update_mode == "strict_yaw_dx0" ||
+                                  params.vio_yaw_update_mode == "visual_yaw_schmidt_current_gauge" ||
                                   VisualObservabilityPolicy::is_prechi2_mode_string(params.vio_yaw_update_mode) ||
                                   params.vio_yaw_update_scale > 0.0 ||
                                   params.vio_global_yaw_oc_alpha > 0.0);
@@ -965,6 +973,11 @@ void VioManager::set_visual_obs_diag_path(const std::string &path) {
   visual_obs_diag_cumsum_yaw_deg = 0.0;
   PRINT_INFO(GREEN "[VOP-DIAG] writing observability diag: %s (mode=%s)\n" RESET,
              path.c_str(), params.vio_yaw_update_mode.c_str());
+}
+
+void VioManager::set_schmidt_yaw_diag_path(const std::string &path) {
+  params.schmidt_yaw_diag_path = path;
+  StateHelper::open_schmidt_yaw_diag_csv(path);
 }
 
 void VioManager::log_visual_obs_diag(double timestamp, const std::string &update_type,

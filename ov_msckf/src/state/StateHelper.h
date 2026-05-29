@@ -62,7 +62,8 @@ public:
     GLOBAL_YAW_OC_PROJECTION = 2,
     CURRENT_ONLY_SCALE = 3,
     HARD_GYRO_YAW = 4,
-    A_STRICT_YAW_DX0 = 5
+    A_STRICT_YAW_DX0 = 5,
+    VISUAL_YAW_SCHMIDT_CURRENT_GAUGE = 6
   };
 
   struct YawDxProjectionDiag {
@@ -70,6 +71,37 @@ public:
     VisualYawUpdateMode mode = VisualYawUpdateMode::ORIGINAL;
     double dx_yaw_before_projection_deg = 0.0;
     double dx_yaw_after_projection_deg = 0.0;
+  };
+
+  struct SchmidtYawDiag {
+    double timestamp = 0.0;
+    std::string update_type;
+    std::string mode = "visual_yaw_schmidt_current_gauge";
+    int H_rows = 0;
+    int H_cols = 0;
+    int N_cols = 1;
+    int rank_Q = 0;
+    double norm_Q = 0.0;
+    double condition_N = 0.0;
+    double norm_HQ = 0.0;
+    double rel_norm_HQ = 0.0;
+    double normal_dx_s_coeff_before = 0.0;
+    double schmidt_dx_s_coeff_after = 0.0;
+    double norm_dx_normal = 0.0;
+    double norm_dx_schmidt = 0.0;
+    double norm_delta_dx = 0.0;
+    double Pss_norm_before = 0.0;
+    double Pss_norm_after = 0.0;
+    double Pss_change_norm = 0.0;
+    double Pas_change_norm = 0.0;
+    double yaw_before_update = 0.0;
+    double yaw_after_update = 0.0;
+    double delta_yaw_update = 0.0;
+    double bg_z_before = 0.0;
+    double bg_z_after = 0.0;
+    bool projection_applied = false;
+    bool schmidt_applied = false;
+    std::string skipped_reason;
   };
 
   /**
@@ -156,6 +188,45 @@ public:
                                const std::vector<std::shared_ptr<ov_type::Type>> &H_order,
                                const Eigen::MatrixXd &H, const Eigen::VectorXd &res,
                                const Eigen::MatrixXd &R);
+
+  /**
+   * @brief Schmidt / consider-state Kalman update protecting the global-yaw gauge subspace.
+   *
+   * Builds the current-state (non-FEJ) global yaw gauge direction q_full over the
+   * FULL N-dimensional covariance state space (IMU + all clones + all SLAM features),
+   * not over the H_order-local subspace.  This ensures the protected direction is
+   * consistent with the complete filter state.
+   *
+   * The Schmidt gain is:
+   *   K_eff = (I - q_full q_full^T) K_std
+   * where K_std is the standard EKFUpdate gain.  By construction q_full^T K_eff = 0,
+   * so the yaw-gauge component of dx is zero.
+   *
+   * All state variables (including those not in H_order) receive the correction
+   * K_eff[var] * res through their cross-covariance with the observed H_order block.
+   * The covariance is updated with the full symmetric Joseph form:
+   *   P+ = P - K_eff M_a^T - M_a K_eff^T + K_eff S K_eff^T
+   * which analytically preserves q_full^T P+ q_full = q_full^T P q_full (Pss unchanged).
+   *
+   * @param state       Filter state
+   * @param H_order     Variables explicitly observed by H
+   * @param H           Compressed Jacobian (m x n_H)
+   * @param res         Residual (m x 1)
+   * @param R           Measurement noise (m x m)
+   * @param update_type Label string for diagnostics ("msckf", "slam", "slam_delayed")
+   * @param diag_out    Optional diagnostics output (may be nullptr)
+   */
+  static void EKFUpdateSchmidtYawCurrentGauge(
+      std::shared_ptr<State> state,
+      const std::vector<std::shared_ptr<ov_type::Type>> &H_order,
+      const Eigen::MatrixXd &H,
+      const Eigen::VectorXd &res,
+      const Eigen::MatrixXd &R,
+      const std::string &update_type = "visual",
+      SchmidtYawDiag *diag_out = nullptr);
+
+  /// Open (or re-open) the per-update Schmidt yaw diagnostic CSV.
+  static void open_schmidt_yaw_diag_csv(const std::string &path);
 
   /**
    * @brief This will set the initial covaraince of the specified state elements.
