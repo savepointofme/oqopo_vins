@@ -574,6 +574,22 @@ protected:
   double vio_yaw_update_diag_cumsum_deg = 0.0;
   std::ofstream of_visual_obs_diag;
   double visual_obs_diag_cumsum_yaw_deg = 0.0;
+
+  // Visual update guard: skip window, reject-file, guard log
+  double visual_skip_t0_ = -1.0;   // --visual-update-skip-window start
+  double visual_skip_t1_ = -1.0;   // --visual-update-skip-window end
+  std::vector<std::pair<double,double>> visual_reject_intervals_;  // from --visual-update-reject-topn-file
+  std::ofstream of_visual_guard_log_;
+  bool visual_guard_log_header_written_ = false;
+  // Burst state for guarded mode (populated in commit 2)
+  std::deque<double> guard_burst_times_;
+
+public:
+  void set_visual_skip_window(double t0, double t1) { visual_skip_t0_ = t0; visual_skip_t1_ = t1; }
+  void open_visual_guard_log(const std::string &path);
+  void load_visual_reject_file(const std::string &path);
+
+private:
   boost::posix_time::ptime rT1, rT2, rT3, rT4, rT5, rT6, rT7;
 
   // Track how much distance we have traveled

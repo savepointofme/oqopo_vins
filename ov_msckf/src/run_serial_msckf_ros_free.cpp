@@ -143,6 +143,11 @@ struct Args {
   std::string vio_yaw_diag_path;           // per-visual-update yaw CSV
   std::string visual_obs_diag_path;        // VisualObservabilityPolicy per-update CSV
   std::string schmidt_yaw_diag_path;       // Schmidt yaw update diagnostics CSV
+  // Visual update guard (commit 1)
+  double visual_skip_t0 = -1.0;           // --visual-update-skip-window start
+  double visual_skip_t1 = -1.0;           // --visual-update-skip-window end
+  std::string visual_guard_log_path;       // --visual-update-guard-log
+  std::string visual_reject_file_path;     // --visual-update-reject-topn-file
   // Diagnostic overrides
   double cam_toff_override = std::numeric_limits<double>::quiet_NaN(); // override timeshift_cam_imu; disables online calib
   int diag_chi2_trigger = 5;    // trigger detailed diagnostics when chi2_rej >= this in one frame
@@ -225,6 +230,9 @@ void print_help() {
                "  --vio-yaw-control-start-after-init S  Delay requested visual yaw control until S seconds after init\n"
                "  --vio-yaw-diag PATH   Write per-MSCKF/SLAM yaw update CSV\n"
                "  --visual-obs-diag PATH  Write VisualObservabilityPolicy diagnostics CSV\n"
+               "  --visual-update-skip-window T0 T1  Skip visual EKF updates in [T0,T1] seconds (ablation)\n"
+               "  --visual-update-guard-log PATH      Write per-update guard decision CSV\n"
+               "  --visual-update-reject-topn-file PATH  CSV of t or t0,t1 intervals to reject\n"
                "  Modes for --vio-yaw-update-mode (new pre-chi2 OC modes):\n"
                "    global_yaw_oc_fej_prechi2  1-D FEJ yaw OC applied before chi2 gating\n"
                "    visual_4d_oc_fej_prechi2   4-D FEJ (yaw+xyz) OC applied before chi2 gating\n"
@@ -312,6 +320,12 @@ bool parse_args(int argc, char **argv, Args &a) {
     else if (s == "--vio-yaw-diag") a.vio_yaw_diag_path = next("--vio-yaw-diag");
     else if (s == "--visual-obs-diag") a.visual_obs_diag_path = next("--visual-obs-diag");
     else if (s == "--schmidt-yaw-diag") a.schmidt_yaw_diag_path = next("--schmidt-yaw-diag");
+    else if (s == "--visual-update-skip-window") {
+      a.visual_skip_t0 = std::atof(next("--visual-update-skip-window T0").c_str());
+      a.visual_skip_t1 = std::atof(next("--visual-update-skip-window T1").c_str());
+    }
+    else if (s == "--visual-update-guard-log") a.visual_guard_log_path = next("--visual-update-guard-log");
+    else if (s == "--visual-update-reject-topn-file") a.visual_reject_file_path = next("--visual-update-reject-topn-file");
     else if (s == "--cam-toff") a.cam_toff_override = std::atof(next("--cam-toff").c_str());
     else if (s == "--diag-chi2-trigger") a.diag_chi2_trigger = std::atoi(next("--diag-chi2-trigger").c_str());
     else if (s == "--diag-window") a.diag_window = std::atoi(next("--diag-window").c_str());
@@ -440,6 +454,21 @@ int main(int argc, char **argv) {
   }
   auto sys = std::make_shared<VioManager>(params);
   bool delayed_vio_yaw_control_applied = !delayed_vio_yaw_control;
+
+  // Visual update guard (--visual-update-skip-window / --visual-update-guard-log / --visual-update-reject-topn-file)
+  if (args.visual_skip_t0 >= 0.0 && args.visual_skip_t1 > args.visual_skip_t0) {
+    sys->set_visual_skip_window(args.visual_skip_t0, args.visual_skip_t1);
+    PRINT_INFO(CYAN "[ros-free] Visual update skip window: [%.3f, %.3f]s\n" RESET,
+               args.visual_skip_t0, args.visual_skip_t1);
+  }
+  if (!args.visual_guard_log_path.empty()) {
+    sys->open_visual_guard_log(args.visual_guard_log_path);
+  }
+  if (!args.visual_reject_file_path.empty()) {
+    sys->load_visual_reject_file(args.visual_reject_file_path);
+    PRINT_INFO(CYAN "[ros-free] Visual reject file loaded: %s\n" RESET,
+               args.visual_reject_file_path.c_str());
+  }
 
   // [中文] 设置 P_zz 地板 (如果 CLI 指定)
   if (args.gps_alt_min_pzz > 0) {

@@ -20,6 +20,10 @@
  */
 
 #include "VioManager.h"
+#include <deque>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
 
 #include "feat/Feature.h"
 #include "feat/FeatureDatabase.h"
@@ -1081,11 +1085,88 @@ void VioManager::log_vio_yaw_update(double timestamp, const std::string &update_
                          << accepted << "," << rejected << "," << tracking_feature_count << "\n";
 }
 
+// ── Visual update guard helpers ────────────────────────────────────────────
+void VioManager::open_visual_guard_log(const std::string &path) {
+  if (of_visual_guard_log_.is_open()) of_visual_guard_log_.close();
+  of_visual_guard_log_.open(path, std::ofstream::out | std::ofstream::trunc);
+  if (!of_visual_guard_log_.is_open()) {
+    PRINT_WARNING(YELLOW "[VioManager] Cannot open visual guard log: %s\n" RESET, path.c_str());
+    return;
+  }
+  of_visual_guard_log_
+    << "timestamp,update_type,decision,reason,num_features\n";
+  of_visual_guard_log_.flush();
+  visual_guard_log_header_written_ = true;
+  PRINT_INFO(CYAN "[VioManager] Visual guard log: %s\n" RESET, path.c_str());
+}
+
+void VioManager::load_visual_reject_file(const std::string &path) {
+  std::ifstream f(path);
+  if (!f.is_open()) {
+    PRINT_WARNING(YELLOW "[VioManager] Cannot open reject file: %s\n" RESET, path.c_str());
+    return;
+  }
+  visual_reject_intervals_.clear();
+  std::string line;
+  int count = 0;
+  while (std::getline(f, line)) {
+    if (line.empty() || line[0] == '#') continue;
+    std::istringstream ss(line);
+    double t0, t1;
+    char sep;
+    if (ss >> t0 >> sep >> t1 && sep == ',') {
+      visual_reject_intervals_.emplace_back(t0, t1);
+    } else {
+      // Single timestamp → ±5ms window
+      std::istringstream ss2(line);
+      double t;
+      if (ss2 >> t) visual_reject_intervals_.emplace_back(t - 0.005, t + 0.005);
+    }
+    count++;
+  }
+  PRINT_INFO(CYAN "[VioManager] Loaded %d reject interval(s) from %s\n" RESET, count, path.c_str());
+}
+
+// Inline guard decision helper (returns true if update should be skipped)
+static bool visual_guard_should_skip(double t,
+                                     double skip_t0, double skip_t1,
+                                     const std::vector<std::pair<double,double>> &reject_ivs,
+                                     std::string &reason) {
+  if (skip_t0 >= 0.0 && t >= skip_t0 && t <= skip_t1) {
+    reason = "skip_window";
+    return true;
+  }
+  for (const auto &iv : reject_ivs) {
+    if (t >= iv.first && t <= iv.second) {
+      reason = "reject_file";
+      return true;
+    }
+  }
+  return false;
+}
+
 void VioManager::apply_visual_update_with_yaw_diag(const std::string &update_type,
                                                    const std::function<void()> &update_fn,
                                                    int num_features,
                                                    double chi2,
                                                    int accepted) {
+  const double t_now = state->_timestamp;
+
+  // ── Guard: skip window / reject file ─────────────────────────────────────
+  std::string guard_reason;
+  if (visual_guard_should_skip(t_now, visual_skip_t0_, visual_skip_t1_,
+                                visual_reject_intervals_, guard_reason)) {
+    if (of_visual_guard_log_.is_open()) {
+      of_visual_guard_log_ << std::fixed << std::setprecision(9)
+        << t_now << "," << update_type << ",skipped," << guard_reason
+        << "," << num_features << "\n";
+      of_visual_guard_log_.flush();
+    }
+    PRINT_DEBUG(YELLOW "[GUARD] t=%.3f  %s  decision=skipped  reason=%s  n=%d\n" RESET,
+                t_now, update_type.c_str(), guard_reason.c_str(), num_features);
+    return;
+  }
+
   const double yaw_before = current_imu_yaw_deg();
   StateHelper::reset_last_yaw_dx_projection_diag();
   update_fn();
@@ -1107,6 +1188,12 @@ void VioManager::apply_visual_update_with_yaw_diag(const std::string &update_typ
   log_vio_yaw_update(state->_timestamp, update_type, yaw_before, yaw_after, delta_yaw,
                      state->_imu->bias_g()(2), num_features, chi2, accepted, rejected,
                      tracking_count);
+  if (of_visual_guard_log_.is_open()) {
+    of_visual_guard_log_ << std::fixed << std::setprecision(9)
+      << state->_timestamp << "," << update_type << ",accepted,,"
+      << num_features << "\n";
+    of_visual_guard_log_.flush();
+  }
 
   // Visual observability policy diagnostics (MSCKF only for now)
   if (of_visual_obs_diag.is_open() && update_type == "MSCKF") {
