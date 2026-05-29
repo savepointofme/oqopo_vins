@@ -109,6 +109,9 @@ StateHelper::VisualYawUpdateMode visual_yaw_mode_from_string(const std::string &
     return StateHelper::VisualYawUpdateMode::VISUAL_YAW_SCHMIDT_GUARDED;
   if (mode == "visual_yaw_schmidt_fej_gauge")
     return StateHelper::VisualYawUpdateMode::VISUAL_YAW_SCHMIDT_FEJ_GAUGE;
+  // Pre-chi2 VOP modes: EKFUpdate runs ORIGINAL (projection already applied by VOP)
+  if (VisualObservabilityPolicy::is_prechi2_mode_string(mode))
+    return StateHelper::VisualYawUpdateMode::ORIGINAL;
   PRINT_WARNING(YELLOW "[VIO-YAW] unknown vio_yaw_update_mode=%s, using original\n" RESET, mode.c_str());
   return StateHelper::VisualYawUpdateMode::ORIGINAL;
 }
