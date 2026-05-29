@@ -526,6 +526,11 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
     EKFUpdateYawGaugeHProjectionCurrent(state, H_order, H, res, R);
     return;
   }
+  // Dispatch: mode D — Schmidt + pre-update guard (R-inflate or reject suspicious updates)
+  if (visual_yaw_update_mode == VisualYawUpdateMode::VISUAL_YAW_SCHMIDT_GUARDED) {
+    EKFUpdateSchmidtGuarded(state, H_order, H, res, R, "visual");
+    return;
+  }
 
   //==========================================================
   //==========================================================
@@ -1066,6 +1071,161 @@ void StateHelper::EKFUpdateYawGaugeHProjectionCurrent(
 
   // Standard EKF with projected H (ORIGINAL to avoid re-application)
   EKFUpdate(state, H_order, H_eff, res, R, VisualYawUpdateMode::ORIGINAL, 1.0, 0.0);
+}
+
+// ── Guarded Schmidt (mode D) static state ─────────────────────────────────────
+static StateHelper::SchmidtGuardConfig g_guard_cfg;
+static std::ofstream g_guard_log_csv;
+static bool g_guard_log_header = false;
+static std::deque<double> g_guard_burst_times;  // timestamps of recent suspicious updates
+
+void StateHelper::set_schmidt_guard_config(const SchmidtGuardConfig &cfg) {
+  g_guard_cfg = cfg;
+}
+
+void StateHelper::open_schmidt_guard_log(const std::string &path) {
+  if (g_guard_log_csv.is_open()) g_guard_log_csv.close();
+  g_guard_log_csv.open(path, std::ofstream::out | std::ofstream::trunc);
+  if (!g_guard_log_csv.is_open()) return;
+  g_guard_log_csv << "timestamp,update_type,decision,reason,gauge_frac,"
+                  << "norm_dx_normal,norm_delta_dx,Pas_est,rel_norm_HQ,"
+                  << "H_rows,H_cols,R_scale_applied\n";
+  g_guard_log_csv.flush();
+  g_guard_log_header = true;
+}
+
+void StateHelper::EKFUpdateSchmidtGuarded(
+    std::shared_ptr<State> state,
+    const std::vector<std::shared_ptr<ov_type::Type>> &H_order,
+    const Eigen::MatrixXd &H,
+    const Eigen::VectorXd &res,
+    const Eigen::MatrixXd &R,
+    const std::string &update_type) {
+
+  const int N = (int)state->_Cov.rows();
+  const double t_now = state->_timestamp;
+
+  // Build full-state gauge vector and compute pre-update gauge fraction
+  Eigen::VectorXd Q_full = build_global_yaw_gauge_full(state, N);
+  const double norm_Q = Q_full.norm();
+  if (norm_Q < 1e-8) {
+    // Degenerate: fall through to normal Schmidt
+    SchmidtYawDiag diag; diag.timestamp = t_now; diag.update_type = update_type;
+    EKFUpdateSchmidtYawCurrentGauge(state, H_order, H, res, R, update_type, &diag);
+    flush_schmidt_yaw_diag(diag);
+    return;
+  }
+  const Eigen::VectorXd q = Q_full / norm_Q;
+
+  // Restrict q to H_order subspace
+  int cur_it = 0; std::vector<int> H_id;
+  for (const auto &v : H_order) { H_id.push_back(cur_it); cur_it += v->size(); }
+  const int n_H = cur_it;
+  Eigen::VectorXd q_H(n_H); q_H.setZero();
+  for (size_t k = 0; k < H_order.size(); k++) {
+    int id_k = H_order[k]->id(), sz_k = H_order[k]->size();
+    if (id_k >= 0 && id_k + sz_k <= N)
+      q_H.segment(H_id[k], sz_k) = q.segment(id_k, sz_k);
+  }
+  const double norm_q_H = q_H.norm();
+  const double norm_H   = H.norm();
+
+  // M_a = P * H_H^T for computing K and dx_normal (abbreviated pre-computation)
+  // We compute a simplified dx_normal = K_std * res to get the gauge coefficient
+  // without running the full EKF (avoids duplicate covariance updates).
+  // Note: This is a READ-ONLY probe — state is not modified.
+  Eigen::MatrixXd M_a(N, H.rows()); M_a.setZero();
+  for (size_t i = 0; i < H_order.size(); ++i) {
+    int xi = H_order[i]->id(), si = H_order[i]->size();
+    if (xi < 0) continue;
+    for (size_t j = 0; j < H_order.size(); ++j) {
+      int xj = H_order[j]->id(), sj = H_order[j]->size();
+      if (xj < 0) continue;
+      M_a.block(xi, 0, si, H.rows()) +=
+          state->_Cov.block(xi, xj, si, sj) * H.block(0, H_id[j], H.rows(), sj).transpose();
+    }
+  }
+  Eigen::MatrixXd S = H * M_a.block(0, 0, N, H.rows());
+  // Only the H_order×H_order block is needed; compute S properly
+  Eigen::MatrixXd S_sub(H.rows(), H.rows()); S_sub.setZero();
+  for (size_t i = 0; i < H_order.size(); ++i) {
+    int xi = H_order[i]->id(), si = H_order[i]->size();
+    if (xi < 0) continue;
+    S_sub += H.block(0, H_id[i], H.rows(), si) * M_a.block(xi, 0, si, H.rows());
+  }
+  S_sub += R;
+
+  // dx_normal probe (H_order subspace only, same as the real EKFUpdate)
+  Eigen::MatrixXd K_H(n_H, H.rows()); K_H.setZero();
+  for (size_t i = 0; i < H_order.size(); ++i) {
+    int xi = H_order[i]->id(), si = H_order[i]->size();
+    if (xi < 0) continue;
+    K_H.block(H_id[i], 0, si, H.rows()) = M_a.block(xi, 0, si, H.rows());
+  }
+  Eigen::VectorXd dx_H = K_H * S_sub.ldlt().solve(res);  // dx in H_order space
+
+  const double norm_dx_n   = dx_H.norm();
+  const double coeff        = (norm_q_H > 1e-8) ? q_H.dot(dx_H) : 0.0;
+  const double gauge_frac   = (norm_dx_n > 1e-9) ? std::fabs(coeff) / norm_dx_n : 0.0;
+  const double norm_ddx     = std::fabs(coeff) * norm_q_H;  // approx norm(coeff*q_H)
+  const double rel_HQ       = (norm_H > 1e-12 && norm_q_H > 1e-8)
+                              ? (H * q_H / norm_q_H).norm() / norm_H : 0.0;
+
+  // ── Guard decision ──────────────────────────────────────────────────────
+  const auto &gc = g_guard_cfg;
+
+  // Purge stale burst timestamps
+  while (!g_guard_burst_times.empty() && t_now - g_guard_burst_times.front() > gc.burst_window_s)
+    g_guard_burst_times.pop_front();
+
+  const bool mild_suspicious = (gauge_frac > gc.gauge_frac_mild && norm_ddx > gc.norm_dx_mild);
+  const bool severe_suspicious = (gauge_frac > gc.gauge_frac_severe && norm_ddx > gc.norm_dx_severe);
+  const bool burst_active = (int)g_guard_burst_times.size() >= gc.burst_count;
+
+  std::string decision = "accept";
+  std::string reason   = "";
+  double r_scale = 1.0;
+
+  if (severe_suspicious || (mild_suspicious && burst_active)) {
+    if (gc.reject_on_severe) {
+      decision = "reject"; reason = severe_suspicious ? "severe" : "burst";
+    } else {
+      decision = "inflate_R_severe"; reason = severe_suspicious ? "severe" : "burst";
+      r_scale = gc.r_scale_severe;
+    }
+    g_guard_burst_times.push_back(t_now);
+  } else if (mild_suspicious) {
+    decision = "inflate_R_mild"; reason = "mild";
+    r_scale = gc.r_scale_mild;
+    g_guard_burst_times.push_back(t_now);
+  }
+
+  // Log guard decision
+  if (g_guard_log_csv.is_open()) {
+    g_guard_log_csv << std::fixed << std::setprecision(9)
+      << t_now << "," << update_type << "," << decision << "," << reason << ","
+      << std::setprecision(6) << gauge_frac << "," << norm_dx_n << ","
+      << norm_ddx << ",0.0," << rel_HQ << ","
+      << H.rows() << "," << n_H << "," << r_scale << "\n";
+    g_guard_log_csv.flush();
+  }
+
+  if (decision == "reject") {
+    PRINT_DEBUG(YELLOW "[GUARD] t=%.3f  %s  REJECTED  gauge_frac=%.3f  norm_ddx=%.3f  reason=%s\n" RESET,
+                t_now, update_type.c_str(), gauge_frac, norm_ddx, reason.c_str());
+    return;
+  }
+
+  // Apply (possibly R-inflated) Schmidt update
+  Eigen::MatrixXd R_eff = (r_scale > 1.0 + 1e-9) ? R * r_scale : R;
+  if (r_scale > 1.0 + 1e-9) {
+    PRINT_DEBUG(YELLOW "[GUARD] t=%.3f  %s  R*=%.0f  gauge_frac=%.3f  norm_ddx=%.3f  reason=%s\n" RESET,
+                t_now, update_type.c_str(), r_scale, gauge_frac, norm_ddx, reason.c_str());
+  }
+
+  SchmidtYawDiag diag; diag.timestamp = t_now; diag.update_type = update_type;
+  EKFUpdateSchmidtYawCurrentGauge(state, H_order, H, res, R_eff, update_type, &diag);
+  flush_schmidt_yaw_diag(diag);
 }
 
 void StateHelper::set_initial_covariance(std::shared_ptr<State> state, const Eigen::MatrixXd &covariance,

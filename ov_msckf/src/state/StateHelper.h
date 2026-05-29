@@ -64,8 +64,27 @@ public:
     HARD_GYRO_YAW = 4,
     A_STRICT_YAW_DX0 = 5,
     VISUAL_YAW_SCHMIDT_CURRENT_GAUGE = 6,   // K-space: K_eff = (I-qq^T)K_std
-    VISUAL_YAW_H_PROJECTION_CURRENT   = 7   // H-space: H_eff = H - (Hq)q^T, then standard EKF
+    VISUAL_YAW_H_PROJECTION_CURRENT   = 7,  // H-space: H_eff = H - (Hq)q^T, then standard EKF
+    VISUAL_YAW_SCHMIDT_GUARDED        = 8   // Schmidt + pre-update guard: R-inflate or reject suspicious updates
   };
+
+  // Thresholds for VISUAL_YAW_SCHMIDT_GUARDED mode (all configurable via CLI)
+  struct SchmidtGuardConfig {
+    double gauge_frac_mild   = 0.50;   // R*=r_scale_mild if gauge_frac > this
+    double gauge_frac_severe = 0.60;   // R*=r_scale_severe (or reject) if > this
+    double norm_dx_mild      = 1.0;    // also require norm_delta_dx > this for mild
+    double norm_dx_severe    = 1.5;    // for severe
+    double pas_mild          = 15.0;   // Pas_change_norm threshold for mild
+    double pas_severe        = 20.0;   // for severe
+    double r_scale_mild      = 10.0;   // R multiplier for mild suspicious
+    double r_scale_severe    = 50.0;   // R multiplier for severe (set to 0 = reject)
+    int    burst_count       = 5;      // number of suspicious updates in burst_window to trigger burst mode
+    double burst_window_s    = 0.5;    // time window for burst detection
+    bool   reject_on_severe  = false;  // if true, reject severe instead of inflating R
+  };
+
+  static void set_schmidt_guard_config(const SchmidtGuardConfig &cfg);
+  static void open_schmidt_guard_log(const std::string &path);
 
   struct YawDxProjectionDiag {
     bool valid = false;
@@ -262,6 +281,25 @@ public:
       const Eigen::MatrixXd &H,
       const Eigen::VectorXd &res,
       const Eigen::MatrixXd &R);
+
+  /**
+   * @brief Guarded Schmidt update (mode D).
+   *
+   * Pre-computes gauge_fraction = |q^T dx_normal| / ||dx_normal||.
+   * - If update is normal: applies standard Schmidt B update.
+   * - If mild suspicious (gauge_frac > mild_thresh AND norm_delta_dx > dx_thresh):
+   *     inflates R by r_scale_mild, recomputes, applies Schmidt.
+   * - If severe suspicious or burst: inflates R by r_scale_severe OR rejects.
+   * Burst detector: if >= burst_count suspicious updates within burst_window_s,
+   *     applies severe treatment to remaining burst updates.
+   */
+  static void EKFUpdateSchmidtGuarded(
+      std::shared_ptr<State> state,
+      const std::vector<std::shared_ptr<ov_type::Type>> &H_order,
+      const Eigen::MatrixXd &H,
+      const Eigen::VectorXd &res,
+      const Eigen::MatrixXd &R,
+      const std::string &update_type);
 
   /**
    * @brief This will set the initial covaraince of the specified state elements.

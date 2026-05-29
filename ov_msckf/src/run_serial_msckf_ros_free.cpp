@@ -46,6 +46,7 @@
 
 #include "core/VioManager.h"
 #include "core/VioManagerOptions.h"
+#include "state/StateHelper.h"
 #include "update/UpdaterGroundPlaneRange.h"
 #include "update/UpdaterGroundPlaneFeature.h"
 #include "update/UpdaterGroundPlaneFeatureV1.h"
@@ -148,6 +149,9 @@ struct Args {
   double visual_skip_t1 = -1.0;           // --visual-update-skip-window end
   std::string visual_guard_log_path;       // --visual-update-guard-log
   std::string visual_reject_file_path;     // --visual-update-reject-topn-file
+  // Guarded-B thresholds (commit 2)
+  StateHelper::SchmidtGuardConfig guard_cfg;  // defaults already set in struct
+  std::string guard_diag_log_path;        // --visual-guard-diag-log
   // Diagnostic overrides
   double cam_toff_override = std::numeric_limits<double>::quiet_NaN(); // override timeshift_cam_imu; disables online calib
   int diag_chi2_trigger = 5;    // trigger detailed diagnostics when chi2_rej >= this in one frame
@@ -326,6 +330,22 @@ bool parse_args(int argc, char **argv, Args &a) {
     }
     else if (s == "--visual-update-guard-log") a.visual_guard_log_path = next("--visual-update-guard-log");
     else if (s == "--visual-update-reject-topn-file") a.visual_reject_file_path = next("--visual-update-reject-topn-file");
+    // Guarded-B thresholds (commit 2)
+    else if (s == "--visual-guard-gauge-frac") {
+      a.guard_cfg.gauge_frac_mild   = std::atof(next("--visual-guard-gauge-frac").c_str());
+      a.guard_cfg.gauge_frac_severe = a.guard_cfg.gauge_frac_mild + 0.10;
+    }
+    else if (s == "--visual-guard-norm-dx") {
+      a.guard_cfg.norm_dx_mild   = std::atof(next("--visual-guard-norm-dx").c_str());
+      a.guard_cfg.norm_dx_severe = a.guard_cfg.norm_dx_mild * 1.5;
+    }
+    else if (s == "--visual-guard-pas")           a.guard_cfg.pas_mild          = std::atof(next("--visual-guard-pas").c_str());
+    else if (s == "--visual-guard-r-scale-mild")  a.guard_cfg.r_scale_mild      = std::atof(next("--visual-guard-r-scale-mild").c_str());
+    else if (s == "--visual-guard-r-scale-severe")a.guard_cfg.r_scale_severe    = std::atof(next("--visual-guard-r-scale-severe").c_str());
+    else if (s == "--visual-guard-burst-count")   a.guard_cfg.burst_count       = std::atoi(next("--visual-guard-burst-count").c_str());
+    else if (s == "--visual-guard-burst-window")  a.guard_cfg.burst_window_s    = std::atof(next("--visual-guard-burst-window").c_str());
+    else if (s == "--visual-guard-reject-severe") a.guard_cfg.reject_on_severe  = true;
+    else if (s == "--visual-guard-diag-log")      a.guard_diag_log_path         = next("--visual-guard-diag-log");
     else if (s == "--cam-toff") a.cam_toff_override = std::atof(next("--cam-toff").c_str());
     else if (s == "--diag-chi2-trigger") a.diag_chi2_trigger = std::atoi(next("--diag-chi2-trigger").c_str());
     else if (s == "--diag-window") a.diag_window = std::atoi(next("--diag-window").c_str());
@@ -468,6 +488,23 @@ int main(int argc, char **argv) {
     sys->load_visual_reject_file(args.visual_reject_file_path);
     PRINT_INFO(CYAN "[ros-free] Visual reject file loaded: %s\n" RESET,
                args.visual_reject_file_path.c_str());
+  }
+  // Guarded-B: push thresholds and open guard diag log
+  StateHelper::set_schmidt_guard_config(args.guard_cfg);
+  if (!args.guard_diag_log_path.empty()) {
+    StateHelper::open_schmidt_guard_log(args.guard_diag_log_path);
+    PRINT_INFO(CYAN "[ros-free] Guard diag log: %s\n" RESET, args.guard_diag_log_path.c_str());
+  }
+  if (params.vio_yaw_update_mode == "visual_yaw_schmidt_guarded") {
+    PRINT_INFO(CYAN "[ros-free] Guarded-B: gauge_frac mild=%.2f/severe=%.2f  "
+               "norm_dx mild=%.2f/severe=%.2f  Pas mild=%.1f  "
+               "R_scale mild=%.0f/severe=%.0f  burst=%d/%.2fs  reject_severe=%d\n" RESET,
+               args.guard_cfg.gauge_frac_mild, args.guard_cfg.gauge_frac_severe,
+               args.guard_cfg.norm_dx_mild, args.guard_cfg.norm_dx_severe,
+               args.guard_cfg.pas_mild,
+               args.guard_cfg.r_scale_mild, args.guard_cfg.r_scale_severe,
+               args.guard_cfg.burst_count, args.guard_cfg.burst_window_s,
+               (int)args.guard_cfg.reject_on_severe);
   }
 
   // [中文] 设置 P_zz 地板 (如果 CLI 指定)
