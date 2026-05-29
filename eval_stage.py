@@ -102,14 +102,30 @@ def read_bias(path):
 def read_schmidt_csv(path):
     if not os.path.exists(path): return {}
     rows = list(csv.DictReader(open(path)))
-    def col(k): return [float(r[k]) for r in rows if r.get(k,'')]
+    def col(k): return np.array([float(r[k]) for r in rows if r.get(k,'') and r[k] != ''])
+    ts = col('timestamp')
     return {
-        'qTdx_n':  np.abs(np.array(col('normal_dx_s_coeff_before'))),
-        'qTdx_s':  np.abs(np.array(col('schmidt_dx_s_coeff_after'))),
-        'pss_chg': np.abs(np.array(col('Pss_change_norm'))),
-        'pas_chg': np.array(col('Pas_change_norm')),
-        'norm_ddx': np.array(col('norm_delta_dx')),
-        'n': len(rows),
+        'ts':           ts,
+        'qTdx_n':       np.abs(col('normal_dx_s_coeff_before')),
+        'qTdx_s':       np.abs(col('schmidt_dx_s_coeff_after')),
+        'pss_chg':      np.abs(col('Pss_change_norm')),
+        'pas_chg':      col('Pas_change_norm'),
+        'norm_ddx':     col('norm_delta_dx'),
+        'rel_norm_HQ':  col('rel_norm_HQ'),
+        'norm_HQ':      col('norm_HQ'),
+        'yaw_delta':    col('delta_yaw_update'),
+        'pss_after_old_q': col('Pss_norm_after')     if 'Pss_norm_after'     in rows[0] else np.array([]),
+        'pss_new_q':    col('Pss_norm_after_new_q') if 'Pss_norm_after_new_q' in rows[0] else np.array([]),
+        'pss_before':   col('Pss_norm_before'),
+        'neg_clamp':    col('neg_diag_clamp_count') if 'neg_diag_clamp_count' in rows[0] else np.zeros(len(ts)),
+        'q_e_ori':      col('q_energy_imu_ori')   if 'q_energy_imu_ori' in rows[0] else np.array([]),
+        'q_e_pos':      col('q_energy_imu_pos')   if 'q_energy_imu_pos' in rows[0] else np.array([]),
+        'q_e_vel':      col('q_energy_imu_vel')   if 'q_energy_imu_vel' in rows[0] else np.array([]),
+        'q_e_cl_ori':   col('q_energy_clone_ori') if 'q_energy_clone_ori' in rows[0] else np.array([]),
+        'q_e_cl_pos':   col('q_energy_clone_pos') if 'q_energy_clone_pos' in rows[0] else np.array([]),
+        'q_e_slam':     col('q_energy_slam')      if 'q_energy_slam' in rows[0] else np.array([]),
+        'q_e_bc':       col('q_energy_bias_calib')if 'q_energy_bias_calib' in rows[0] else np.array([]),
+        'n':       len(rows),
         'skipped': sum(1 for r in rows if r.get('skipped_reason','')),
     }
 
@@ -591,5 +607,165 @@ fig.tight_layout()
 fig.savefig(f'{args.out}/heading_850_930s.png', dpi=150)
 plt.close(fig)
 print(f'Wrote: {args.out}/heading_850_930s.png')
+
+# ── Plot 5: Schmidt diagnostic correlation plots (B only) ────────────────────
+scl_B = datasets['B']['scl']
+if scl_B.get('n', 0) > 0 and len(scl_B.get('ts', [])) > 0:
+    sc_ts     = scl_B['ts']
+    sc_in_win = (sc_ts >= T0) & (sc_ts <= T1)
+    sc_ts_w   = sc_ts[sc_in_win]
+
+    def sc_arr(key):
+        v = scl_B.get(key, np.array([]))
+        return v[sc_in_win] if len(v) == len(sc_ts) else np.array([])
+
+    rel_hq   = sc_arr('rel_norm_HQ')
+    ddx      = sc_arr('norm_ddx')
+    pas      = sc_arr('pas_chg')
+    yaw_d    = sc_arr('yaw_delta')
+    neg_cl   = sc_arr('neg_clamp')
+
+    # q-energy over time (all 7 blocks)
+    q_e_imu_ori  = sc_arr('q_e_ori')
+    q_e_imu_pos  = sc_arr('q_e_pos')
+    q_e_imu_vel  = sc_arr('q_e_vel')
+    q_e_cl_ori   = sc_arr('q_e_cl_ori')
+    q_e_cl_pos   = sc_arr('q_e_cl_pos')
+    q_e_slam     = sc_arr('q_e_slam')
+    q_e_bc       = sc_arr('q_e_bc')
+
+    # Pss old/new gauge comparison
+    pss_old_q_arr = sc_arr('pss_after_old_q')
+    pss_new_q_arr = sc_arr('pss_new_q')
+
+    # ── Correlation: 6-panel overlay ─────────────────────────────────────────
+    fig, axes = plt.subplots(6, 1, figsize=(12, 18), sharex=True)
+
+    axes[0].plot(sc_ts_w, rel_hq, '-', color='#9b4dca', lw=0.7, alpha=0.7)
+    axes[0].set_ylabel('rel_norm_Hq'); axes[0].set_title(
+        f'B diagnostic correlations (start+yaw aligned, until={T1:.0f}s)\n'
+        f'rel_norm_Hq = ||H·q_H|| / ||H||  — if large, H observes yaw gauge')
+    axes[0].axhline(0.1, color='r', lw=0.8, ls='--', label='0.1 threshold')
+    axes[0].legend(fontsize=7); axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(sc_ts_w, ddx, '-', color='#2b6de0', lw=0.7, alpha=0.7)
+    axes[1].set_ylabel('norm_delta_dx'); axes[1].set_title(
+        'norm_delta_dx = ||dx_normal - dx_eff||  — yaw-direction correction removed')
+    axes[1].grid(True, alpha=0.3)
+
+    axes[2].plot(sc_ts_w, pas, '-', color='#1a8f4a', lw=0.7, alpha=0.7)
+    axes[2].set_ylabel('Pas_change_norm'); axes[2].set_title(
+        'Pas_change_norm  — cross-cov active↔Schmidt; should be nonzero (real Schmidt)')
+    axes[2].grid(True, alpha=0.3)
+
+    axes[3].plot(sc_ts_w, yaw_d, '-', color='#e05a2b', lw=0.7, alpha=0.7)
+    axes[3].axhline(0, color='k', lw=0.5, ls='--')
+    axes[3].set_ylabel('current_imu_yaw_delta_deg'); axes[3].set_title(
+        'current_imu_yaw_delta_deg (deg/update)  — IMU yaw shift caused by Schmidt update; should be small & zero-mean')
+    axes[3].grid(True, alpha=0.3)
+
+    # XY ATE for B on same time axis (GPS-spaced, interpolated to sc_ts_w)
+    traj_B = datasets['B']['traj']; p_aln_B = datasets['B']['p_aln']
+    ts_B = traj_B[:, 0]
+    gps_at_sc = np.array([
+        math.sqrt((interp1(ts_B, p_aln_B[:,0], t) - interp1(gps_t, gps_E, t))**2 +
+                  (interp1(ts_B, p_aln_B[:,1], t) - interp1(gps_t, gps_N, t))**2)
+        for t in sc_ts_w[::10]])  # subsample for speed
+    axes[4].plot(sc_ts_w[::10], gps_at_sc, '-', color='k', lw=0.9)
+    axes[4].set_ylabel('XY ATE B (m)'); axes[4].set_title('XY ATE (B, start+yaw aligned)')
+    axes[4].grid(True, alpha=0.3)
+
+    # Yaw error for B (interpolated)
+    ye_B = datasets['B']
+    if len(ye_B.get('yaw_err_t', [])) > 0:
+        ye_at_sc = np.array([interp1(ye_B['yaw_err_t'], ye_B['yaw_err'], t)
+                              for t in sc_ts_w[::10]])
+        axes[5].plot(sc_ts_w[::10], ye_at_sc, '-', color='#e05a2b', lw=0.9)
+    axes[5].axhline(0, color='k', lw=0.5, ls='--')
+    axes[5].set_ylabel('Yaw err B (deg)'); axes[5].set_title('VIO yaw − GPS course (B)')
+    axes[5].set_xlabel('t (s)'); axes[5].grid(True, alpha=0.3)
+
+    # Segment band overlays
+    for ax in axes:
+        for (sname, st0, st1), sc_col in zip(segs, ['#e8f4e8','#fff3cd','#fde8e8']):
+            ax.axvspan(st0, st1, alpha=0.12, color=sc_col)
+    fig.tight_layout()
+    fig.savefig(f'{args.out}/schmidt_diag_correlations.png', dpi=150)
+    plt.close(fig)
+    print(f'Wrote: {args.out}/schmidt_diag_correlations.png')
+
+    # ── q-energy decomposition plot ──────────────────────────────────────────
+    if len(q_e_imu_ori) > 0:
+        fig2, ax2 = plt.subplots(figsize=(12, 4))
+        # Subsample for readability
+        step = max(1, len(sc_ts_w)//2000)
+        t_s  = sc_ts_w[::step]
+        slam_s = q_e_slam[::step] if len(q_e_slam) == len(sc_ts_w) else np.zeros(len(t_s))
+        bc_s   = q_e_bc[::step]   if len(q_e_bc)   == len(sc_ts_w) else np.zeros(len(t_s))
+        ax2.stackplot(t_s,
+                      q_e_imu_ori[::step], q_e_imu_pos[::step], q_e_imu_vel[::step],
+                      q_e_cl_ori[::step],  q_e_cl_pos[::step],
+                      slam_s, bc_s,
+                      labels=['IMU ori','IMU pos','IMU vel','clone ori','clone pos',
+                              'SLAM lm','bias/calib'],
+                      colors=['#4e79a7','#f28e2b','#e15759','#76b7b2','#59a14f',
+                              '#b07aa1','#9c755f'],
+                      alpha=0.85)
+        ax2.set_xlabel('t (s)'); ax2.set_ylabel('fraction of ||q||²')
+        ax2.set_title(f'q-energy decomposition over time (until={T1:.0f}s)\n'
+                      f'Note: mixes rad/m/m·s⁻¹ — Euclidean fraction only')
+        ax2.legend(loc='upper right', fontsize=8); ax2.grid(True, alpha=0.3)
+        ax2.set_xlim(T0, T1); ax2.set_ylim(0, 1.05)
+        fig2.tight_layout()
+        fig2.savefig(f'{args.out}/q_energy_decomp.png', dpi=150)
+        plt.close(fig2)
+        print(f'Wrote: {args.out}/q_energy_decomp.png')
+
+    # ── Segmented Schmidt diagnostic summary ─────────────────────────────────
+    print('\n── B Schmidt diagnostic segmented summary ──')
+    print(f'  (NOTE: described as "full-state current-yaw-gauge projected-gain update")')
+    print(f'  rel_norm_Hq meaning: if large, H observes the yaw gauge → '
+          f'residual may redirect yaw info into orthogonal subspace')
+    for sname, st0, st1 in segs:
+        m_s = (sc_ts_w >= st0) & (sc_ts_w < st1)
+        def sp(arr, name):
+            v = arr[m_s] if len(arr) == len(sc_ts_w) else np.array([])
+            if len(v) == 0: return f'  [{sname:12s}] {name}: no data'
+            return (f'  [{sname:12s}] {name}: '
+                    f'mean={np.mean(v):.4f}  P95={np.percentile(np.abs(v),95):.4f}  '
+                    f'max={np.max(np.abs(v)):.4f}')
+        print(sp(rel_hq,  'rel_norm_Hq              '))
+        print(sp(ddx,     'norm_delta_dx            '))
+        print(sp(pas,     'Pas_change_norm          '))
+        print(sp(yaw_d,   'current_imu_yaw_delta_deg'))
+        clamp_count = int(neg_cl[m_s].sum()) if len(neg_cl) == len(sc_ts_w) else 0
+        print(f'  [{sname:12s}] neg_diag_clamp_count: {clamp_count}')
+        # Pss gauge comparison (old q vs new q after update)
+        def pss_seg(arr, label):
+            v = arr[m_s] if len(arr) == len(sc_ts_w) else np.array([])
+            if len(v) == 0: return f'  [{sname:12s}] {label}: no data'
+            return (f'  [{sname:12s}] {label}: '
+                    f'mean={np.mean(v):.6f}  min={np.min(v):.6f}  max={np.max(v):.6f}')
+        print(pss_seg(pss_old_q_arr, 'Pss(q_old^T P+ q_old)   '))
+        print(pss_seg(pss_new_q_arr, 'Pss(q_new^T P+ q_new)   '))
+
+    # q-energy summary (mean over window) — all 7 blocks
+    if len(q_e_imu_ori) > 0:
+        print('\n── q-energy decomposition (mean over full window, Euclidean fraction of ||q||²) ──')
+        print('   NOTE: q mixes rad(ori)/m(pos)/m·s⁻¹(vel) — fractions are unit-heterogeneous')
+        for lbl, arr in [('imu_ori',    q_e_imu_ori),
+                          ('imu_pos',   q_e_imu_pos),
+                          ('imu_vel',   q_e_imu_vel),
+                          ('clone_ori', q_e_cl_ori),
+                          ('clone_pos', q_e_cl_pos),
+                          ('slam_lm',   q_e_slam),
+                          ('bias_calib',q_e_bc)]:
+            if len(arr): print(f'  {lbl:12s}: mean={np.mean(arr):.4f}  '
+                               f'min={np.min(arr):.4f}  max={np.max(arr):.4f}')
+
+    total_clamp = int(neg_cl.sum()) if len(neg_cl) > 0 else 0
+    print(f'\n── Covariance health ──')
+    print(f'  neg_diag_clamp_count TOTAL = {total_clamp}  '
+          f'(must be 0 for valid run)')
 
 print(f'\nAll outputs in: {args.out}')

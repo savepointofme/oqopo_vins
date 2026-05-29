@@ -99,6 +99,8 @@ StateHelper::VisualYawUpdateMode visual_yaw_mode_from_string(const std::string &
     return StateHelper::VisualYawUpdateMode::A_STRICT_YAW_DX0;
   if (mode == "visual_yaw_schmidt_current_gauge")
     return StateHelper::VisualYawUpdateMode::VISUAL_YAW_SCHMIDT_CURRENT_GAUGE;
+  if (mode == "visual_yaw_h_projection_current")
+    return StateHelper::VisualYawUpdateMode::VISUAL_YAW_H_PROJECTION_CURRENT;
   PRINT_WARNING(YELLOW "[VIO-YAW] unknown vio_yaw_update_mode=%s, using original\n" RESET, mode.c_str());
   return StateHelper::VisualYawUpdateMode::ORIGINAL;
 }
@@ -888,6 +890,7 @@ void VioManager::set_vio_yaw_update_scale(double scale) {
                                   params.vio_yaw_update_mode == "a_strict_yaw_dx0" ||
                                   params.vio_yaw_update_mode == "strict_yaw_dx0" ||
                                   params.vio_yaw_update_mode == "visual_yaw_schmidt_current_gauge" ||
+                                  params.vio_yaw_update_mode == "visual_yaw_h_projection_current" ||
                                   VisualObservabilityPolicy::is_prechi2_mode_string(params.vio_yaw_update_mode) ||
                                   params.vio_yaw_update_scale > 0.0 ||
                                   params.vio_global_yaw_oc_alpha > 0.0);

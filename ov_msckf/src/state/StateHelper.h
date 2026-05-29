@@ -63,7 +63,8 @@ public:
     CURRENT_ONLY_SCALE = 3,
     HARD_GYRO_YAW = 4,
     A_STRICT_YAW_DX0 = 5,
-    VISUAL_YAW_SCHMIDT_CURRENT_GAUGE = 6
+    VISUAL_YAW_SCHMIDT_CURRENT_GAUGE = 6,   // K-space: K_eff = (I-qq^T)K_std
+    VISUAL_YAW_H_PROJECTION_CURRENT   = 7   // H-space: H_eff = H - (Hq)q^T, then standard EKF
   };
 
   struct YawDxProjectionDiag {
@@ -82,6 +83,7 @@ public:
     int N_cols = 1;
     int rank_Q = 0;
     double norm_Q = 0.0;
+    double norm_H = 0.0;        // Frobenius norm of H
     double condition_N = 0.0;
     double norm_HQ = 0.0;
     double rel_norm_HQ = 0.0;
@@ -91,7 +93,8 @@ public:
     double norm_dx_schmidt = 0.0;
     double norm_delta_dx = 0.0;
     double Pss_norm_before = 0.0;
-    double Pss_norm_after = 0.0;
+    double Pss_norm_after = 0.0;            // q_old^T P_plus q_old (same q as before)
+    double Pss_norm_after_new_q = 0.0;      // q_new^T P_plus q_new (gauge rebuilt from updated state)
     double Pss_change_norm = 0.0;
     double Pas_change_norm = 0.0;
     double yaw_before_update = 0.0;
@@ -99,6 +102,18 @@ public:
     double delta_yaw_update = 0.0;
     double bg_z_before = 0.0;
     double bg_z_after = 0.0;
+    // q-energy decomposition (fraction of ||q||^2 in each block; mix of rad/m/m/s)
+    double q_energy_imu_ori    = 0.0;
+    double q_energy_imu_pos    = 0.0;
+    double q_energy_imu_vel    = 0.0;
+    double q_energy_clone_ori  = 0.0;
+    double q_energy_clone_pos  = 0.0;
+    double q_energy_slam       = 0.0;
+    double q_energy_bias_calib = 0.0;  // remainder (bg/ba + calibration)
+    // Covariance health
+    int    neg_diag_clamp_count    = 0;
+    double min_cov_diag_before_clamp  = 0.0;
+    double min_cov_diag_after_update  = 0.0;
     bool projection_applied = false;
     bool schmidt_applied = false;
     std::string skipped_reason;
@@ -227,6 +242,26 @@ public:
 
   /// Open (or re-open) the per-update Schmidt yaw diagnostic CSV.
   static void open_schmidt_yaw_diag_csv(const std::string &path);
+
+  /**
+   * @brief H-space current-yaw-gauge projection update (mode C).
+   *
+   * Builds the current-state yaw gauge q restricted to the H_order subspace,
+   * then projects: H_eff = H - (H*q_H)*q_H^T  so that H_eff*q_H ≈ 0.
+   * A standard EKFUpdate is then applied with H_eff.
+   *
+   * This is the H-space counterpart of EKFUpdateSchmidtYawCurrentGauge (mode B).
+   * Unlike mode B, the measurement Jacobian itself has no yaw component;
+   * the residual cannot pull the yaw gauge direction at all.
+   *
+   * Named: visual_yaw_h_projection_current
+   */
+  static void EKFUpdateYawGaugeHProjectionCurrent(
+      std::shared_ptr<State> state,
+      const std::vector<std::shared_ptr<ov_type::Type>> &H_order,
+      const Eigen::MatrixXd &H,
+      const Eigen::VectorXd &res,
+      const Eigen::MatrixXd &R);
 
   /**
    * @brief This will set the initial covaraince of the specified state elements.

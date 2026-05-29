@@ -347,12 +347,16 @@ bool g_schmidt_yaw_diag_header_written = false;
 
 void write_schmidt_yaw_diag_header() {
   g_schmidt_yaw_diag_csv
-      << "timestamp,update_type,mode,H_rows,H_cols,N_cols,rank_Q,norm_Q,condition_N,"
+      << "timestamp,update_type,mode,H_rows,H_cols,N_cols,rank_Q,norm_Q,norm_H,condition_N,"
       << "norm_HQ,rel_norm_HQ,normal_dx_s_coeff_before,schmidt_dx_s_coeff_after,"
       << "norm_dx_normal,norm_dx_schmidt,norm_delta_dx,"
-      << "Pss_norm_before,Pss_norm_after,Pss_change_norm,Pas_change_norm,"
+      << "Pss_norm_before,Pss_norm_after,Pss_norm_after_new_q,Pss_change_norm,Pas_change_norm,"
       << "yaw_before_update,yaw_after_update,delta_yaw_update,"
-      << "bg_z_before,bg_z_after,projection_applied,schmidt_applied,skipped_reason\n";
+      << "bg_z_before,bg_z_after,"
+      << "q_energy_imu_ori,q_energy_imu_pos,q_energy_imu_vel,"
+      << "q_energy_clone_ori,q_energy_clone_pos,q_energy_slam,q_energy_bias_calib,"
+      << "neg_diag_clamp_count,min_cov_diag_before_clamp,min_cov_diag_after_update,"
+      << "projection_applied,schmidt_applied,skipped_reason\n";
   g_schmidt_yaw_diag_csv.flush();
   g_schmidt_yaw_diag_header_written = true;
 }
@@ -369,6 +373,7 @@ void flush_schmidt_yaw_diag(const StateHelper::SchmidtYawDiag &d) {
       << d.H_rows << "," << d.H_cols << "," << d.N_cols << ","
       << d.rank_Q << ","
       << std::setprecision(6) << d.norm_Q << ","
+      << d.norm_H << ","
       << d.condition_N << ","
       << d.norm_HQ << ","
       << d.rel_norm_HQ << ","
@@ -379,6 +384,7 @@ void flush_schmidt_yaw_diag(const StateHelper::SchmidtYawDiag &d) {
       << d.norm_delta_dx << ","
       << d.Pss_norm_before << ","
       << d.Pss_norm_after << ","
+      << d.Pss_norm_after_new_q << ","
       << d.Pss_change_norm << ","
       << d.Pas_change_norm << ","
       << d.yaw_before_update << ","
@@ -386,6 +392,16 @@ void flush_schmidt_yaw_diag(const StateHelper::SchmidtYawDiag &d) {
       << d.delta_yaw_update << ","
       << d.bg_z_before << ","
       << d.bg_z_after << ","
+      << d.q_energy_imu_ori << ","
+      << d.q_energy_imu_pos << ","
+      << d.q_energy_imu_vel << ","
+      << d.q_energy_clone_ori << ","
+      << d.q_energy_clone_pos << ","
+      << d.q_energy_slam << ","
+      << d.q_energy_bias_calib << ","
+      << d.neg_diag_clamp_count << ","
+      << d.min_cov_diag_before_clamp << ","
+      << d.min_cov_diag_after_update << ","
       << (int)d.projection_applied << ","
       << (int)d.schmidt_applied << ","
       << d.skipped_reason << "\n";
@@ -492,12 +508,22 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
                             const Eigen::VectorXd &res, const Eigen::MatrixXd &R, VisualYawUpdateMode visual_yaw_update_mode,
                             double visual_yaw_update_scale, double visual_global_yaw_oc_alpha) {
 
-  // Dispatch to Schmidt update for the new mode — handles MSCKF, SLAM, and delayed-init Hup
+  // Dispatch: mode B — full-state current-yaw-gauge projected-gain update (K-space)
   if (visual_yaw_update_mode == VisualYawUpdateMode::VISUAL_YAW_SCHMIDT_CURRENT_GAUGE) {
     SchmidtYawDiag diag;
     diag.timestamp = state->_timestamp;
     EKFUpdateSchmidtYawCurrentGauge(state, H_order, H, res, R, "visual", &diag);
     flush_schmidt_yaw_diag(diag);
+    return;
+  }
+  // Dispatch: mode C — current-yaw-gauge H-space projection, then standard EKF.
+  // NOTE: mode C does NOT write to schmidt_yaw_update_diag.csv.  It projects H
+  // before calling EKFUpdate(ORIGINAL), so the Schmidt gain-projection path (mode B)
+  // is never entered and no SchmidtYawDiag is emitted.  If mode C diagnostics are
+  // needed later, add a separate EKFUpdateYawGaugeHProjectionCurrentWithDiag() that
+  // logs to either a dedicated CSV or a shared visual-yaw-gauge diagnostic CSV.
+  if (visual_yaw_update_mode == VisualYawUpdateMode::VISUAL_YAW_H_PROJECTION_CURRENT) {
+    EKFUpdateYawGaugeHProjectionCurrent(state, H_order, H, res, R);
     return;
   }
 
@@ -771,12 +797,51 @@ void StateHelper::EKFUpdateSchmidtYawCurrentGauge(
   double norm_H            = H.norm();
   double rel_norm_HQ       = (norm_H > 1e-12) ? norm_HQ / norm_H : 0.0;
 
+  // -- q-energy decomposition (fraction of ||q||^2 in each state block) ---------
+  // NOTE: q mixes rad (orientation), m (position), m/s (velocity).
+  // Euclidean fractions are reported as-is; the user interprets physical meaning.
+  double q_energy_imu_ori = 0, q_energy_imu_pos = 0, q_energy_imu_vel = 0;
+  double q_energy_clone_ori = 0, q_energy_clone_pos = 0, q_energy_slam = 0;
+  {
+    if (state->_imu != nullptr) {
+      int id = state->_imu->id();
+      q_energy_imu_ori = q.segment(id, 3).squaredNorm();
+      q_energy_imu_pos = q.segment(id+3, 3).squaredNorm();
+      q_energy_imu_vel = q.segment(id+6, 3).squaredNorm();
+      // bg/ba at id+9 and id+12 are zero by gauge construction
+    }
+    for (const auto &clone_pair : state->_clones_IMU) {
+      const auto &pose = clone_pair.second;
+      if (!pose || pose->id() < 0) continue;
+      int id = pose->id();
+      q_energy_clone_ori += q.segment(id, 3).squaredNorm();
+      q_energy_clone_pos += q.segment(id+3, 3).squaredNorm();
+    }
+    for (const auto &feat_pair : state->_features_SLAM) {
+      const auto &lm = feat_pair.second;
+      if (!lm || lm->id() < 0 || lm->id() + lm->size() > N) continue;
+      q_energy_slam += q.segment(lm->id(), lm->size()).squaredNorm();
+    }
+  }
+  // q is unit-norm so sum should = 1; remainder = bias + calibration
+  double q_energy_bias_calib = 1.0 - q_energy_imu_ori - q_energy_imu_pos - q_energy_imu_vel
+                               - q_energy_clone_ori - q_energy_clone_pos - q_energy_slam;
+  q_energy_bias_calib = std::max(0.0, q_energy_bias_calib);  // guard numerical round-off
+
   if (diag_out) {
-    diag_out->rank_Q      = 1;
-    diag_out->norm_Q      = 1.0;   // normalized by construction
-    diag_out->condition_N = 1.0;
-    diag_out->norm_HQ     = norm_HQ;
-    diag_out->rel_norm_HQ = rel_norm_HQ;
+    diag_out->rank_Q             = 1;
+    diag_out->norm_Q             = 1.0;   // normalized by construction
+    diag_out->norm_H             = norm_H;
+    diag_out->condition_N        = 1.0;
+    diag_out->norm_HQ            = norm_HQ;
+    diag_out->rel_norm_HQ        = rel_norm_HQ;
+    diag_out->q_energy_imu_ori   = q_energy_imu_ori;
+    diag_out->q_energy_imu_pos   = q_energy_imu_pos;
+    diag_out->q_energy_imu_vel   = q_energy_imu_vel;
+    diag_out->q_energy_clone_ori = q_energy_clone_ori;
+    diag_out->q_energy_clone_pos = q_energy_clone_pos;
+    diag_out->q_energy_slam      = q_energy_slam;
+    diag_out->q_energy_bias_calib= q_energy_bias_calib;
   }
 
   // -- M_a = P * H_full^T  (same loop as standard EKFUpdate) ----------------
@@ -855,26 +920,44 @@ void StateHelper::EKFUpdateSchmidtYawCurrentGauge(
   state->_Cov -= KM + KM.transpose() - KSK;
   state->_Cov = 0.5 * (state->_Cov + state->_Cov.transpose());
 
-  // -- Check for negative diagonals ------------------------------------------
+  // -- Covariance health: count negative diagonals, clamp explicitly -----------
+  int neg_clamp_count = 0;
+  double min_diag_before_clamp = state->_Cov.diagonal().minCoeff();
   {
     Eigen::VectorXd diags = state->_Cov.diagonal();
-    bool found_neg = false;
     for (int i = 0; i < diags.rows(); i++) {
       if (diags(i) < 0.0) {
-        PRINT_WARNING(YELLOW "[SCHMIDT-YAW] negative diag at %d = %.6f\n" RESET, i, diags(i));
+        neg_clamp_count++;
         if (state->_Cov(i, i) < 0.0) state->_Cov(i, i) = 1e-12;
-        found_neg = true;
       }
     }
-    (void)found_neg;
   }
+  if (neg_clamp_count > 0) {
+    PRINT_WARNING(YELLOW "[SCHMIDT-YAW] HEALTH WARNING: %d negative covariance diagonal(s) clamped "
+                         "(min_before=%.4e). This must be exactly 0 in a valid run.\n" RESET,
+                  neg_clamp_count, min_diag_before_clamp);
+  }
+  double min_diag_after_update = state->_Cov.diagonal().minCoeff();
 
-  // -- Pss and Pas AFTER update ----------------------------------------------
+  // -- Pss and Pas AFTER update (using same q as before) ----------------------
   Eigen::VectorXd Pq_after = state->_Cov.selfadjointView<Eigen::Upper>() * q;
-  double Pss_after          = q.dot(Pq_after);
+  double Pss_after          = q.dot(Pq_after);                    // q_old^T P_plus q_old
   Eigen::VectorXd Pas_after_vec = Pq_after - q * Pss_after;
   double Pas_change_norm    = (Pas_after_vec - Pas_before_vec).norm();
   double Pss_change_norm    = std::abs(Pss_after - Pss_before);
+
+  // -- Pss with NEW gauge direction (q rebuilt from updated state) -------------
+  // After applying dx_eff the IMU orientation has changed, so the yaw-gauge
+  // direction q_new differs from q.  q_new^T P_plus q_new measures whether the
+  // updated covariance still has low variance in the NEW gauge direction.
+  Eigen::VectorXd Q_full_new = build_global_yaw_gauge_full(state, N);
+  double norm_Q_new = Q_full_new.norm();
+  double Pss_after_new_q = 0.0;
+  if (norm_Q_new > 1e-8) {
+    Eigen::VectorXd q_new = Q_full_new / norm_Q_new;
+    Eigen::VectorXd Pq_new = state->_Cov.selfadjointView<Eigen::Upper>() * q_new;
+    Pss_after_new_q = q_new.dot(Pq_new);
+  }
 
   if (Pss_change_norm > 1e-6 * std::max(1.0, std::abs(Pss_before))) {
     PRINT_WARNING(YELLOW "[SCHMIDT-YAW] Pss_change=%.3e (before=%.6f after=%.6f) — Schmidt property violated\n" RESET,
@@ -886,23 +969,27 @@ void StateHelper::EKFUpdateSchmidtYawCurrentGauge(
   double bg_z_after = (state->_imu->bg() != nullptr) ? state->_imu->bg()->value()(2) : 0.0;
 
   if (diag_out) {
-    diag_out->normal_dx_s_coeff_before = normal_dx_s_coeff;
-    diag_out->schmidt_dx_s_coeff_after = schmidt_dx_s_coeff;
-    diag_out->norm_dx_normal           = norm_dx_normal;
-    diag_out->norm_dx_schmidt          = norm_dx_schmidt;
-    diag_out->norm_delta_dx            = norm_delta_dx;
-    diag_out->Pss_norm_before          = Pss_before;
-    diag_out->Pss_norm_after           = Pss_after;
-    diag_out->Pss_change_norm          = Pss_change_norm;
-    diag_out->Pas_change_norm          = Pas_change_norm;
-    diag_out->yaw_before_update        = yaw_before * (180.0 / M_PI);
-    diag_out->yaw_after_update         = yaw_after  * (180.0 / M_PI);
-    diag_out->delta_yaw_update         = (yaw_after - yaw_before) * (180.0 / M_PI);
-    diag_out->bg_z_before              = bg_z_before;
-    diag_out->bg_z_after               = bg_z_after;
-    diag_out->projection_applied       = true;
-    diag_out->schmidt_applied          = true;
-    diag_out->update_type              = update_type;
+    diag_out->normal_dx_s_coeff_before  = normal_dx_s_coeff;
+    diag_out->schmidt_dx_s_coeff_after  = schmidt_dx_s_coeff;
+    diag_out->norm_dx_normal            = norm_dx_normal;
+    diag_out->norm_dx_schmidt           = norm_dx_schmidt;
+    diag_out->norm_delta_dx             = norm_delta_dx;
+    diag_out->Pss_norm_before           = Pss_before;
+    diag_out->Pss_norm_after            = Pss_after;
+    diag_out->Pss_norm_after_new_q      = Pss_after_new_q;
+    diag_out->Pss_change_norm           = Pss_change_norm;
+    diag_out->Pas_change_norm           = Pas_change_norm;
+    diag_out->yaw_before_update         = yaw_before * (180.0 / M_PI);
+    diag_out->yaw_after_update          = yaw_after  * (180.0 / M_PI);
+    diag_out->delta_yaw_update          = (yaw_after - yaw_before) * (180.0 / M_PI);
+    diag_out->bg_z_before               = bg_z_before;
+    diag_out->bg_z_after                = bg_z_after;
+    diag_out->neg_diag_clamp_count      = neg_clamp_count;
+    diag_out->min_cov_diag_before_clamp = min_diag_before_clamp;
+    diag_out->min_cov_diag_after_update = min_diag_after_update;
+    diag_out->projection_applied        = true;
+    diag_out->schmidt_applied           = true;
+    diag_out->update_type               = update_type;
   }
 
   // Camera intrinsic calibration sync (mirrors EKFUpdate)
@@ -911,6 +998,74 @@ void StateHelper::EKFUpdateSchmidtYawCurrentGauge(
       state->_cam_intrinsics_cameras.at(calib.first)->set_value(calib.second->value());
     }
   }
+}
+
+void StateHelper::EKFUpdateYawGaugeHProjectionCurrent(
+    std::shared_ptr<State> state,
+    const std::vector<std::shared_ptr<Type>> &H_order,
+    const Eigen::MatrixXd &H,
+    const Eigen::VectorXd &res,
+    const Eigen::MatrixXd &R) {
+
+  // =========================================================================
+  // H-space current-yaw-gauge projection update (mode C).
+  //
+  // Builds the current-state yaw gauge q restricted to the H_order subspace,
+  // then projects: H_eff = H - (H*q_H)*q_H^T so that H_eff*q_H = 0.
+  // A standard EKFUpdate (ORIGINAL mode) is then applied with H_eff.
+  //
+  // Unlike mode B (K-space projection), the measurement Jacobian itself has
+  // no yaw component; the visual residual cannot pull the yaw direction at all.
+  // S is computed from H_eff, so the innovation covariance also excludes the
+  // gauge direction — which is the key difference from mode B where S includes
+  // the full H and the residual can still redirect yaw info into other subspaces.
+  // =========================================================================
+
+  const int N = (int)state->_Cov.rows();
+
+  // Build H_id
+  int cur_it = 0;
+  std::vector<int> H_id;
+  H_id.reserve(H_order.size());
+  for (const auto &v : H_order) { H_id.push_back(cur_it); cur_it += v->size(); }
+  const int n_H = cur_it;
+
+  // Full-state gauge → restrict to H_order section
+  Eigen::VectorXd Q_full = build_global_yaw_gauge_full(state, N);
+  double norm_Q_full = Q_full.norm();
+
+  if (norm_Q_full < 1e-8) {
+    PRINT_WARNING(YELLOW "[YAW-H-PROJ] norm_Q_full=%.2e < 1e-8, using standard EKFUpdate\n" RESET, norm_Q_full);
+    EKFUpdate(state, H_order, H, res, R, VisualYawUpdateMode::ORIGINAL, 1.0, 0.0);
+    return;
+  }
+
+  // q restricted to H_order columns (same as H_full * q_full since non-H_order H cols = 0)
+  Eigen::VectorXd q_H(n_H);
+  q_H.setZero();
+  for (size_t k = 0; k < H_order.size(); k++) {
+    int id_k = H_order[k]->id();
+    int sz_k = H_order[k]->size();
+    if (id_k >= 0 && id_k + sz_k <= N)
+      q_H.segment(H_id[k], sz_k) = Q_full.segment(id_k, sz_k);
+  }
+  double norm_qH = q_H.norm();
+
+  if (norm_qH < 1e-8) {
+    // Gauge has no component in the H_order subspace → no projection possible
+    PRINT_WARNING(YELLOW "[YAW-H-PROJ] norm_qH=%.2e in H_order space, fallback\n" RESET, norm_qH);
+    EKFUpdate(state, H_order, H, res, R, VisualYawUpdateMode::ORIGINAL, 1.0, 0.0);
+    return;
+  }
+  q_H /= norm_qH;   // unit vector in H_order space
+
+  // Project H: H_eff = H - (H*q_H)*q_H^T  →  H_eff * q_H = 0
+  Eigen::VectorXd Hq      = H * q_H;   // m×1
+  Eigen::MatrixXd H_eff   = H;
+  H_eff.noalias()         -= Hq * q_H.transpose();
+
+  // Standard EKF with projected H (ORIGINAL to avoid re-application)
+  EKFUpdate(state, H_order, H_eff, res, R, VisualYawUpdateMode::ORIGINAL, 1.0, 0.0);
 }
 
 void StateHelper::set_initial_covariance(std::shared_ptr<State> state, const Eigen::MatrixXd &covariance,
