@@ -47,6 +47,11 @@ struct DiagMetrics {
   int n_acc     = 0;  // MSCKF features accepted this frame
   int msckf_in  = 0;  // MSCKF features fed in (before triangulation/chi2)
   int slam_count = 0; // active SLAM features
+  // Descriptor-tracker diagnostics (zero when using KLT)
+  int desc_detected  = 0;  // FAST keypoints detected
+  int desc_pre_gate  = 0;  // matches after kNN+ratio+symmetry, before spatial gate
+  int desc_post_gate = 0;  // matches after spatial gate
+  int desc_tracked   = 0;  // matches surviving RANSAC (= tracked from previous frame)
 
   // ---- first-event timestamps ----
   double first_accept_t = -1;

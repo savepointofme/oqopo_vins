@@ -1,8 +1,0 @@
-Truth first-edge: path_length = 402.04 m, straightness = 0.995
-Window: t_rel ∈ [48.2, 116.4] s  (span 68.2s, ~400 m southbound)
-
-run              est len (m) scale_ratio   XY rmse   XY max  XY final
----------------------------------------------------------------------
-R0_nogps              412.62       1.026      5.00     9.84      8.90
-R2f_stageA            354.86       0.883     23.71    42.29     41.58
-R5b_stageB_v0         372.64       0.927     14.55    27.95     27.85

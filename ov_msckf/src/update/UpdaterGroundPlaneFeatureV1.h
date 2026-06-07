@@ -28,6 +28,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "state/StateHelper.h"
+
 namespace ov_core {
 class FeatureDatabase;
 class Feature;
@@ -148,6 +150,15 @@ public:
                   double t_state,
                   double z_ground);
 
+  /// Variant used from the MSCKF update path: consume the same candidate
+  /// tracks that are about to be used by MSCKF, and pick a valid two-clone
+  /// observation span from each track.
+  bool try_update_candidates(
+      std::shared_ptr<State> state,
+      const std::vector<std::shared_ptr<ov_core::Feature>> &feature_candidates,
+      double t_state,
+      double z_ground);
+
   /// Feature IDs consumed by the LATEST successful UPDATE call.  When
   /// exclude_used_from_msckf is true, callers should pass these to the
   /// MSCKF updater so the same observations are not double-counted.
@@ -159,6 +170,12 @@ public:
 
   const LastUpdate &last_update() const { return last_; }
   const Stats &stats() const { return stats_; }
+
+  void set_visual_yaw_update_control(StateHelper::VisualYawUpdateMode mode, double scale, double global_alpha) {
+    visual_yaw_update_mode_ = mode;
+    visual_yaw_update_scale_ = scale;
+    visual_global_yaw_oc_alpha_ = global_alpha;
+  }
 
   void reset();
   void print_summary() const;
@@ -182,6 +199,10 @@ private:
   LastUpdate last_;
   Stats stats_;
   std::unordered_set<size_t> last_used_ids_;
+
+  StateHelper::VisualYawUpdateMode visual_yaw_update_mode_ = StateHelper::VisualYawUpdateMode::ORIGINAL;
+  double visual_yaw_update_scale_ = 1.0;
+  double visual_global_yaw_oc_alpha_ = 0.0;
 
   /// Verbose diagnostic dump: dump the full analytic, numeric, and diff
   /// 2x12 matrices + intermediates + step-size sweep for the first

@@ -21,6 +21,8 @@
 
 #include "TrackDescriptor.h"
 
+#include <algorithm>
+#include <numeric>
 #include <opencv2/features2d.hpp>
 
 #include "Grider_FAST.h"
@@ -103,8 +105,17 @@ void TrackDescriptor::feed_monocular(const CameraData &message, size_t msg_id) {
   cv::Mat desc_new;
   std::vector<size_t> ids_new;
 
-  // First, extract new descriptors for this new image
-  perform_detection_monocular(img, mask, pts_new, desc_new, ids_new);
+  // First, extract new descriptors for this new image.
+  // For XFeat, pass previous frame's locations as hints so the same physical features
+  // are preferentially re-detected (temporal continuity; see detect_xfeat Pass 1).
+  // Neural detectors (SP, XFeat) use previous-frame hint for temporal continuity.
+  // ORB/FAST ignores the hint (biases toward low-quality corners on aerial scenes).
+  {
+    const auto &prev = pts_last.at(cam_id);
+    bool neural = use_sp_ || (use_xfeat_ && xfeat_temporal_hint_);
+    const std::vector<cv::KeyPoint> *hint = (neural && !prev.empty()) ? &prev : nullptr;
+    perform_detection_monocular(img, mask, pts_new, desc_new, ids_new, hint);
+  }
   rT2 = boost::posix_time::microsec_clock::local_time();
 
   // Our matches temporally
@@ -154,8 +165,52 @@ void TrackDescriptor::feed_monocular(const CameraData &message, size_t msg_id) {
     database->update_feature(good_ids_left.at(i), message.timestamp, cam_id, good_left.at(i).pt.x, good_left.at(i).pt.y, npt_l.x, npt_l.y);
   }
 
-  // Debug info
-  // PRINT_DEBUG("LtoL = %d | good = %d | fromlast = %d\n",(int)matches_ll.size(),(int)good_left.size(),num_tracklast);
+  // Populate per-frame descriptor diagnostic packet
+  {
+    std::lock_guard<std::mutex> lck(mtx_desc_diag_);
+    TrackerWarpVizPacket &pkt = desc_viz_packets_[cam_id];
+    pkt.valid             = true;
+    pkt.cam_id            = cam_id;
+    pkt.t_curr            = message.timestamp;
+    pkt.n_desc_detected    = (int)pts_new.size();
+    pkt.n_desc_pre_gate    = match_pre_gate_;
+    pkt.n_desc_post_gate   = match_post_gate_;
+    pkt.n_desc_post_ransac = num_tracklast;
+  }
+  PRINT_INFO("[DESC-DIAG-B] t=%.3f cam=%zu detected=%d knn=%d ratio=%d sym=%d spatial=%d ransac=%d tracked=%d\n",
+             message.timestamp, cam_id, (int)pts_new.size(),
+             match_n_knn_, match_n_ratio_, match_pre_gate_, match_post_gate_, match_n_ransac_, num_tracklast);
+
+  // Track-lifetime histogram (C): maintain per-feature consecutive-frame age
+  {
+    std::unordered_map<size_t, int> new_age;
+    new_age.reserve(good_ids_left.size());
+    for (size_t id : good_ids_left) {
+      auto it = track_age_.find(id);
+      new_age[id] = (it != track_age_.end()) ? it->second + 1 : 1;
+    }
+    track_age_ = std::move(new_age);
+
+    // Print histogram every 60 frames per camera
+    static std::unordered_map<size_t, int> s_frame_cnt;
+    if (++s_frame_cnt[cam_id] % 60 == 0) {
+      int n2=0, n3=0, n5=0, n8=0, n12=0, max_age=0;
+      double sum_age = 0;
+      for (auto &[id, age] : track_age_) {
+        if (age >= 2)  n2++;
+        if (age >= 3)  n3++;
+        if (age >= 5)  n5++;
+        if (age >= 8)  n8++;
+        if (age >= 12) n12++;
+        if (age > max_age) max_age = age;
+        sum_age += age;
+      }
+      PRINT_INFO("[XFEAT-HIST-C] t=%.3f cam=%zu total=%zu age>=2:%d age>=3:%d age>=5:%d age>=8:%d age>=12:%d max:%d mean:%.1f\n",
+                 message.timestamp, cam_id, track_age_.size(),
+                 n2, n3, n5, n8, n12, max_age,
+                 track_age_.empty() ? 0.0 : sum_age / (double)track_age_.size());
+    }
+  }
 
   // Move forward in time
   {
@@ -352,11 +407,268 @@ void TrackDescriptor::feed_stereo(const CameraData &message, size_t msg_id_left,
   PRINT_ALL("[TIME-DESC]: %.4f seconds for total\n", (rT5 - rT1).total_microseconds() * 1e-6);
 }
 
-void TrackDescriptor::perform_detection_monocular(const cv::Mat &img0, const cv::Mat &mask0, std::vector<cv::KeyPoint> &pts0,
-                                                  cv::Mat &desc0, std::vector<size_t> &ids0) {
+bool TrackDescriptor::get_warp_viz_packet(size_t cam_id, TrackerWarpVizPacket &packet) {
+  std::lock_guard<std::mutex> lck(mtx_desc_diag_);
+  auto it = desc_viz_packets_.find(cam_id);
+  if (it == desc_viz_packets_.end() || !it->second.valid)
+    return false;
+  packet = it->second;
+  return true;
+}
 
-  // Assert that we need features
+void TrackDescriptor::detect_xfeat(const cv::Mat &img, const cv::Mat &mask, std::vector<cv::KeyPoint> &pts, cv::Mat &desc,
+                                    std::vector<size_t> &ids, const std::vector<cv::KeyPoint> *pts_hint) {
+#ifndef USE_ONNXRUNTIME
+  (void)img;
+  (void)mask;
+  (void)pts;
+  (void)desc;
+  (void)ids;
+  (void)pts_hint;
+  PRINT_ERROR("[XFEAT] detect_xfeat called but built without USE_ONNXRUNTIME!\n");
+#else
+  int H = img.rows, W = img.cols;
+
+  // Grayscale → 3-channel BGR, normalize to [0, 1] float32
+  cv::Mat img3, img_f;
+  cv::cvtColor(img, img3, cv::COLOR_GRAY2BGR);
+  img3.convertTo(img_f, CV_32F, 1.0 / 255.0);
+
+  // Build CHW blob [1, 3, H, W] expected by XFeat ONNX
+  std::vector<float> blob(3 * H * W);
+  std::vector<cv::Mat> ch(3);
+  cv::split(img_f, ch);
+  for (int c = 0; c < 3; c++)
+    std::memcpy(blob.data() + c * H * W, ch[c].ptr<float>(0), H * W * sizeof(float));
+
+  std::array<int64_t, 4> in_shape{1, 3, (int64_t)H, (int64_t)W};
+  Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+  Ort::Value in_tensor = Ort::Value::CreateTensor<float>(mem_info, blob.data(), blob.size(), in_shape.data(), in_shape.size());
+
+  const char *in_names[]  = {"images"};
+  const char *out_names[] = {"keypoints", "descriptors", "scores"};
+  std::vector<Ort::Value> outs;
+  try {
+    outs = xfeat_session_->Run(Ort::RunOptions{nullptr}, in_names, &in_tensor, 1, out_names, 3);
+  } catch (const Ort::Exception &e) {
+    PRINT_ERROR("[XFEAT] ORT inference failed: %s\n", e.what());
+    return;
+  }
+
+  auto kpts_shape = outs[0].GetTensorTypeAndShapeInfo().GetShape();
+  int N = (int)kpts_shape[0];
+  if (N == 0)
+    return;
+
+  const float *kpts_ptr  = outs[0].GetTensorData<float>(); // [N, 2] (x, y)
+  const float *desc_ptr  = outs[1].GetTensorData<float>(); // [N, 64]
+  const float *score_ptr = outs[2].GetTensorData<float>(); // [N]
+
+  // Collect in-bounds candidates sorted by score (descending)
+  std::vector<int> valid;
+  valid.reserve(N);
+  {
+    std::vector<int> order(N);
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](int a, int b) { return score_ptr[a] > score_ptr[b]; });
+    for (int ii : order) {
+      float x = kpts_ptr[ii * 2], y = kpts_ptr[ii * 2 + 1];
+      if (x < 0 || x >= W || y < 0 || y >= H)
+        continue;
+      if (!mask.empty() && mask.at<uint8_t>((int)y, (int)x) != 0)
+        continue;
+      valid.push_back(ii);
+    }
+  }
+
+  cv::Size grid_sz(W / min_px_dist, H / min_px_dist);
+  cv::Mat grid = cv::Mat::zeros(grid_sz, CV_8UC1);
+  desc = cv::Mat(0, 64, CV_32F);
+  std::vector<bool> used(N, false);
+
+  // Helper: try to accept candidate ii into the grid
+  auto try_accept = [&](int ii) -> bool {
+    float x = kpts_ptr[ii * 2], y = kpts_ptr[ii * 2 + 1];
+    int xg = (int)(x / min_px_dist), yg = (int)(y / min_px_dist);
+    if (xg < 0 || xg >= grid_sz.width || yg < 0 || yg >= grid_sz.height)
+      return false;
+    if (grid.at<uint8_t>(yg, xg) > 127)
+      return false;
+    grid.at<uint8_t>(yg, xg) = 255;
+    cv::KeyPoint kp;
+    kp.pt       = cv::Point2f(x, y);
+    kp.response = score_ptr[ii];
+    pts.push_back(kp);
+    desc.push_back(cv::Mat(1, 64, CV_32F, const_cast<float *>(desc_ptr + ii * 64)).clone());
+    ids.push_back(++currid);
+    used[ii] = true;
+    return true;
+  };
+
+  // Pass 1 (temporal continuity): for each hint, accept the closest in-bounds candidate
+  // within min_px_dist pixels. At 200m altitude / 30Hz the inter-frame pixel motion is
+  // ~2-3px, so this reliably re-selects the same physical feature before grid-fill.
+  if (pts_hint && !pts_hint->empty()) {
+    const float radius = (float)min_px_dist;
+    for (const auto &h : *pts_hint) {
+      if ((int)pts.size() >= num_features)
+        break;
+      int best = -1;
+      float best_d = radius;
+      for (int ii : valid) {
+        if (used[ii])
+          continue;
+        float dx = h.pt.x - kpts_ptr[ii * 2];
+        float dy = h.pt.y - kpts_ptr[ii * 2 + 1];
+        float d = std::sqrt(dx * dx + dy * dy);
+        if (d < best_d) {
+          best_d = d;
+          best    = ii;
+        }
+      }
+      if (best >= 0)
+        try_accept(best);
+    }
+  }
+
+  // Pass 2 (grid-fill): accept remaining candidates in score order
+  for (int ii : valid) {
+    if ((int)pts.size() >= num_features)
+      break;
+    if (used[ii])
+      continue;
+    try_accept(ii);
+  }
+
+  PRINT_INFO("[XFEAT] detected=%d  hint_pass=%zu  accepted=%zu\n", N,
+             pts_hint ? pts_hint->size() : 0, pts.size());
+#endif
+}
+
+void TrackDescriptor::detect_superpoint(const cv::Mat &img, const cv::Mat &mask, std::vector<cv::KeyPoint> &pts,
+                                        cv::Mat &desc, std::vector<size_t> &ids,
+                                        const std::vector<cv::KeyPoint> *pts_hint) {
+#ifndef USE_ONNXRUNTIME
+  (void)img; (void)mask; (void)pts; (void)desc; (void)ids; (void)pts_hint;
+  PRINT_ERROR("[SP] detect_superpoint called but built without USE_ONNXRUNTIME!\n");
+#else
+  int H = img.rows, W = img.cols;
+
+  // Input: [1, 1, H, W] float32 grayscale normalised to [0, 1]
+  std::vector<float> blob(H * W);
+  cv::Mat img_f;
+  img.convertTo(img_f, CV_32F, 1.0 / 255.0);
+  std::memcpy(blob.data(), img_f.ptr<float>(0), H * W * sizeof(float));
+
+  std::array<int64_t, 4> in_shape{1, 1, (int64_t)H, (int64_t)W};
+  Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+  Ort::Value in_tensor = Ort::Value::CreateTensor<float>(mem_info, blob.data(), blob.size(), in_shape.data(), in_shape.size());
+
+  const char *in_names[]  = {"image"};
+  const char *out_names[] = {"keypoints", "scores", "descriptors"};
+  std::vector<Ort::Value> outs;
+  try {
+    outs = sp_session_->Run(Ort::RunOptions{nullptr}, in_names, &in_tensor, 1, out_names, 3);
+  } catch (const Ort::Exception &e) {
+    PRINT_ERROR("[SP] ORT inference failed: %s\n", e.what());
+    return;
+  }
+
+  // Outputs: keypoints [1,N,2] int64, scores [1,N] float, descriptors [1,N,256] float
+  auto kpts_shape = outs[0].GetTensorTypeAndShapeInfo().GetShape();
+  int N = (int)kpts_shape[1];  // shape is [1, N, 2]
+  if (N == 0) return;
+
+  const int64_t *kpts_ptr  = outs[0].GetTensorData<int64_t>(); // [1,N,2]: kpts[i*2+0]=x, [i*2+1]=y
+  const float   *score_ptr = outs[1].GetTensorData<float>();   // [1,N]
+  const float   *desc_ptr  = outs[2].GetTensorData<float>();   // [1,N,256]
+
+  // Collect in-bounds candidates sorted by score descending
+  std::vector<int> order;
+  order.reserve(N);
+  {
+    std::vector<int> all(N);
+    std::iota(all.begin(), all.end(), 0);
+    std::sort(all.begin(), all.end(), [&](int a, int b) { return score_ptr[a] > score_ptr[b]; });
+    for (int ii : all) {
+      float x = (float)kpts_ptr[ii * 2], y = (float)kpts_ptr[ii * 2 + 1];
+      if (x >= 0 && x < W && y >= 0 && y < H)
+        if (mask.empty() || mask.at<uint8_t>((int)y, (int)x) == 0)
+          order.push_back(ii);
+    }
+  }
+
+  cv::Size grid_sz(W / min_px_dist, H / min_px_dist);
+  cv::Mat grid = cv::Mat::zeros(grid_sz, CV_8UC1);
+  desc = cv::Mat(0, 256, CV_32F);
+  std::vector<bool> used(N, false);
+
+  auto try_accept_sp = [&](int ii) -> bool {
+    float x = (float)kpts_ptr[ii * 2], y = (float)kpts_ptr[ii * 2 + 1];
+    int xg = (int)(x / min_px_dist), yg = (int)(y / min_px_dist);
+    if (xg < 0 || xg >= grid_sz.width || yg < 0 || yg >= grid_sz.height) return false;
+    if (grid.at<uint8_t>(yg, xg) > 127) return false;
+    grid.at<uint8_t>(yg, xg) = 255;
+    cv::KeyPoint kp;
+    kp.pt = cv::Point2f(x, y);
+    kp.response = score_ptr[ii];
+    pts.push_back(kp);
+    desc.push_back(cv::Mat(1, 256, CV_32F, const_cast<float *>(desc_ptr + ii * 256)).clone());
+    ids.push_back(++currid);
+    used[ii] = true;
+    return true;
+  };
+
+  // Pass 1: accept the highest-score SP keypoint nearest to each hint within min_px_dist.
+  // SP outputs integer NMS keypoints — same physical feature is at the same pixel each
+  // frame, so spatial proximity reliably identifies the same scene point.
+  if (pts_hint && !pts_hint->empty()) {
+    const float radius = (float)min_px_dist;
+    for (const auto &h : *pts_hint) {
+      if ((int)pts.size() >= num_features) break;
+      int best = -1;
+      float best_d = radius;
+      for (int ii : order) {
+        if (used[ii]) continue;
+        float dx = h.pt.x - (float)kpts_ptr[ii * 2];
+        float dy = h.pt.y - (float)kpts_ptr[ii * 2 + 1];
+        float d = std::sqrt(dx * dx + dy * dy);
+        if (d < best_d) { best_d = d; best = ii; }
+      }
+      if (best >= 0) try_accept_sp(best);
+    }
+  }
+
+  // Pass 2: grid-fill from remaining candidates in score order
+  for (int ii : order) {
+    if ((int)pts.size() >= num_features) break;
+    if (used[ii]) continue;
+    try_accept_sp(ii);
+  }
+
+  PRINT_INFO("[SP] detected=%d hint=%zu accepted=%zu\n", N, pts_hint ? pts_hint->size() : 0, pts.size());
+#endif
+}
+
+void TrackDescriptor::perform_detection_monocular(const cv::Mat &img0, const cv::Mat &mask0, std::vector<cv::KeyPoint> &pts0,
+                                                  cv::Mat &desc0, std::vector<size_t> &ids0,
+                                                  const std::vector<cv::KeyPoint> *pts_hint) {
+
   assert(pts0.empty());
+
+  // Neural detector paths — both accept the temporal hint
+  if (use_sp_) {
+    detect_superpoint(img0, mask0, pts0, desc0, ids0, pts_hint);
+    return;
+  }
+  if (use_xfeat_) {
+    detect_xfeat(img0, mask0, pts0, desc0, ids0, pts_hint);
+    return;
+  }
+
+  // ORB/FAST path — standard Grider_FAST + grid selection (no temporal hint).
+  // The hint parameter is accepted but ignored for ORB: on low-texture aerial scenes
+  // biasing toward previous locations selects weaker corners and hurts match quality.
 
   // Extract our features (use FAST with griding)
   std::vector<cv::KeyPoint> pts0_ext;
@@ -366,34 +678,23 @@ void TrackDescriptor::perform_detection_monocular(const cv::Mat &img0, const cv:
   cv::Mat desc0_ext;
   this->orb0->compute(img0, pts0_ext, desc0_ext);
 
-  // Create a 2D occupancy grid for this current image
-  // Note that we scale this down, so that each grid point is equal to a set of pixels
-  // This means that we will reject points that less then grid_px_size points away then existing features
+  // Create a 2D occupancy grid to enforce min_px_dist spacing
   cv::Size size((int)((float)img0.cols / (float)min_px_dist), (int)((float)img0.rows / (float)min_px_dist));
   cv::Mat grid_2d = cv::Mat::zeros(size, CV_8UC1);
 
-  // For all good matches, lets append to our returned vectors
-  // NOTE: if we multi-thread this atomic can cause some randomness due to multiple thread detecting features
-  // NOTE: this is due to the fact that we select update features based on feat id
-  // NOTE: thus the order will matter since we try to select oldest (smallest id) to update with
-  // NOTE: not sure how to remove... maybe a better way?
   for (size_t i = 0; i < pts0_ext.size(); i++) {
-    // Get current left keypoint, check that it is in bounds
     cv::KeyPoint kpt = pts0_ext.at(i);
     int x = (int)kpt.pt.x;
     int y = (int)kpt.pt.y;
     int x_grid = (int)(kpt.pt.x / (float)min_px_dist);
     int y_grid = (int)(kpt.pt.y / (float)min_px_dist);
-    if (x_grid < 0 || x_grid >= size.width || y_grid < 0 || y_grid >= size.height || x < 0 || x >= img0.cols || y < 0 || y >= img0.rows) {
+    if (x_grid < 0 || x_grid >= size.width || y_grid < 0 || y_grid >= size.height || x < 0 || x >= img0.cols || y < 0 ||
+        y >= img0.rows)
       continue;
-    }
-    // Check if this keypoint is near another point
     if (grid_2d.at<uint8_t>(y_grid, x_grid) > 127)
       continue;
-    // Else we are good, append our keypoints and descriptors
     pts0.push_back(pts0_ext.at(i));
     desc0.push_back(desc0_ext.row((int)i));
-    // Set our IDs to be unique IDs here, will later replace with corrected ones, after temporal matching
     size_t temp = ++currid;
     ids0.push_back(temp);
     grid_2d.at<uint8_t>(y_grid, x_grid) = 255;
@@ -483,17 +784,38 @@ void TrackDescriptor::robust_match(const std::vector<cv::KeyPoint> &pts0, const 
   // Our 1to2 and 2to1 match vectors
   std::vector<std::vector<cv::DMatch>> matches0to1, matches1to0;
 
-  // Match descriptors (return 2 nearest neighbours)
-  matcher->knnMatch(desc0, desc1, matches0to1, 2);
-  matcher->knnMatch(desc1, desc0, matches1to0, 2);
+  // Use L2 for float descriptors (XFeat 64-dim), Hamming for binary (ORB)
+  cv::Ptr<cv::DescriptorMatcher> active_matcher =
+      (desc0.type() == CV_8U) ? cv::DescriptorMatcher::create("BruteForce-Hamming") : cv::DescriptorMatcher::create("BruteForce");
+  active_matcher->knnMatch(desc0, desc1, matches0to1, 2);
+  active_matcher->knnMatch(desc1, desc0, matches1to0, 2);
+  match_n_knn_ = (int)(matches0to1.size() + matches1to0.size());
 
   // Do a ratio test for both matches
   robust_ratio_test(matches0to1);
   robust_ratio_test(matches1to0);
+  match_n_ratio_ = 0;
+  for (auto &m : matches0to1) if (!m.empty()) match_n_ratio_++;
 
   // Finally do a symmetry test
   std::vector<cv::DMatch> matches_good;
   robust_symmetry_test(matches0to1, matches1to0, matches_good);
+  match_pre_gate_ = (int)matches_good.size();
+
+  // Spatial gate: reject matches whose pixel displacement exceeds the threshold.
+  // At high-speed drone flight, wrong global kNN matches have large displacements.
+  // Filtering them before RANSAC avoids degenerate fundamental matrix estimation.
+  if (max_match_px_dist_ > 0.0) {
+    std::vector<cv::DMatch> gated;
+    gated.reserve(matches_good.size());
+    for (const auto &m : matches_good) {
+      cv::Point2f d = pts0[m.queryIdx].pt - pts1[m.trainIdx].pt;
+      if (std::sqrt(d.x * d.x + d.y * d.y) <= max_match_px_dist_)
+        gated.push_back(m);
+    }
+    matches_good = std::move(gated);
+  }
+  match_post_gate_ = (int)matches_good.size();
 
   // Convert points into points for RANSAC
   std::vector<cv::Point2f> pts0_rsc, pts1_rsc;
@@ -533,6 +855,7 @@ void TrackDescriptor::robust_match(const std::vector<cv::KeyPoint> &pts0, const 
     // Else, lets append this match to the return array!
     matches.push_back(matches_good.at(i));
   }
+  match_n_ransac_ = (int)matches.size();
 }
 
 void TrackDescriptor::robust_ratio_test(std::vector<std::vector<cv::DMatch>> &matches) {

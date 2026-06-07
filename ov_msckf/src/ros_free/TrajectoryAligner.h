@@ -76,6 +76,59 @@ public:
     return true;
   }
 
+  /**
+   * @brief Fit only horizontal yaw and translation (no roll/pitch, no scale).
+   *
+   * GPS is an ENU reference (x=east, y=north, z=up). In high-altitude,
+   * mostly-straight flight, full 3D SE3 alignment is poorly conditioned:
+   * altitude drift can produce a large pitch/roll rotation that makes the
+   * top-down dashboard look reversed. This keeps alignment in the XY plane.
+   */
+  bool solve_xy_yaw(const std::vector<Eigen::Vector3d> &vio, const std::vector<Eigen::Vector3d> &gt) {
+    if (vio.size() != gt.size() || vio.size() < 2)
+      return false;
+    const size_t N = vio.size();
+    Eigen::Vector2d cv = Eigen::Vector2d::Zero(), cg = Eigen::Vector2d::Zero();
+    double zv = 0.0, zg = 0.0;
+    for (size_t i = 0; i < N; ++i) {
+      cv += vio[i].head<2>();
+      cg += gt[i].head<2>();
+      zv += vio[i].z();
+      zg += gt[i].z();
+    }
+    cv /= static_cast<double>(N);
+    cg /= static_cast<double>(N);
+    zv /= static_cast<double>(N);
+    zg /= static_cast<double>(N);
+
+    Eigen::Matrix2d H = Eigen::Matrix2d::Zero();
+    double spread = 0.0;
+    for (size_t i = 0; i < N; ++i) {
+      const Eigen::Vector2d dv = vio[i].head<2>() - cv;
+      const Eigen::Vector2d dg = gt[i].head<2>() - cg;
+      H.noalias() += dv * dg.transpose();
+      spread += dv.squaredNorm();
+    }
+    if (spread < 1e-6)
+      return false;
+
+    Eigen::JacobiSVD<Eigen::Matrix2d> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    Eigen::Matrix2d U = svd.matrixU();
+    Eigen::Matrix2d V = svd.matrixV();
+    Eigen::Matrix2d S = Eigen::Matrix2d::Identity();
+    if ((V * U.transpose()).determinant() < 0)
+      S(1, 1) = -1;
+    Eigen::Matrix2d R2 = V * S * U.transpose();
+
+    R_.setIdentity();
+    R_.block<2, 2>(0, 0) = R2;
+    t_.setZero();
+    t_.head<2>() = cg - R2 * cv;
+    t_.z() = zg - zv;
+    solved_ = true;
+    return true;
+  }
+
   /// [中文] 将 VIO world 坐标下的点映射到 GT/GPS 坐标系
   Eigen::Vector3d align_point(const Eigen::Vector3d &p_vio) const { return R_ * p_vio + t_; }
 

@@ -330,11 +330,12 @@ Eigen::VectorXd build_global_yaw_gauge_mixed(std::shared_ptr<State> state, int N
 }
 
 Eigen::MatrixXd project_global_yaw_from_H(std::shared_ptr<State> state, const std::vector<std::shared_ptr<Type>> &H_order,
-                                          const std::vector<int> &H_id, const Eigen::MatrixXd &H, double alpha) {
+                                          const std::vector<int> &H_id, const Eigen::MatrixXd &H, double alpha,
+                                          bool use_fej = false) {
   alpha = std::max(0.0, std::min(1.0, alpha));
   if (alpha <= 1e-12)
     return H;
-  Eigen::VectorXd n = build_global_yaw_gauge_small(state, H_order, H_id, H.cols());
+  Eigen::VectorXd n = build_global_yaw_gauge_small(state, H_order, H_id, H.cols(), use_fej);
   const double n2 = n.squaredNorm();
   if (n2 < 1e-12)
     return H;
@@ -568,6 +569,9 @@ void StateHelper::EKFPropagation(std::shared_ptr<State> state, const std::vector
   }
 }
 
+// ── VINS numeric nullspace (Route 4) static config — must be before EKFUpdate ─
+static StateHelper::VinsNullspaceConfig g_vins_nullspace_cfg;
+
 void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std::shared_ptr<Type>> &H_order, const Eigen::MatrixXd &H,
                             const Eigen::VectorXd &res, const Eigen::MatrixXd &R, VisualYawUpdateMode visual_yaw_update_mode,
                             double visual_yaw_update_scale, double visual_global_yaw_oc_alpha,
@@ -623,9 +627,13 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
   }
   Eigen::MatrixXd H_eff = H;
   if (visual_yaw_update_mode == VisualYawUpdateMode::GLOBAL_YAW_OC_PROJECTION) {
-    H_eff = project_global_yaw_from_H(state, H_order, H_id, H, visual_global_yaw_oc_alpha);
+    H_eff = project_global_yaw_from_H(state, H_order, H_id, H, visual_global_yaw_oc_alpha, /*use_fej=*/false);
+  } else if (visual_yaw_update_mode == VisualYawUpdateMode::GLOBAL_YAW_OC_FEJ_PROJECTION) {
+    H_eff = project_global_yaw_from_H(state, H_order, H_id, H, visual_global_yaw_oc_alpha, /*use_fej=*/true);
+  // DSO_INCREMENT_ORTHO (enum 11): v1 K-projection retired; mode removed from official dispatch.
+  // String "dso_increment_ortho" now redirects to GLOBAL_YAW_OC_FEJ_PROJECTION in VioManager.
   } else if (visual_yaw_update_mode == VisualYawUpdateMode::HARD_GYRO_YAW) {
-    H_eff = project_global_yaw_from_H(state, H_order, H_id, H, 1.0);
+    H_eff = project_global_yaw_from_H(state, H_order, H_id, H, 1.0, /*use_fej=*/false);
   } else if (visual_yaw_update_mode == VisualYawUpdateMode::A_STRICT_YAW_DX0) {
     H_eff = project_per_block_yaw_from_H(state, H_order, H_id, H, 0.0, false);
   } else if (visual_yaw_update_mode == VisualYawUpdateMode::PER_BLOCK_SCALE ||
@@ -659,11 +667,23 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
   S.triangularView<Eigen::Upper>() += R;
   // Eigen::MatrixXd S = H * P_small * H.transpose() + R;
 
-  // Invert our S (should we use a more stable method here??)
-  Eigen::MatrixXd Sinv = Eigen::MatrixXd::Identity(R.rows(), R.rows());
-  S.selfadjointView<Eigen::Upper>().llt().solveInPlace(Sinv);
-  Eigen::MatrixXd K = M_a * Sinv.selfadjointView<Eigen::Upper>();
-  // Eigen::MatrixXd K = M_a * S.inverse();
+  // Invert S: Cholesky for all modes.
+  // VINS_NUMERIC_NULLSPACE (enum 12) is retired — fly3 smoke showed n_zeroed=0 at
+  // eig_thresh=1e-6, meaning EVD adds no nullspace maintenance vs Cholesky.
+  Eigen::MatrixXd K(M_a.rows(), R.rows());
+  if (visual_yaw_update_mode == VisualYawUpdateMode::VINS_NUMERIC_NULLSPACE) {
+    static bool g_vins_warned = false;
+    if (!g_vins_warned) {
+      PRINT_WARNING(RED "[VINS-NULLSPACE] mode is retired (smoke n_zeroed=0 at 1e-6); "
+                        "falling through to Cholesky.\n" RESET);
+      g_vins_warned = true;
+    }
+  }
+  {
+    Eigen::MatrixXd Sinv = Eigen::MatrixXd::Identity(R.rows(), R.rows());
+    S.selfadjointView<Eigen::Upper>().llt().solveInPlace(Sinv);
+    K = M_a * Sinv.selfadjointView<Eigen::Upper>();
+  }
 
   // Scale bg_z row of K for visual bg_z ablation (default scale=1.0 = no change)
   if (visual_bgz_update_scale < 1.0 - 1e-12 &&
@@ -673,11 +693,10 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
       K.row(bgz_row) *= visual_bgz_update_scale;
   }
 
-  // Update Covariance
+
+  // Covariance update (standard for all modes; K is unmodified so K = M_a S^{-1} holds).
   state->_Cov.triangularView<Eigen::Upper>() -= K * M_a.transpose();
   state->_Cov = state->_Cov.selfadjointView<Eigen::Upper>();
-  // Cov -= K * M_a.transpose();
-  // Cov = 0.5*(Cov+Cov.transpose());
 
   // We should check if we are not positive semi-definitate (i.e. negative diagionals is not s.p.d)
   Eigen::VectorXd diags = state->_Cov.diagonal();
@@ -703,6 +722,100 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
     zero_visual_yaw_dx(state, dx, false);
   }
   last_yaw_dx_projection_diag.dx_yaw_after_projection_deg = yaw_dx_component_deg(state, dx);
+
+  // CONSTRAINED_YAW_NULLSPACE: post-update rank-1 constraint nᵀδx=0 (Simon & Chia 2002).
+  // Runs AFTER the standard EKF P update (P is P_new here), modifying both dx and P.
+  // dx_c = dx - K_c(nᵀdx),  P_c = P - P·n·nᵀ·P / (nᵀPn)
+  if (visual_yaw_update_mode == VisualYawUpdateMode::CONSTRAINED_YAW_NULLSPACE) {
+    const int N = (int)state->_Cov.rows();
+    Eigen::VectorXd n = build_global_yaw_gauge_full(state, N, /*use_fej=*/true);
+    const double n_norm = n.norm();
+
+    static int g_con_n = 0;
+    ++g_con_n;
+    bool do_diag = (g_con_n <= 10 || g_con_n % 500 == 0);
+
+    const bool cov_finite = state->_Cov.allFinite();
+    const bool dx_finite  = dx.allFinite();
+
+    // Compute P_n = nᵀ P n (scalar gauge variance)
+    double P_n = 0.0;
+    Eigen::VectorXd Pn;
+    if (n_norm > 1e-10 && cov_finite) {
+      Pn = state->_Cov * n;
+      P_n = n.dot(Pn);
+    }
+
+    bool can_constrain = (n_norm > 1e-10) && cov_finite && dx_finite && (P_n > 1e-15);
+    if (!can_constrain) {
+      PRINT_WARNING(YELLOW "[CNSTR-YAW #%d] SKIPPED: n_norm=%.3e P_n=%.3e "
+                           "cov_finite=%s dx_finite=%s\n" RESET,
+                   g_con_n, n_norm, P_n,
+                   cov_finite ? "OK" : "NaN/Inf", dx_finite ? "OK" : "NaN/Inf");
+    } else {
+      // Collect cross-covariance diagnostics before projection
+      int pz_idx = -1, px_idx = -1, py_idx = -1, qz_idx = -1;
+      if (state->_imu) {
+        if (state->_imu->p()) {
+          px_idx = state->_imu->p()->id() + 0;
+          py_idx = state->_imu->p()->id() + 1;
+          pz_idx = state->_imu->p()->id() + 2;
+        }
+        if (state->_imu->q())
+          qz_idx = state->_imu->q()->id() + 2;
+      }
+
+      const double nTdx_before = (n_norm > 1e-30) ? n.dot(dx) / n_norm : 0.0;
+      const double min_diag_before = state->_Cov.diagonal().minCoeff();
+      double P_zx_b = 0, P_zy_b = 0, P_zt_b = 0;
+      if (do_diag && pz_idx >= 0) {
+        if (px_idx >= 0) P_zx_b = state->_Cov(pz_idx, px_idx);
+        if (py_idx >= 0) P_zy_b = state->_Cov(pz_idx, py_idx);
+        if (qz_idx >= 0) P_zt_b = state->_Cov(pz_idx, qz_idx);
+      }
+
+      // Constraint gain K_c = P·n / P_n  (N-vector)
+      Eigen::VectorXd K_c = Pn / P_n;
+
+      // Apply to dx
+      const double nTdx = n.dot(dx);
+      const Eigen::VectorXd dx_correction = K_c * nTdx;
+      const double correction_norm = dx_correction.norm();
+      dx -= dx_correction;
+
+      // Apply rank-1 deflation to P: P_c = P - P·n·nᵀ·P / P_n = P - Pn·Pnᵀ / P_n
+      state->_Cov.noalias() -= (Pn * Pn.transpose()) / P_n;
+      state->_Cov = 0.5 * (state->_Cov + state->_Cov.transpose());
+
+      const double nTdx_after   = (n_norm > 1e-30) ? n.dot(dx) / n_norm : 0.0;
+      const double min_diag_after = state->_Cov.diagonal().minCoeff();
+      const double sym_err_after  = (state->_Cov - state->_Cov.transpose()).norm();
+
+      if (do_diag) {
+        double P_zx_a = 0, P_zy_a = 0, P_zt_a = 0;
+        if (pz_idx >= 0) {
+          if (px_idx >= 0) P_zx_a = state->_Cov(pz_idx, px_idx);
+          if (py_idx >= 0) P_zy_a = state->_Cov(pz_idx, py_idx);
+          if (qz_idx >= 0) P_zt_a = state->_Cov(pz_idx, qz_idx);
+        }
+        PRINT_INFO(YELLOW "[CNSTR-YAW #%d] nᵀdx/||n||: %.3e → %.3e  "
+                          "corr_norm=%.3e  P_n=%.3e\n" RESET,
+                   g_con_n, nTdx_before, nTdx_after, correction_norm, P_n);
+        PRINT_INFO(YELLOW "[CNSTR-YAW #%d] min_diag: %.3e → %.3e  sym_err=%.3e\n" RESET,
+                   g_con_n, min_diag_before, min_diag_after, sym_err_after);
+        if (pz_idx >= 0)
+          PRINT_INFO(YELLOW "[CNSTR-YAW #%d] P_zx: %.3e→%.3e  P_zy: %.3e→%.3e  "
+                            "P_zt: %.3e→%.3e\n" RESET,
+                     g_con_n, P_zx_b, P_zx_a, P_zy_b, P_zy_a, P_zt_b, P_zt_a);
+        if (g_con_n <= 2) {
+          Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> saes(state->_Cov, Eigen::EigenvaluesOnly);
+          PRINT_INFO(YELLOW "[CNSTR-YAW #%d] min_ev=%.3e\n" RESET,
+                     g_con_n, saes.eigenvalues().minCoeff());
+        }
+      }
+    }
+  }
+
   for (size_t i = 0; i < state->_variables.size(); i++) {
     state->_variables.at(i)->update(dx.block(state->_variables.at(i)->id(), 0, state->_variables.at(i)->size(), 1));
   }
@@ -1244,6 +1357,10 @@ void StateHelper::EKFUpdateYawGaugeHProjectionCurrent(
   EKFUpdate(state, H_order, H_eff, res, R, VisualYawUpdateMode::ORIGINAL, 1.0, 0.0);
 }
 
+void StateHelper::set_vins_nullspace_config(const VinsNullspaceConfig &cfg) {
+  g_vins_nullspace_cfg = cfg;
+}
+
 // ── Guarded Schmidt (mode D) static state ─────────────────────────────────────
 static StateHelper::SchmidtGuardConfig g_guard_cfg;
 static std::ofstream g_guard_log_csv;
@@ -1431,6 +1548,11 @@ void StateHelper::inject_pz_noise(std::shared_ptr<State> state, double noise) {
   state->_Cov(global_pz, global_pz) += noise;
 }
 
+void StateHelper::inject_h_offset_noise(std::shared_ptr<State> state, double noise) {
+  if (!state->_h_offset || state->_h_offset->id() < 0) return;
+  state->_Cov(state->_h_offset->id(), state->_h_offset->id()) += noise;
+}
+
 void StateHelper::ekf_update_zonly(std::shared_ptr<State> state, double R) {
   int pz_global = state->_imu->p()->id() + 2; // p_z = 3rd element of IMU position
   double P_pz = state->_Cov(pz_global, pz_global);
@@ -1467,6 +1589,118 @@ void StateHelper::EKFUpdateZOnly(std::shared_ptr<State> state,
   Eigen::Vector3d p_final = p_pre;
   p_final(2) = p_z_new;
   state->_imu->p()->set_value(p_final);
+}
+
+// =============================================================================
+// josephCovUpdate — pure-math Joseph-form covariance update
+// Ported from PX4-Autopilot ekf_helper.cpp:measurementUpdate lines 1127-1171
+// Commit d5a0ca1bbc5e932bba5dc5b2bb58e0e0147f9909, BSD-3 License
+// Copyright (c) 2012-2025 PX4 Development Team
+// =============================================================================
+void StateHelper::josephCovUpdate(Eigen::MatrixXd &P,
+                                   const Eigen::VectorXd &K,
+                                   const Eigen::VectorXd &H,
+                                   double R) {
+  const int N = (int)P.rows();
+  assert(P.cols() == N);
+  assert((int)K.rows() == N);
+  assert((int)H.rows() == N);
+
+  // Step 1 (PX4 "conventional update"): P = (I - K * H^T) * P
+  //   PH = P * H  (N×1)
+  //   P(i,j) -= K(i) * PH(j)  for all i,j
+  // Matrix form: P -= K * (P*H)^T = K * H^T * P
+  // For masked K entries (K(i)=0), that row of P is unchanged in this step.
+  Eigen::VectorXd PH = P * H;
+  P.noalias() -= K * PH.transpose();
+
+  // Step 2 (PX4 "stabilized update"): enforces Joseph form and symmetry
+  //   PH = P_step1 * H  (recomputed)
+  //   P(i,j) = P(i,j) - PH(i)*K(j) + K(i)*R*K(j)  for j<=i
+  //   P(j,i) = P(i,j)
+  // Net result: P = P_step1*(I - H*K^T) + R*K*K^T
+  //           = (I-K*H^T)*P*(I-K*H^T)^T + R*K*K^T  (Joseph form)
+  PH = P * H;
+  for (int i = 0; i < N; i++) {
+    for (int j = 0; j <= i; j++) {
+      const double v = P(i, j) - PH(i) * K(j) + K(i) * R * K(j);
+      P(i, j) = v;
+      P(j, i) = v;
+    }
+  }
+}
+
+// =============================================================================
+// EKFUpdateJoseph — State-aware Joseph update with pre-computed masked gain
+// Ported from PX4-Autopilot ekf_helper.cpp:measurementUpdate + fuseHaglRng
+// Commit d5a0ca1bbc5e932bba5dc5b2bb58e0e0147f9909, BSD-3 License
+// Copyright (c) 2012-2025 PX4 Development Team
+// =============================================================================
+void StateHelper::EKFUpdateJoseph(std::shared_ptr<State> state,
+                                   const Eigen::VectorXd &K_full,
+                                   const Eigen::VectorXd &H_full,
+                                   double R, double res) {
+  const int N = (int)state->_Cov.rows();
+  assert((int)K_full.rows() == N);
+  assert((int)H_full.rows() == N);
+
+  // Covariance update — Joseph form (K_full may have zeroed entries for masking)
+  josephCovUpdate(state->_Cov, K_full, H_full, R);
+
+  // State correction: dx = K_full * res
+  // Variables with all-zero K block are skipped (masked out).
+  const Eigen::VectorXd dx = K_full * res;
+  for (const auto &var : state->_variables) {
+    const int id = var->id(), sz = var->size();
+    if (id < 0 || id + sz > N) continue;
+    if (dx.segment(id, sz).norm() < 1e-18) continue;
+    var->update(dx.segment(id, sz));
+  }
+}
+
+// =============================================================================
+// EKFUpdateJosephMasked — convenience wrapper
+// Ported from PX4-Autopilot fuseHaglRng K-masking pattern
+// Commit d5a0ca1bbc5e932bba5dc5b2bb58e0e0147f9909, BSD-3 License
+// Copyright (c) 2012-2025 PX4 Development Team
+// =============================================================================
+void StateHelper::EKFUpdateJosephMasked(std::shared_ptr<State> state,
+                                         const std::vector<std::shared_ptr<Type>> &H_order,
+                                         const Eigen::MatrixXd &H,
+                                         const Eigen::VectorXd &res,
+                                         const Eigen::MatrixXd &R,
+                                         std::shared_ptr<Type> active_var,
+                                         int active_dof) {
+  assert(H.rows() == 1 && res.rows() == 1 && R.rows() == 1 && R.cols() == 1);
+
+  const int N = (int)state->_Cov.rows();
+  const int active_global_idx = active_var->id() + active_dof;
+  assert(active_global_idx >= 0 && active_global_idx < N);
+
+  // --- Expand compressed H to global H_full (N×1) ---
+  Eigen::VectorXd H_full = Eigen::VectorXd::Zero(N);
+  {
+    int col = 0;
+    for (const auto &var : H_order) {
+      for (int k = 0; k < var->size(); k++)
+        H_full(var->id() + k) = H(0, col + k);
+      col += var->size();
+    }
+  }
+
+  // --- Compute optimal K = P * H_full / S ---
+  Eigen::VectorXd M = state->_Cov * H_full;          // N×1 gain numerator
+  const double S = H_full.dot(M) + R(0, 0);           // innovation variance
+  if (S < 1e-18) return;                               // degenerate: skip
+  Eigen::VectorXd K_full = M / S;
+
+  // --- Mask K: zero all entries except active_global_idx (PX4 fuseHaglRng pattern) ---
+  const double k_active = K_full(active_global_idx);
+  K_full.setZero();
+  K_full(active_global_idx) = k_active;
+
+  // --- Joseph-form update with masked K ---
+  EKFUpdateJoseph(state, K_full, H_full, R(0, 0), res(0));
 }
 
 Eigen::MatrixXd StateHelper::get_marginal_covariance(std::shared_ptr<State> state,

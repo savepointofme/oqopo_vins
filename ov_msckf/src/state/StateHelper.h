@@ -57,16 +57,33 @@ class StateHelper {
 
 public:
   enum class VisualYawUpdateMode {
-    ORIGINAL = 0,
-    PER_BLOCK_SCALE = 1,
-    GLOBAL_YAW_OC_PROJECTION = 2,
-    CURRENT_ONLY_SCALE = 3,
-    HARD_GYRO_YAW = 4,
-    A_STRICT_YAW_DX0 = 5,
-    VISUAL_YAW_SCHMIDT_CURRENT_GAUGE = 6,   // K-space: K_eff = (I-qq^T)K_std, gauge built from current state
-    VISUAL_YAW_H_PROJECTION_CURRENT   = 7,  // H-space: H_eff = H - (Hq)q^T, then standard EKF
-    VISUAL_YAW_SCHMIDT_GUARDED        = 8,  // Schmidt + pre-update guard: R-inflate or reject suspicious updates
-    VISUAL_YAW_SCHMIDT_FEJ_GAUGE      = 9   // K-space: same Schmidt math as mode 6, gauge built from FEJ state
+    // ── Official modes (safe for reported results, see official_yaw_modes_20260606.md) ──
+    ORIGINAL                         =  0, // official: original_fej — FEJ Jacobians, no OC projection
+    GLOBAL_YAW_OC_PROJECTION         =  2, // official: oc_mode2    — post-chi2 OC, current gauge, alpha=1.0
+    GLOBAL_YAW_OC_FEJ_PROJECTION     = 10, // accessible: oc_legacy_fej — post-chi2 OC, FEJ gauge (fly1 Cond3)
+    // (msckf2_0 / oc_prechi2 is dispatched via VisualObservabilityPolicy::is_prechi2_mode_string, not this enum)
+
+    // ── Internal / infrastructure ─────────────────────────────────────────────
+    PER_BLOCK_SCALE                  =  1, // INTERNAL_ONLY: "no yaw update" placeholder (--no-vio-yaw-update)
+
+    // ── Experimental-only (not for official results, loud warning at CLI) ─────
+    HARD_GYRO_YAW                    =  4, // EXPERIMENTAL_ONLY: replaces yaw innovation with gyro integral (debug)
+    A_STRICT_YAW_DX0                 =  5, // EXPERIMENTAL_ONLY: hard dx_yaw=0 constraint
+    VISUAL_YAW_SCHMIDT_CURRENT_GAUGE =  6, // EXPERIMENTAL_ONLY: Schmidt K-projection, current-state gauge
+    VISUAL_YAW_H_PROJECTION_CURRENT  =  7, // EXPERIMENTAL_ONLY: H-projection with current gauge (superseded by mode 2)
+    VISUAL_YAW_SCHMIDT_GUARDED       =  8, // EXPERIMENTAL_ONLY: Schmidt + pre-update R-inflate guard
+    VISUAL_YAW_SCHMIDT_FEJ_GAUGE     =  9, // EXPERIMENTAL_ONLY: Schmidt K-projection, FEJ gauge
+
+    // ── Retired modes (DO NOT USE — CLI returns error) ────────────────────────
+    CURRENT_ONLY_SCALE               =  3, // RETIRED: heuristic scale mode; no principled OC basis
+    DSO_INCREMENT_ORTHO              = 11, // RETIRED: v1 K-projection (fly3 smoke fail: altitude diverges t=450s)
+                                           //   String "dso_increment_ortho"/"dso" → CLI exits with error.
+    VINS_NUMERIC_NULLSPACE           = 12, // RETIRED: n_zeroed=0 throughout; EVD on S ≠ VINS marginalization
+                                           //   String "vins_numeric_nullspace"/"vins_nullspace" → CLI exits with error.
+    CONSTRAINED_YAW_NULLSPACE        = 13, // RETIRED: smoke FAILED 2026-06-06 — P_n exhausted after ~40 calls
+                                           //   (time-varying n defeats rank-1 Schur deflation; P indefinite).
+                                           //   See constrained_yaw_nullspace_smoke_report.md.
+                                           //   CLI exits with error. Unit tests in test_constrained_yaw_nullspace.cpp preserved.
   };
 
   // Thresholds for VISUAL_YAW_SCHMIDT_GUARDED mode (all configurable via CLI)
@@ -86,6 +103,13 @@ public:
 
   static void set_schmidt_guard_config(const SchmidtGuardConfig &cfg);
   static void open_schmidt_guard_log(const std::string &path);
+
+  // DEPRECATED: VinsNullspaceConfig and set_vins_nullspace_config are no-ops since
+  // VINS_NUMERIC_NULLSPACE is retired. Kept for link compatibility; EVD path is removed.
+  struct VinsNullspaceConfig {
+    double eig_thresh = 1e-6;
+  };
+  static void set_vins_nullspace_config(const VinsNullspaceConfig &cfg);
 
   struct YawDxProjectionDiag {
     bool valid = false;
@@ -341,6 +365,9 @@ public:
    */
   static void inject_pz_noise(std::shared_ptr<State> state, double noise);
 
+  /// Inject noise into the h_offset diagonal element (Architecture G random walk).
+  static void inject_h_offset_noise(std::shared_ptr<State> state, double noise);
+
   /**
    * @brief Z-only EKF covariance update: only reduce P_zz, cross-terms unchanged.
    *
@@ -372,6 +399,82 @@ public:
                              const std::vector<std::shared_ptr<ov_type::Type>> &H_order,
                              const Eigen::MatrixXd &H, const Eigen::VectorXd &res,
                              const Eigen::MatrixXd &R);
+
+  /**
+   * @brief Pure-math Joseph-form covariance update with arbitrary gain K.
+   *
+   * Ported from PX4-Autopilot ekf_helper.cpp:measurementUpdate lines 1127-1171,
+   * commit d5a0ca1bbc5e932bba5dc5b2bb58e0e0147f9909.
+   * BSD-3 License, Copyright (c) 2012-2025 PX4 Development Team.
+   *
+   * Computes: P = (I - K*H^T)*P*(I - K*H^T)^T + K*R*K^T
+   * where H and K are N×1 column vectors in the global state space.
+   *
+   * Valid for any K (optimal or masked sub-optimal gain).
+   * Symmetric enforcement: P(j,i) = P(i,j) for all i,j after update.
+   * PSD-preserving for any K when R > 0.
+   *
+   * No State object required. Operates on plain Eigen matrices.
+   * Use EKFUpdateJoseph() for the State-aware version.
+   *
+   * @param P  Covariance matrix (N×N), modified in-place
+   * @param K  Kalman gain column vector (N×1); zero entries skip that state
+   * @param H  Jacobian column vector (N×1) in global state space
+   * @param R  Scalar measurement noise variance (> 0)
+   */
+  static void josephCovUpdate(Eigen::MatrixXd &P,
+                               const Eigen::VectorXd &K,
+                               const Eigen::VectorXd &H,
+                               double R);
+
+  /**
+   * @brief State-aware Joseph-form update with pre-computed, possibly masked, gain.
+   *
+   * Applies josephCovUpdate() then corrects state variables via var->update(dx)
+   * for all variables with non-zero K_full entries.
+   * Caller is responsible for zeroing K_full entries for states that should
+   * not receive corrections (masking).
+   *
+   * Ported from PX4-Autopilot ekf_helper.cpp:measurementUpdate + fuseHaglRng,
+   * commit d5a0ca1bbc5e932bba5dc5b2bb58e0e0147f9909.
+   * BSD-3 License, Copyright (c) 2012-2025 PX4 Development Team.
+   *
+   * @param state   State to update (covariance + state vector)
+   * @param K_full  Pre-computed (possibly masked) gain, N×1 in global space
+   * @param H_full  Jacobian, N×1 in global space
+   * @param R       Scalar measurement noise variance
+   * @param res     Scalar residual (measurement - predicted)
+   */
+  static void EKFUpdateJoseph(std::shared_ptr<State> state,
+                               const Eigen::VectorXd &K_full,
+                               const Eigen::VectorXd &H_full,
+                               double R, double res);
+
+  /**
+   * @brief Convenience wrapper: compute optimal K, mask to a single state DOF, call EKFUpdateJoseph.
+   *
+   * Ported from PX4-Autopilot fuseHaglRng (commit d5a0ca1bbc5e932bba5dc5b2bb58e0e0147f9909):
+   *   K = P * H_full / S  (optimal Kalman gain)
+   *   K entries for all DOFs except (active_var, active_dof) zeroed (masking)
+   *   EKFUpdateJoseph(state, K_masked, H_full, R, res)  (Joseph form, PX4-style)
+   *
+   * Scalar measurement only (H is 1×n, res is 1×1, R is 1×1).
+   *
+   * @param state       State to update
+   * @param H_order     Variable ordering for compressed Jacobian H
+   * @param H           Compressed Jacobian (1×n)
+   * @param res         Scalar residual (1×1 vector)
+   * @param R           Scalar measurement noise (1×1 matrix)
+   * @param active_var  Variable whose active_dof-th DOF receives the state correction
+   * @param active_dof  Index within active_var (e.g. 2 for p_z in IMU position Vec)
+   */
+  static void EKFUpdateJosephMasked(std::shared_ptr<State> state,
+                                     const std::vector<std::shared_ptr<ov_type::Type>> &H_order,
+                                     const Eigen::MatrixXd &H,
+                                     const Eigen::VectorXd &res,
+                                     const Eigen::MatrixXd &R,
+                                     std::shared_ptr<ov_type::Type> active_var,
+                                     int active_dof);
 
   /**
    * @brief For a given set of variables, this will this will calculate a smaller covariance.

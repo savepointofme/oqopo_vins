@@ -79,22 +79,73 @@ void UpdaterGroundPlaneFeatureV1::reset() {
 
 namespace {
 
-// Find first observation of feat at timestamp t_query.
-bool find_uv_at(const std::shared_ptr<ov_core::Feature> &feat, double t_query,
-                Eigen::Vector2d &uv_out, size_t &cam_id_out) {
-  for (auto const &kv : feat->timestamps) {
-    size_t cam = kv.first;
-    auto const &ts = kv.second;
-    auto const &uvs = feat->uvs.at(cam);
-    for (size_t k = 0; k < ts.size(); k++) {
-      if (std::fabs(ts[k] - t_query) < 1e-6) {
-        uv_out << uvs[k](0), uvs[k](1);
-        cam_id_out = cam;
-        return true;
-      }
+bool is_clone_time(const std::shared_ptr<ov_msckf::State> &state, double t_query,
+                   double &t_clone_out) {
+  for (const auto &kv : state->_clones_IMU) {
+    if (std::fabs(kv.first - t_query) < 1e-6) {
+      t_clone_out = kv.first;
+      return true;
     }
   }
   return false;
+}
+
+bool find_clone_span_observations(
+    const std::shared_ptr<ov_core::Feature> &feat,
+    const std::shared_ptr<ov_msckf::State> &state,
+    double &t_anchor_out, Eigen::Vector2d &uv_anchor_out,
+    double &t_curr_out, Eigen::Vector2d &uv_curr_out, size_t &cam_id_out) {
+  bool found = false;
+  double best_span = -1.0;
+  double best_anchor = 0.0, best_curr = 0.0;
+  Eigen::Vector2d best_uv_anchor = Eigen::Vector2d::Zero();
+  Eigen::Vector2d best_uv_curr = Eigen::Vector2d::Zero();
+  size_t best_cam = 0;
+
+  for (const auto &kv : feat->timestamps) {
+    size_t cam = kv.first;
+    const auto &ts = kv.second;
+    const auto &uvs = feat->uvs.at(cam);
+
+    bool cam_found = false;
+    double cam_anchor = 0.0, cam_curr = 0.0;
+    Eigen::Vector2d cam_uv_anchor = Eigen::Vector2d::Zero();
+    Eigen::Vector2d cam_uv_curr = Eigen::Vector2d::Zero();
+
+    for (size_t k = 0; k < ts.size(); k++) {
+      double t_clone = 0.0;
+      if (!is_clone_time(state, ts[k], t_clone)) continue;
+      Eigen::Vector2d uv(uvs[k](0), uvs[k](1));
+      if (!cam_found || t_clone < cam_anchor) {
+        cam_anchor = t_clone;
+        cam_uv_anchor = uv;
+      }
+      if (!cam_found || t_clone > cam_curr) {
+        cam_curr = t_clone;
+        cam_uv_curr = uv;
+      }
+      cam_found = true;
+    }
+
+    double span = cam_curr - cam_anchor;
+    if (cam_found && span > 1e-6 && span > best_span) {
+      found = true;
+      best_span = span;
+      best_anchor = cam_anchor;
+      best_curr = cam_curr;
+      best_uv_anchor = cam_uv_anchor;
+      best_uv_curr = cam_uv_curr;
+      best_cam = cam;
+    }
+  }
+
+  if (!found) return false;
+  t_anchor_out = best_anchor;
+  uv_anchor_out = best_uv_anchor;
+  t_curr_out = best_curr;
+  uv_curr_out = best_uv_curr;
+  cam_id_out = best_cam;
+  return true;
 }
 
 // ---- Forward model -------------------------------------------------------
@@ -363,9 +414,9 @@ void compare_jacobian(const Eigen::Matrix<double, 2, 12> &Ha,
 
 // ---------------------------------------------------------------------------
 
-bool UpdaterGroundPlaneFeatureV1::try_update(
+bool UpdaterGroundPlaneFeatureV1::try_update_candidates(
     std::shared_ptr<ov_msckf::State> state,
-    std::shared_ptr<ov_core::FeatureDatabase> features,
+    const std::vector<std::shared_ptr<ov_core::Feature>> &feats_curr,
     double t_state, double z_ground) {
 
   using namespace ov_type;
@@ -387,48 +438,44 @@ bool UpdaterGroundPlaneFeatureV1::try_update(
     stats_.n_skipped_tilt++; last_.decision = "SKIP_TILT"; return false;
   }
 
-  double t_anchor = state->_clones_IMU.begin()->first;
-  if (std::fabs(t_anchor - t_state) < 1e-6) {
-    stats_.n_skipped_no_clones++;
-    last_.decision = "SKIP_ANCHOR=CURRENT";
-    return false;
-  }
-
-  std::shared_ptr<PoseJPL> anchor_clone = state->_clones_IMU.at(t_anchor);
-  std::shared_ptr<PoseJPL> curr_clone   = state->_clones_IMU.at(t_state);
-  Eigen::Matrix3d R_GtoIa = anchor_clone->Rot();
-  Eigen::Vector3d p_IainG = anchor_clone->pos();
-  Eigen::Matrix3d R_GtoIc = curr_clone->Rot();
-  Eigen::Vector3d p_IcinG = curr_clone->pos();
-
-  auto feats_curr = features->features_containing(t_state, false, true);
   if (feats_curr.empty()) {
     stats_.n_skipped_no_features++;
     last_.decision = "SKIP_NO_FEATURES";
     return false;
   }
 
-  std::vector<std::shared_ptr<Type>> Hx_order = {
-      anchor_clone->q(), anchor_clone->p(),
-      curr_clone->q(),   curr_clone->p()
+  struct Group {
+    double t_anchor = 0.0;
+    double t_curr = 0.0;
+    std::shared_ptr<PoseJPL> anchor_clone;
+    std::shared_ptr<PoseJPL> curr_clone;
+    std::vector<Eigen::Matrix<double, 2, 12>> H_blocks;
+    std::vector<Eigen::Vector2d> res_blocks;
+    std::vector<size_t> used_ids;
+    double sum_abs_res = 0.0;
+    double max_abs_res = 0.0;
   };
-
-  std::vector<Eigen::Matrix<double, 2, 12>> H_blocks;
-  std::vector<Eigen::Vector2d> res_blocks;
-  std::vector<size_t> used_ids;
+  std::vector<Group> groups;
 
   int n_candidates = 0, n_pass_gate = 0;
-  double sum_abs_res = 0.0, max_abs_res = 0.0;
   FDCheck last_fd;
 
   for (const auto &feat : feats_curr) {
     Eigen::Vector2d uv_anchor, uv_curr;
-    size_t cam_a = 0, cam_c = 0;
-    if (!find_uv_at(feat, t_anchor, uv_anchor, cam_a)) continue;
-    if (!find_uv_at(feat, t_state, uv_curr, cam_c))   continue;
-    if (cam_a != cam_c) continue;
-    size_t cam_id = cam_c;
+    double t_anchor = 0.0, t_curr = 0.0;
+    size_t cam_id = 0;
+    if (!find_clone_span_observations(feat, state, t_anchor, uv_anchor,
+                                      t_curr, uv_curr, cam_id)) {
+      continue;
+    }
     n_candidates++;
+
+    std::shared_ptr<PoseJPL> anchor_clone = state->_clones_IMU.at(t_anchor);
+    std::shared_ptr<PoseJPL> curr_clone = state->_clones_IMU.at(t_curr);
+    Eigen::Matrix3d R_GtoIa = anchor_clone->Rot();
+    Eigen::Vector3d p_IainG = anchor_clone->pos();
+    Eigen::Matrix3d R_GtoIc = curr_clone->Rot();
+    Eigen::Vector3d p_IcinG = curr_clone->pos();
 
     auto cam_it = state->_cam_intrinsics_cameras.find(cam_id);
     if (cam_it == state->_cam_intrinsics_cameras.end()) continue;
@@ -458,12 +505,29 @@ bool UpdaterGroundPlaneFeatureV1::try_update(
     if (r_norm > max_residual_px_) continue;
     n_pass_gate++;
 
+    Group *group = nullptr;
+    for (auto &g : groups) {
+      if (std::fabs(g.t_anchor - t_anchor) < 1e-6 &&
+          std::fabs(g.t_curr - t_curr) < 1e-6) {
+        group = &g;
+        break;
+      }
+    }
+    if (group == nullptr) {
+      groups.emplace_back();
+      group = &groups.back();
+      group->t_anchor = t_anchor;
+      group->t_curr = t_curr;
+      group->anchor_clone = anchor_clone;
+      group->curr_clone = curr_clone;
+    }
+
     // analytic Jacobian
     Eigen::Matrix<double, 2, 12> Ha =
         analytic_jacobian(R_GtoIa, p_IinC, R_GtoIc, R_ItoC, fwd, cam);
 
-    // FD check (always in DRY_RUN; first-feature-of-each-update in UPDATE)
-    bool do_fd = (mode_ == Mode::DRY_RUN) || (H_blocks.empty());
+    // FD check: validate the first feature accepted for each clone pair.
+    bool do_fd = (mode_ == Mode::DRY_RUN) || group->H_blocks.empty();
     if (do_fd) {
       Eigen::Matrix<double, 2, 12> Hf;
       bool fd_ok = fd_jacobian(R_GtoIa, p_IainG, R_GtoIc, p_IcinG, R_ItoC,
@@ -637,20 +701,33 @@ bool UpdaterGroundPlaneFeatureV1::try_update(
       }
     }
 
-    H_blocks.push_back(Ha);
-    res_blocks.push_back(res);
-    used_ids.push_back(feat->featid);
-    sum_abs_res += r_norm;
-    if (r_norm > max_abs_res) max_abs_res = r_norm;
-    if ((int)H_blocks.size() >= max_features_) break;
+    if ((int)group->H_blocks.size() < max_features_) {
+      group->H_blocks.push_back(Ha);
+      group->res_blocks.push_back(res);
+      group->used_ids.push_back(feat->featid);
+      group->sum_abs_res += r_norm;
+      if (r_norm > group->max_abs_res) group->max_abs_res = r_norm;
+    }
   }
 
   last_.n_candidates = n_candidates;
   last_.n_passed_gate = n_pass_gate;
-  last_.n_used = (int)H_blocks.size();
   last_.fd = last_fd;
 
-  if (H_blocks.empty()) {
+  Group *best = nullptr;
+  for (auto &g : groups) {
+    if (g.H_blocks.empty()) continue;
+    if (best == nullptr ||
+        g.H_blocks.size() > best->H_blocks.size() ||
+        (g.H_blocks.size() == best->H_blocks.size() &&
+         g.sum_abs_res / (double)g.H_blocks.size() <
+             best->sum_abs_res / (double)best->H_blocks.size())) {
+      best = &g;
+    }
+  }
+  last_.n_used = best == nullptr ? 0 : (int)best->H_blocks.size();
+
+  if (best == nullptr) {
     stats_.n_skipped_no_features++;
     last_.decision = "SKIP_NO_PASS";
     PRINT_DEBUG(YELLOW "[GPLANE-V1] t=%.3f cand=%d gate=%d used=0 (mode=%s) -- skip\n" RESET,
@@ -662,54 +739,69 @@ bool UpdaterGroundPlaneFeatureV1::try_update(
   // DRY_RUN: do NOT touch state / P; just log.
   if (mode_ == Mode::DRY_RUN) {
     last_.decision = "DRY_RUN_OK";
-    last_.mean_residual_px = sum_abs_res / (double)H_blocks.size();
-    last_.max_residual_px = max_abs_res;
+    last_.mean_residual_px = best->sum_abs_res / (double)best->H_blocks.size();
+    last_.max_residual_px = best->max_abs_res;
     PRINT_INFO(CYAN "[GPLANE-V1-DRY] t=%.3f cand=%d gate=%d feats=%d "
                "|res|_mu=%.2fpx max=%.2fpx fd_pass=%zu fd_fail=%zu\n" RESET,
-               t_state, n_candidates, n_pass_gate, (int)H_blocks.size(),
+               t_state, n_candidates, n_pass_gate, (int)best->H_blocks.size(),
                last_.mean_residual_px, last_.max_residual_px,
                stats_.n_fd_pass, stats_.n_fd_fail);
     return true;
   }
 
   // UPDATE: stack and EKFUpdate
-  int m = (int)H_blocks.size() * 2;
+  std::vector<std::shared_ptr<Type>> Hx_order = {
+      best->anchor_clone->q(), best->anchor_clone->p(),
+      best->curr_clone->q(),   best->curr_clone->p()
+  };
+
+  int m = (int)best->H_blocks.size() * 2;
   Eigen::MatrixXd Hbig = Eigen::MatrixXd::Zero(m, 12);
   Eigen::VectorXd res  = Eigen::VectorXd::Zero(m);
-  for (size_t i = 0; i < H_blocks.size(); i++) {
-    Hbig.block(2 * i, 0, 2, 12) = H_blocks[i];
-    res.segment(2 * i, 2)       = res_blocks[i];
+  for (size_t i = 0; i < best->H_blocks.size(); i++) {
+    Hbig.block(2 * i, 0, 2, 12) = best->H_blocks[i];
+    res.segment(2 * i, 2)       = best->res_blocks[i];
   }
   Eigen::MatrixXd R =
       (sigma_pixel_ * sigma_pixel_) * Eigen::MatrixXd::Identity(m, m);
 
   Eigen::Vector3d p_pre = state->_imu->pos();
-  ov_msckf::StateHelper::EKFUpdate(state, Hx_order, Hbig, res, R);
+  ov_msckf::StateHelper::EKFUpdate(state, Hx_order, Hbig, res, R,
+                                   visual_yaw_update_mode_, visual_yaw_update_scale_,
+                                   visual_global_yaw_oc_alpha_);
   Eigen::Vector3d dp = state->_imu->pos() - p_pre;
 
-  for (auto id : used_ids) last_used_ids_.insert(id);
+  for (auto id : best->used_ids) last_used_ids_.insert(id);
 
-  last_.mean_residual_px = sum_abs_res / (double)H_blocks.size();
-  last_.max_residual_px = max_abs_res;
+  last_.mean_residual_px = best->sum_abs_res / (double)best->H_blocks.size();
+  last_.max_residual_px = best->max_abs_res;
   last_.dxy_norm = std::sqrt(dp.x() * dp.x() + dp.y() * dp.y());
   last_.dz_after = dp.z();
   last_.decision = "ACCEPT";
 
   stats_.n_accepted_updates++;
-  stats_.n_features_used_total += H_blocks.size();
-  stats_.sum_residual_px += sum_abs_res;
+  stats_.n_features_used_total += best->H_blocks.size();
+  stats_.sum_residual_px += best->sum_abs_res;
   stats_.sum_dxy_norm += last_.dxy_norm;
   stats_.sum_dz_after += std::fabs(dp.z());
-  if (max_abs_res > stats_.max_residual_px) stats_.max_residual_px = max_abs_res;
+  if (best->max_abs_res > stats_.max_residual_px) stats_.max_residual_px = best->max_abs_res;
   if (last_.dxy_norm > stats_.max_dxy_norm) stats_.max_dxy_norm = last_.dxy_norm;
   if (std::fabs(dp.z()) > stats_.max_dz_after) stats_.max_dz_after = std::fabs(dp.z());
 
   PRINT_INFO(CYAN "[GPLANE-V1] t=%.3f cand=%d gate=%d used=%d "
              "|res|_mu=%.2fpx max=%.2fpx |dxy|=%.3fm dz=%+.3fm\n" RESET,
-             t_state, n_candidates, n_pass_gate, (int)H_blocks.size(),
+             t_state, n_candidates, n_pass_gate, (int)best->H_blocks.size(),
              last_.mean_residual_px, last_.max_residual_px,
              last_.dxy_norm, dp.z());
   return true;
+}
+
+bool UpdaterGroundPlaneFeatureV1::try_update(
+    std::shared_ptr<ov_msckf::State> state,
+    std::shared_ptr<ov_core::FeatureDatabase> features,
+    double t_state, double z_ground) {
+  auto feats_curr = features->features_containing(t_state, false, true);
+  return try_update_candidates(state, feats_curr, t_state, z_ground);
 }
 
 void UpdaterGroundPlaneFeatureV1::print_summary() const {

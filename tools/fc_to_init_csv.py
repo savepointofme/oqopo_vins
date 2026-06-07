@@ -80,6 +80,33 @@ def rot_to_jpl_quat(rot):
     return q / np.linalg.norm(q)
 
 
+def jpl_quat_to_rot(q):
+    q = np.asarray(q, dtype=float)
+    q = q / np.linalg.norm(q)
+    qv = q[:3]
+    qw = q[3]
+    qx = np.array([[0.0, -qv[2], qv[1]],
+                   [qv[2], 0.0, -qv[0]],
+                   [-qv[1], qv[0], 0.0]], dtype=float)
+    return (2.0 * qw * qw - 1.0) * np.eye(3) - 2.0 * qw * qx + 2.0 * np.outer(qv, qv)
+
+
+def heading_deg_from_enu(vec):
+    return math.degrees(math.atan2(vec[0], vec[1])) % 360.0
+
+
+def angle_diff_deg(a, b):
+    return (a - b + 180.0) % 360.0 - 180.0
+
+
+def aircraft_forward_axis_imu(body_to_imu):
+    if body_to_imu in ("identity", "frd_to_flu"):
+        return np.array([1.0, 0.0, 0.0])
+    if body_to_imu == "frd_to_xright_yfwd_zup":
+        return np.array([0.0, 1.0, 0.0])
+    raise ValueError("unknown body_to_imu: %s" % body_to_imu)
+
+
 def parse_fc_time_utc(text):
     text = text.strip()
     if "_" in text:
@@ -127,23 +154,32 @@ def load_imu_window(dataset_dir, t0, t1):
     return np.mean(np.array(acc), axis=0), np.mean(np.array(gyro), axis=0)
 
 
-def load_fc_rows(fc_path, cam_epoch):
+def load_fc_rows(fc_path, cam_epoch=None, fc_rel_to_cam_offset=None):
     with open(fc_path, newline="", encoding="utf-8-sig") as f:
         reader = csv.reader(f)
         raw_rows = [r for r in reader if r]
     if not raw_rows:
         raise RuntimeError("FC CSV is empty")
     header = [h.strip() for h in raw_rows[0]]
+    fc0_unix = None
     rows = []
     for raw in raw_rows[1:]:
         if len(raw) < 11:
             continue
         try:
             unix = parse_fc_time_utc(raw[3])
+            if fc0_unix is None:
+                fc0_unix = unix
+            if fc_rel_to_cam_offset is None:
+                if cam_epoch is None:
+                    raise RuntimeError("cam_epoch is required in absolute time mode")
+                t_s = unix - cam_epoch
+            else:
+                t_s = (unix - fc0_unix) - fc_rel_to_cam_offset
             values = dict(zip(FC_COLUMNS, raw[:11]))
             rows.append(
                 {
-                    "t_s": unix - cam_epoch,
+                    "t_s": t_s,
                     "fc_unix": unix,
                     "pitch_deg": float(values["pitch_deg"]),
                     "roll_deg": float(values["roll_deg"]),
@@ -224,10 +260,21 @@ def main():
     parser.add_argument("--yaw-sign", type=float, default=-1.0)
     parser.add_argument("--body-to-imu", choices=["frd_to_xright_yfwd_zup", "frd_to_flu", "identity"],
                         default="frd_to_xright_yfwd_zup")
+    parser.add_argument("--fc-rel-to-cam-offset", type=float, default=None,
+                        help="Use manual timing t_cam = (fc_time - first_fc_time) - OFFSET instead of absolute UTC.")
+    parser.add_argument("--max-heading-diff-deg", type=float, default=25.0,
+                        help="Fail if aircraft-forward heading and FC velocity track differ by more than this.")
+    parser.add_argument("--allow-heading-mismatch", action="store_true",
+                        help="Only warn on heading mismatch instead of failing.")
     args = parser.parse_args()
 
-    cam_epoch = camera_epoch_unix(args.dataset)
-    header, raw_rows, rows = load_fc_rows(args.fc, cam_epoch)
+    if args.fc_rel_to_cam_offset is None:
+        cam_epoch = camera_epoch_unix(args.dataset)
+        time_mode = "absolute UTC: t_cam = fc_unix - camera_epoch"
+    else:
+        cam_epoch = None
+        time_mode = "manual relative offset: t_cam = (fc_time - first_fc_time) - %.6f" % args.fc_rel_to_cam_offset
+    header, raw_rows, rows = load_fc_rows(args.fc, cam_epoch, args.fc_rel_to_cam_offset)
     state, dt_nearest = interpolate(rows, args.start_time)
 
     print("FC file path:", args.fc)
@@ -238,8 +285,10 @@ def main():
     print("Last 5 rows:")
     for row in raw_rows[-5:]:
         print(row)
-    print("Camera epoch unix: %.6f" % cam_epoch)
-    print("Camera epoch UTC:", dt.datetime.fromtimestamp(cam_epoch, dt.timezone.utc).isoformat())
+    print("Time mode:", time_mode)
+    if cam_epoch is not None:
+        print("Camera epoch unix: %.6f" % cam_epoch)
+        print("Camera epoch UTC:", dt.datetime.fromtimestamp(cam_epoch, dt.timezone.utc).isoformat())
     print("FC unix range: %.3f %.3f" % (rows[0]["fc_unix"], rows[-1]["fc_unix"]))
     print("FC camera-time range: %.3f %.3f" % (rows[0]["t_s"], rows[-1]["t_s"]))
 
@@ -257,6 +306,20 @@ def main():
         state["roll_deg"], state["pitch_deg"], state["yaw_deg"], args.yaw_sign, args.body_to_imu
     )
     q = rot_to_jpl_quat(R_GtoI)
+    forward_axis_I = aircraft_forward_axis_imu(args.body_to_imu)
+    forward_G = jpl_quat_to_rot(q).T @ forward_axis_I
+    forward_heading = heading_deg_from_enu(forward_G)
+    heading_diff = angle_diff_deg(forward_heading, track)
+    print("  aircraft-forward heading from q: %.4f deg, GPS track: %.4f deg, diff: %.4f deg" %
+          (forward_heading, track, heading_diff))
+    if speed > 10.0 and abs(heading_diff) > args.max_heading_diff_deg:
+        msg = ("FC init heading sanity failed: |%.2f deg| > %.2f deg. "
+               "Check yaw_sign, body_to_imu, time alignment, or active/passive rotation convention." %
+               (heading_diff, args.max_heading_diff_deg))
+        if args.allow_heading_mismatch:
+            print("WARNING:", msg, file=sys.stderr)
+        else:
+            raise RuntimeError(msg)
     pred_acc = R_GtoI @ np.array([0.0, 0.0, 9.81])
     acc_avg, gyro_avg = load_imu_window(args.dataset, args.start_time - 0.5, args.start_time + 0.5)
     if acc_avg is not None:
@@ -274,7 +337,12 @@ def main():
         os.makedirs(out_dir, exist_ok=True)
     with open(args.output, "w", newline="") as f:
         f.write("# FC-assisted VIO initialization, no continuous GPS/FC fusion\n")
-        f.write("# FC time parsed as UTC; FC yaw sign %.1f; body_to_imu %s\n" % (args.yaw_sign, args.body_to_imu))
+        if args.fc_rel_to_cam_offset is None:
+            f.write("# FC time parsed as absolute UTC; FC yaw sign %.1f; body_to_imu %s\n" %
+                    (args.yaw_sign, args.body_to_imu))
+        else:
+            f.write("# FC time used relatively only; fc_rel_to_cam_offset %.6f; FC yaw sign %.1f; body_to_imu %s\n" %
+                    (args.fc_rel_to_cam_offset, args.yaw_sign, args.body_to_imu))
         f.write("# t_s,qx,qy,qz,qw,vx,vy,vz,px,py,pz,bgx,bgy,bgz,bax,bay,baz\n")
         f.write(
             "%.6f,%.10f,%.10f,%.10f,%.10f,%.6f,%.6f,%.6f,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0\n"

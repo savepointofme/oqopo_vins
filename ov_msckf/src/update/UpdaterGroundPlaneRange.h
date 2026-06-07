@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "UpdaterOptions.h"
+#include "state/StateHelper.h"
 
 namespace ov_type {
 class Type;
@@ -118,6 +119,12 @@ public:
   bool try_update(std::shared_ptr<State> state, double t_state,
                   double z_gps, double t_gps);
 
+  void set_visual_yaw_update_control(StateHelper::VisualYawUpdateMode mode, double scale, double global_alpha) {
+    visual_yaw_update_mode_ = mode;
+    visual_yaw_update_scale_ = scale;
+    visual_global_yaw_oc_alpha_ = global_alpha;
+  }
+
   /// Accessors
   const LastUpdate &last_update() const { return last_; }
   const Stats &stats() const { return stats_; }
@@ -145,6 +152,10 @@ private:
   // Diagnostics
   LastUpdate last_;
   Stats stats_;
+
+  StateHelper::VisualYawUpdateMode visual_yaw_update_mode_ = StateHelper::VisualYawUpdateMode::ORIGINAL;
+  double visual_yaw_update_scale_ = 1.0;
+  double visual_global_yaw_oc_alpha_ = 0.0;
 };
 
 } // namespace ov_msckf

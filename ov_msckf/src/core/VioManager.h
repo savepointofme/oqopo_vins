@@ -204,11 +204,20 @@ public:
   /// transient (un-settled) monocular scale.
   void set_gps_alt_min_t_after_init(double v) { gps_alt_min_t_after_init_ = v; }
 
-  /// Enable Z-only GPS altitude update mode.
-  /// When enabled, only the IMU position-z correction is applied (all other
-  /// state components: px, py, attitude, velocity, biases, clones are zeroed).
-  /// Covariance: only P_zz is reduced; cross-terms are NOT updated.
+  /// Enable Architecture G: augment state with h_offset (GPS-VIO altitude bias).
+  /// Measurement model: GPS_z = p_z + h_offset.  Standard (unmasked) EKF update applied.
+  /// Requires StateOptions::use_gps_h_offset = true before State construction.
+  void set_gps_alt_arch_g(bool v) { gps_alt_arch_g_ = v; }
+
+  /// Enable Z-only GPS altitude update mode (legacy).
+  /// Covariance: full P update applied (all cross-terms modified); only p_z state correction kept.
   void set_gps_alt_zonly_update(bool v) { gps_alt_zonly_update_ = v; }
+
+  /// Enable PX4-style masked Joseph update for GPS-Z / scalar height aiding.
+  /// Ported from PX4-Autopilot fuseHaglRng, commit d5a0ca1bbc5e932bba5dc5b2bb58e0e0147f9909.
+  /// Only p_z state DOF and p_z column/row of P are updated; all others unchanged.
+  /// Takes priority over gps_alt_zonly_update_ when both are set.
+  void set_gps_alt_joseph_update(bool v) { gps_alt_joseph_update_ = v; }
 
   /// Set innovation rejection gate (meters). Updates with |residual| > threshold
   /// are skipped entirely (no EKF update). Default = 1e9 (off).
@@ -633,9 +642,19 @@ private:
   // [Cross-covariance guard] Reject if bias correction norm > this. 0=off.
   double gps_alt_guard_dbias_max_ = 0.0;
 
-  // [Z-only mode] Only apply IMU p_z correction; zero all other corrections.
-  // Covariance: only reduce P_zz, do not update cross-terms.
+  // [Architecture G] GPS-VIO altitude bias augmented state.
+  // When true, h_offset Vec(1) is in H_order alongside p_z.
+  // Standard (unmasked) EKF update applied. Mutually exclusive with ZONLY/JOSEPH.
+  bool gps_alt_arch_g_ = false;
+  double gps_alt_h_offset_last_t_ = -1.0;  // timestamp of last h_offset noise injection
+
+  // [Z-only legacy] Full covariance update; only p_z state correction applied.
   bool gps_alt_zonly_update_ = false;
+
+  // [Joseph masked] PX4-style masked Joseph update: only p_z state DOF and p_z row/col updated.
+  // Ported from PX4-Autopilot fuseHaglRng, commit d5a0ca1bbc5e932bba5dc5b2bb58e0e0147f9909.
+  // Takes priority over gps_alt_zonly_update_ when both are set.
+  bool gps_alt_joseph_update_ = false;
 
 public:
   /// Per-evaluation statistics for GPS altitude fusion diagnostics.

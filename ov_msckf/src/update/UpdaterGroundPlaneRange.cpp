@@ -184,7 +184,9 @@ bool UpdaterGroundPlaneRange::try_update(std::shared_ptr<State> state,
     StateHelper::EKFUpdateZOnly(state, Hx_order, H, res, R_meas);
     last_.decision = "ZONLY";
   } else {
-    StateHelper::EKFUpdate(state, Hx_order, H, res, R_meas);
+    StateHelper::EKFUpdate(state, Hx_order, H, res, R_meas,
+                           visual_yaw_update_mode_, visual_yaw_update_scale_,
+                           visual_global_yaw_oc_alpha_);
     last_.decision = "FULL";
   }
 

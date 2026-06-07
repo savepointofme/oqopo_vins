@@ -179,6 +179,11 @@ public:
   /// Rotation from accelerometer to the "IMU" gyroscope frame frame (rpng model)
   std::shared_ptr<ov_type::JPLQuat> _calib_imu_ACCtoIMU;
 
+  /// Architecture G (new_height_aid_research.md §5.3): GPS-VIO altitude bias.
+  /// Measurement model: GPS_z = p_z + h_offset.
+  /// Enabled when StateOptions::use_gps_h_offset is true.
+  std::shared_ptr<ov_type::Vec> _h_offset;
+
 private:
   // Define that the state helper is a friend class of this class
   // This will allow it to access the below functions which should normally not be called

@@ -60,6 +60,7 @@ public:
     size_t max_history = 20000;
     size_t timeseries_max = 5000;
     bool show_window = true;
+    std::string window_title = "OpenVINS ROS-free Dashboard";
     std::string video_path; ///< [中文] 若非空则写 MP4
     int video_fps = 20;
     // fast mode: decimate curves/trajectories, limit drawn feature count,

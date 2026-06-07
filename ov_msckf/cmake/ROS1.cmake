@@ -38,6 +38,17 @@ list(APPEND thirdparty_libraries
         ${catkin_LIBRARIES}
 )
 
+# Optional ONNX Runtime for neural feature extractors (XFeat, SuperPoint …)
+# Pass -DONNXRUNTIME_DIR=/path/to/onnxruntime-linux-x64-<ver> to cmake to enable.
+if(DEFINED ONNXRUNTIME_DIR)
+    message(STATUS "ONNX Runtime: ${ONNXRUNTIME_DIR}")
+    include_directories(${ONNXRUNTIME_DIR}/include)
+    list(APPEND thirdparty_libraries ${ONNXRUNTIME_DIR}/lib/libonnxruntime.so)
+    add_definitions(-DUSE_ONNXRUNTIME=1)
+else()
+    message(STATUS "ONNX Runtime: not configured (XFeat disabled; pass -DONNXRUNTIME_DIR=...)")
+endif()
+
 # If we are not building with ROS then we need to manually link to its headers
 # This isn't that elegant of a way, but this at least allows for building without ROS
 # If we had a root cmake we could do this: https://stackoverflow.com/a/11217008/7718197
@@ -172,6 +183,24 @@ install(TARGETS test_sim_meas
 add_executable(test_sim_repeat src/test_sim_repeat.cpp)
 target_link_libraries(test_sim_repeat ov_msckf_lib ${thirdparty_libraries})
 install(TARGETS test_sim_repeat
+        ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+        LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+        RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+# Gate 1: Joseph-form covariance update unit tests (no ROS, no GPS, no VIO pipeline)
+add_executable(test_joseph_update src/test_joseph_update.cpp)
+target_link_libraries(test_joseph_update ov_msckf_lib ${thirdparty_libraries})
+install(TARGETS test_joseph_update
+        ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+        LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+        RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+# Gate 2: Constrained-yaw-nullspace rank-1 projection unit tests (pure Eigen, no pipeline)
+add_executable(test_constrained_yaw_nullspace src/test_constrained_yaw_nullspace.cpp)
+target_link_libraries(test_constrained_yaw_nullspace ov_msckf_lib ${thirdparty_libraries})
+install(TARGETS test_constrained_yaw_nullspace
         ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
         LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
         RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}

@@ -70,7 +70,8 @@ DiagLogger::DiagLogger(const std::string &csv_path, const std::string &event_pat
               "ba_norm,bg_norm,"
               "cam_toff,"
               "fx,fy,cx,cy,"
-              "vio_dist,gps_dist\n";
+              "vio_dist,gps_dist,"
+              "desc_detected,desc_pre_gate,desc_post_gate,desc_tracked\n";
       PRINT_INFO(GREEN "[diag-csv] writing to %s\n" RESET, csv_path.c_str());
     } else {
       PRINT_WARNING(YELLOW "[diag-csv] failed to open %s\n" RESET, csv_path.c_str());
@@ -106,7 +107,9 @@ void DiagLogger::write_row(const DiagMetrics &m) {
        << m.ba_norm    << ',' << m.bg_norm   << ','
        << m.cam_toff   << ','
        << m.fx  << ',' << m.fy  << ',' << m.cx  << ',' << m.cy << ','
-       << m.vio_dist   << ',' << m.gps_path_len << '\n';
+       << m.vio_dist   << ',' << m.gps_path_len << ','
+       << m.desc_detected << ',' << m.desc_pre_gate << ','
+       << m.desc_post_gate << ',' << m.desc_tracked << '\n';
 }
 
 void DiagLogger::log_event(EventType type, const DiagMetrics &m,

@@ -35,6 +35,17 @@ list(APPEND thirdparty_libraries
         ${catkin_LIBRARIES}
 )
 
+# Optional ONNX Runtime for neural feature extractors (XFeat, SuperPoint …)
+# Pass -DONNXRUNTIME_DIR=/path/to/onnxruntime-linux-x64-<ver> to cmake to enable.
+if(DEFINED ONNXRUNTIME_DIR)
+    message(STATUS "ONNX Runtime: ${ONNXRUNTIME_DIR}")
+    include_directories(${ONNXRUNTIME_DIR}/include)
+    list(APPEND thirdparty_libraries ${ONNXRUNTIME_DIR}/lib/libonnxruntime.so)
+    add_definitions(-DUSE_ONNXRUNTIME=1)
+else()
+    message(STATUS "ONNX Runtime: not configured (XFeat/SP disabled; pass -DONNXRUNTIME_DIR=...)")
+endif()
+
 ##################################################
 # Make the core library
 ##################################################

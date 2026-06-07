@@ -109,6 +109,28 @@ StateHelper::VisualYawUpdateMode visual_yaw_mode_from_string(const std::string &
     return StateHelper::VisualYawUpdateMode::VISUAL_YAW_SCHMIDT_GUARDED;
   if (mode == "visual_yaw_schmidt_fej_gauge")
     return StateHelper::VisualYawUpdateMode::VISUAL_YAW_SCHMIDT_FEJ_GAUGE;
+  if (mode == "global_yaw_oc_fej_projection")
+    return StateHelper::VisualYawUpdateMode::GLOBAL_YAW_OC_FEJ_PROJECTION;
+  if (mode == "constrained_yaw_nullspace") {
+    // RETIRED 2026-06-06: smoke FAILED — P_n exhausted after ~40 calls; covariance indefinite.
+    // The CLI alias already exits before reaching here, but guard against direct string use.
+    PRINT_WARNING(YELLOW "[VIO-YAW] RETIRED: constrained_yaw_nullspace smoke FAILED (P_n exhausted); "
+                         "using original. See constrained_yaw_nullspace_smoke_report.md\n" RESET);
+    return StateHelper::VisualYawUpdateMode::ORIGINAL;
+  }
+  if (mode == "dso_increment_ortho") {
+    // RETIRED 2026-06-06: v1 K-projection failed fly3 smoke (P_{z,x} corrupted, t=450s).
+    // The CLI alias already exits before reaching here, but guard against direct string use.
+    PRINT_WARNING(YELLOW "[VIO-YAW] RETIRED: dso_increment_ortho v1 (K-projection smoke fail); "
+                         "redirecting to global_yaw_oc_fej_projection (mode 10).\n" RESET);
+    return StateHelper::VisualYawUpdateMode::GLOBAL_YAW_OC_FEJ_PROJECTION;
+  }
+  if (mode == "vins_numeric_nullspace") {
+    // RETIRED 2026-06-06: smoke showed n_zeroed=0; EVD on S ≠ VINS marginalization.
+    PRINT_WARNING(YELLOW "[VIO-YAW] RETIRED: vins_numeric_nullspace (n_zeroed=0 smoke fail); "
+                         "using original.\n" RESET);
+    return StateHelper::VisualYawUpdateMode::ORIGINAL;
+  }
   // Pre-chi2 VOP modes: EKFUpdate runs ORIGINAL (projection already applied by VOP)
   if (VisualObservabilityPolicy::is_prechi2_mode_string(mode))
     return StateHelper::VisualYawUpdateMode::ORIGINAL;
@@ -264,7 +286,10 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   } else {
     trackFEATS = std::shared_ptr<TrackBase>(new TrackDescriptor(
         state->_cam_intrinsics_cameras, init_max_features, state->_options.max_aruco_features, params.use_stereo, params.histogram_method,
-        params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist, params.knn_ratio));
+        params.fast_threshold, params.grid_x, params.grid_y, params.min_px_dist, params.knn_ratio,
+        params.desc_max_match_px_dist, params.xfeat_model_path, params.sp_model_path));
+  if (!params.xfeat_temporal_hint)
+    std::dynamic_pointer_cast<TrackDescriptor>(trackFEATS)->xfeat_temporal_hint_ = false;
   }
 
   // Initialize our aruco tag extractor
@@ -440,6 +465,44 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
     H(0, 2) = 0.0;                    // d/d theta_z (yaw around g has no effect on r22)
     H(0, 3 + 2) = 1.0 / r22;          // d/d p_z
     // velocity columns (if included) default 0
+  } else if (gps_alt_arch_g_ && state->_h_offset && state->_h_offset->id() >= 0) {
+    // Architecture G (new_height_aid_research.md §5.3):
+    //   GPS_z = p_z + h_offset    (h_offset = GPS-VIO altitude reference bias)
+    //   H = [0, 0, 1,  1]   in {p_x, p_y, p_z, h_offset}
+    //
+    // Both p_z and h_offset receive consistent corrections. No masking.
+    // h_offset absorbs measurement innovation; cross-covariances evolve correctly.
+
+    // Inject random-walk process noise into h_offset (models slow drift of bias)
+    if (gps_alt_h_offset_last_t_ > 0.0) {
+      double dt_noise = t_state - gps_alt_h_offset_last_t_;
+      if (dt_noise > 0.0 && dt_noise < 10.0) {
+        double walk_var = std::pow(params.state_options.gps_h_offset_walk_sigma, 2) * dt_noise;
+        StateHelper::inject_h_offset_noise(state, walk_var);
+      }
+    }
+    gps_alt_h_offset_last_t_ = t_state;
+
+    double h_offset_val = state->_h_offset->value()(0);
+    z_pred = p_IinG(2) + h_offset_val;
+
+    Hx_order.push_back(state->_imu->p());
+    Hx_order.push_back(state->_h_offset);
+    if (also_update_vz) {
+      // Insert velocity before h_offset so h_offset is last
+      Hx_order.clear();
+      Hx_order.push_back(state->_imu->p());
+      Hx_order.push_back(state->_imu->v());
+      Hx_order.push_back(state->_h_offset);
+      H = Eigen::MatrixXd::Zero(1, 7); // p(3) + v(3) + h_offset(1)
+      H(0, 2) = 1.0;   // p_z
+      H(0, 6) = 1.0;   // h_offset
+    } else {
+      H = Eigen::MatrixXd::Zero(1, 4); // p(3) + h_offset(1)
+      H(0, 2) = 1.0;   // p_z
+      H(0, 3) = 1.0;   // h_offset
+    }
+    // pz_idx stays 2 (within H_order: p is first, p_z is column 2)
   } else {
     // Legacy measurement model: h(x) = p_IinG[2]  (altitude directly in world)
     z_pred = p_IinG(2);
@@ -606,11 +669,14 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
   const double yaw_before_gps_alt = current_imu_yaw_deg();
   StateHelper::reset_last_yaw_dx_projection_diag();
 
-  if (gps_alt_zonly_update_) {
-    // --- Z-only update with consistent covariance ---
-    // Full EKF covariance update (Joseph form) for consistency.
-    // State: only IMU p_z is corrected; all other state components
-    // (px, py, v, q, bg, ba, clones, SLAM) are reverted.
+  if (gps_alt_joseph_update_) {
+    // PX4-style masked Joseph update (Brink 2017 / PX4 fuseHaglRng).
+    // Only p_z state DOF and p_z row/column of P are updated; all other states
+    // and cross-covariances are unchanged.  All guard logic above still applies.
+    StateHelper::EKFUpdateJosephMasked(state, Hx_order, H, res, R,
+                                       state->_imu->p(), 2);
+    decision = "JOSEPH_MASKED";
+  } else if (gps_alt_zonly_update_) {
     StateHelper::EKFUpdateZOnly(state, Hx_order, H, res, R);
     decision = "ZONLY";
   } else if (use_schmidt) {
@@ -908,6 +974,7 @@ void VioManager::set_vio_yaw_update_scale(double scale) {
                                   params.vio_yaw_update_mode == "visual_yaw_schmidt_fej_gauge" ||
                                   params.vio_yaw_update_mode == "visual_yaw_h_projection_current" ||
                                   params.vio_yaw_update_mode == "visual_yaw_schmidt_guarded" ||
+                                  params.vio_yaw_update_mode == "constrained_yaw_nullspace" ||
                                   VisualObservabilityPolicy::is_prechi2_mode_string(params.vio_yaw_update_mode) ||
                                   params.vio_yaw_update_scale > 0.0 ||
                                   params.vio_global_yaw_oc_alpha > 0.0);

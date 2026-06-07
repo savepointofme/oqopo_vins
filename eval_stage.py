@@ -2,26 +2,23 @@
 """
 eval_stage.py — Stage validation evaluator for visual_yaw_schmidt_current_gauge.
 
-Alignment method: START-POSITION + INITIAL-YAW ONLY. No global trajectory fitting.
+Default alignment: START-POSITION + INITIAL-YAW from GPS course at T0 vs VIO velocity at T0.
+No global trajectory fitting, no scale, no Umeyama, no SE(3).
 
-  p_aligned(t) = R(yaw_gps_start - yaw_vio_start) * (p_vio(t) - p_vio_start) + p_gps_start
+  p_aligned(t) = R(delta_yaw) * (p_vio(t) - p_vio_start) + p_gps_start
 
-  yaw_gps_start : mean GPS course heading over speed-gated samples in [T0, T0+YAW_WIN]s
-  yaw_vio_start : VIO VELOCITY direction (atan2(vx,vy) from traj.bias) at T0
-                  GPS course = direction of motion, so velocity direction is
-                  the correct counterpart (not body quaternion heading).
-                  Residual: ~0.03 deg vs ~5.7 deg for quaternion-based.
-  YAW_WIN       : 5.0 s  (i.e. [618, 623]s for this experiment)
-  SPEED_GATE    : 2.0 m/s
-  p_vio_start   : VIO position interpolated at T0
-  p_gps_start   : GPS ENU position interpolated at T0
-
-No Umeyama, no SE(2) least-squares, no ICP, no time-varying re-alignment,
-no scale correction, no end-point fitting.
+Yaw alignment modes (--yaw-align-mode):
+  start_yaw        [DEFAULT] GPS course in [T0, T0+yaw_win] vs VIO velocity at T0
+  gps_course_window Same logic, window/gate controlled by --yaw-win / --speed-gate
+  segment_yaw_fit  GPS+VIO mean over user segment [--yaw-fit-t0, --yaw-fit-t1]
+  fixed_yaw_offset User-supplied rotation in degrees (--yaw-offset-deg)
+  best_yaw_fit     Analytically optimal yaw over eval window — OPTIMISTIC, not headline metric
+  no_yaw_align     Translation-only, no rotation — sanity check
+  all              Run all modes and print comparison table (uses start_yaw for main report)
 
 Usage:
-  python3 eval_stage.py --until 900  --dir-a <A> --dir-b <B> --gps <csv> --imu <csv> --out <dir>
-  python3 eval_stage.py --until 1600 --dir-a <A> --dir-b <B> --gps <csv> --imu <csv> --out <dir>
+  python3 eval_stage.py --until 1630 --t0 980 --dir-a <A> --dir-b <B> \\
+      --gps <csv> --imu <csv> --out <dir> [--yaw-align-mode start_yaw]
 """
 import argparse, csv, math, os, sys
 import numpy as np
@@ -33,17 +30,45 @@ import matplotlib.patches as mpatches
 # ── CLI ──────────────────────────────────────────────────────────────────────
 ap = argparse.ArgumentParser()
 ap.add_argument('--until',  type=float, required=True)
+ap.add_argument('--t0',     type=float, default=618.0)
 ap.add_argument('--dir-a',  required=True)
 ap.add_argument('--dir-b',  required=True)
 ap.add_argument('--gps',    required=True)
 ap.add_argument('--imu',    required=True)
 ap.add_argument('--out',    required=True)
+# Yaw alignment
+ap.add_argument('--yaw-align-mode', default='start_yaw',
+                choices=['start_yaw','fixed_yaw_offset','best_yaw_fit',
+                         'segment_yaw_fit','gps_course_window','no_yaw_align','all'],
+                help='Yaw alignment strategy (default: start_yaw)')
+ap.add_argument('--yaw-offset-deg', type=float, default=0.0,
+                help='[fixed_yaw_offset] Rotation in degrees to apply')
+ap.add_argument('--yaw-fit-t0',  type=float, default=None,
+                help='[segment_yaw_fit] Segment start time (default: T0)')
+ap.add_argument('--yaw-fit-t1',  type=float, default=None,
+                help='[segment_yaw_fit] Segment end time (default: T0+60s)')
+ap.add_argument('--yaw-win',     type=float, default=5.0,
+                help='GPS course window length in seconds (default: 5.0)')
+ap.add_argument('--speed-gate',  type=float, default=2.0,
+                help='Speed gate m/s for GPS course estimation (default: 2.0)')
 args = ap.parse_args()
 
-T0, T1       = 618.0, args.until
-SPEED_GATE   = 2.0     # m/s — for GPS course gating
-YAW_WIN      = 5.0     # s   — initial-yaw estimation window [T0, T0+YAW_WIN]
-LAT0, LON0, ALT0 = 38.4975415, 103.2091577, 1399.505
+T0, T1       = args.t0, args.until
+SPEED_GATE   = args.speed_gate
+YAW_WIN      = args.yaw_win
+YAW_MODE     = args.yaw_align_mode
+
+# Auto-derive GPS reference origin from first GPS point within [T0-10, T0+10]s
+# so that ENU is centred near the start of flight (works for any dataset).
+_gps_ref = None
+for _r in csv.DictReader(open(args.gps)):
+    _t = float(_r['ts_ns']) * 1e-9
+    if T0 - 10 <= _t <= T0 + 10:
+        _gps_ref = (float(_r['lat']), float(_r['lon']), float(_r['alt']))
+        break
+if _gps_ref is None:
+    _gps_ref = (38.4975415, 103.2091577, 1399.505)  # fly3 fallback
+LAT0, LON0, ALT0 = _gps_ref
 RAD = math.pi / 180.0
 os.makedirs(args.out, exist_ok=True)
 
@@ -96,12 +121,13 @@ def read_bias(path):
         s = line.strip()
         if not s or s.startswith('#'): continue
         c = s.split()
-        if len(c) >= 7: rows.append([float(x) for x in c[:10]])
+        if len(c) >= 7: rows.append([float(x) for x in c[:7]])
     return np.array(rows)
 
 def read_schmidt_csv(path):
     if not os.path.exists(path): return {}
     rows = list(csv.DictReader(open(path)))
+    if not rows: return {}
     def col(k): return np.array([float(r[k]) for r in rows if r.get(k,'') and r[k] != ''])
     ts = col('timestamp')
     return {
@@ -128,6 +154,120 @@ def read_schmidt_csv(path):
         'n':       len(rows),
         'skipped': sum(1 for r in rows if r.get('skipped_reason','')),
     }
+
+# ── yaw-alignment helpers ─────────────────────────────────────────────────────
+def _gps_course_mean(win_t0, win_t1, speed_gate, _gc_t, _gc_v, _gc_spd, fallback):
+    """Circular mean of speed-gated GPS course bearings in [win_t0, win_t1].
+    Returns (yaw_rad, n_samples). Falls back to `fallback` if no qualifying samples."""
+    m = (_gc_spd >= speed_gate) & (_gc_t >= win_t0) & (_gc_t <= win_t1)
+    if m.sum() > 0:
+        s = np.sum(np.sin(_gc_v[m])); c = np.sum(np.cos(_gc_v[m]))
+        return math.atan2(s, c), int(m.sum())
+    return fallback, 0
+
+def _align_dataset(mode, ds, _gc_t, _gc_v, _gc_spd, _gps_t, _gps_E, _gps_N,
+                   _p_gps_start, _T0, _T1, _YAW_WIN, _SPEED_GATE,
+                   _yaw_fit_t0, _yaw_fit_t1, _yaw_offset_deg, _yaw_gps_default):
+    """
+    Compute yaw-aligned positions for one dataset under the given alignment mode.
+
+    Returns dict:
+      p_aln       (N,2)  — aligned XY positions
+      vio_yaw_aln (N,)   — VIO body yaw in GPS frame (rad)
+      delta_yaw   float  — rotation applied (rad)
+      vio_yaw_arr (N,)   — raw VIO yaw from quaternion (rad)
+      p_vio_start (2,)   — VIO position at T0 (unrotated)
+      yaw_src     str    — 'vel' | 'quat(fallback)' | 'n/a'
+      meta        dict   — mode, delta_yaw_deg, n_samples, notes, ...
+    """
+    traj = ds['traj']; ts = traj[:,0]
+    bias = ds['bias']; bias_ts = bias[:,0]
+    vio_yaw_arr = np.array([quat_to_yaw(*traj[i,4:8]) for i in range(len(traj))])
+    p_vio_start = np.array([interp1(ts, traj[:,1], _T0), interp1(ts, traj[:,2], _T0)])
+
+    def _vio_vel_dir(t_c):
+        """VIO velocity direction at time t_c; falls back to quaternion if slow."""
+        vx = interp1(bias_ts, bias[:,1], t_c)
+        vy = interp1(bias_ts, bias[:,2], t_c)
+        if math.sqrt(vx**2 + vy**2) > 1.0:
+            return math.atan2(vx, vy), 'vel'
+        return float(interp1(ts, vio_yaw_arr, t_c)), 'quat(fallback)'
+
+    if mode == 'no_yaw_align':
+        delta_yaw = 0.0
+        meta = dict(mode=mode, delta_yaw_deg=0.0, n_samples=0,
+                    notes='no rotation — translation-only (sanity check)')
+
+    elif mode == 'fixed_yaw_offset':
+        delta_yaw = math.radians(_yaw_offset_deg)
+        meta = dict(mode=mode, delta_yaw_deg=_yaw_offset_deg, n_samples=0,
+                    notes=f'user-supplied {_yaw_offset_deg:.3f} deg')
+
+    elif mode in ('start_yaw', 'gps_course_window'):
+        yaw_gps, n_s = _gps_course_mean(_T0, _T0 + _YAW_WIN, _SPEED_GATE,
+                                         _gc_t, _gc_v, _gc_spd, _yaw_gps_default)
+        yaw_vio, src = _vio_vel_dir(_T0)
+        delta_yaw = yaw_gps - yaw_vio
+        meta = dict(mode=mode, delta_yaw_deg=math.degrees(delta_yaw),
+                    yaw_gps_deg=math.degrees(yaw_gps),
+                    yaw_vio_deg=math.degrees(yaw_vio),
+                    n_samples=n_s, vio_src=src,
+                    notes=(f'GPS course [{_T0:.0f},{_T0+_YAW_WIN:.0f}]s '
+                           f'gate={_SPEED_GATE}m/s n={n_s} vio={src}'))
+
+    elif mode == 'segment_yaw_fit':
+        ft0 = _yaw_fit_t0 if _yaw_fit_t0 is not None else _T0
+        ft1 = _yaw_fit_t1 if _yaw_fit_t1 is not None else _T0 + 60.0
+        yaw_gps, n_s = _gps_course_mean(ft0, ft1, _SPEED_GATE,
+                                         _gc_t, _gc_v, _gc_spd, _yaw_gps_default)
+        seg_m = (bias_ts >= ft0) & (bias_ts <= ft1)
+        vx_s = bias[:,1][seg_m]; vy_s = bias[:,2][seg_m]
+        spd_s = np.sqrt(vx_s**2 + vy_s**2)
+        fast = spd_s > 1.0
+        if fast.sum() > 0:
+            yaw_vio = float(np.arctan2(np.mean(vx_s[fast]), np.mean(vy_s[fast])))
+            src = 'vel-mean'
+        else:
+            qq = np.array([quat_to_yaw(*traj[i,4:8])
+                           for i in range(len(traj)) if ft0 <= traj[i,0] <= ft1])
+            yaw_vio = float(np.mean(qq)) if len(qq) else float(interp1(ts, vio_yaw_arr, _T0))
+            src = 'quat-mean'
+        delta_yaw = yaw_gps - yaw_vio
+        meta = dict(mode=mode, delta_yaw_deg=math.degrees(delta_yaw),
+                    n_samples=n_s, seg=f'[{ft0:.0f},{ft1:.0f}]s', vio_src=src,
+                    notes=f'GPS+VIO mean over [{ft0:.0f},{ft1:.0f}]s n={n_s} vio={src}')
+
+    elif mode == 'best_yaw_fit':
+        # Analytical: maximize sum_i g_i^T R(theta) r_i
+        # = cos(theta)*sum(g.r) + sin(theta)*sum(gy*rx - gx*ry)
+        # => theta = atan2(sum(gy*rx-gx*ry), sum(gx*rx+gy*ry))
+        win_m = (ts >= _T0) & (ts <= _T1)
+        ts_w = ts[win_m]
+        rx = traj[:,1][win_m] - p_vio_start[0]
+        ry = traj[:,2][win_m] - p_vio_start[1]
+        gx = np.array([interp1(_gps_t, _gps_E, t) for t in ts_w]) - _p_gps_start[0]
+        gy = np.array([interp1(_gps_t, _gps_N, t) for t in ts_w]) - _p_gps_start[1]
+        A = float(np.sum(gx*rx + gy*ry))
+        B = float(np.sum(gy*rx - gx*ry))
+        delta_yaw = math.atan2(B, A)
+        meta = dict(mode=mode, delta_yaw_deg=math.degrees(delta_yaw),
+                    n_samples=int(win_m.sum()),
+                    notes=f'OPTIMISTIC — minimizes XY ATE over [{_T0:.0f},{_T1:.0f}]s analytically')
+
+    else:
+        raise ValueError(f'Unknown yaw align mode: {mode!r}')
+
+    # Apply rotation: p_aln = R(delta_yaw) @ (p_vio - p_vio_start) + p_gps_start
+    R = np.array([[math.cos(delta_yaw), -math.sin(delta_yaw)],
+                  [math.sin(delta_yaw),  math.cos(delta_yaw)]])
+    p_vio_rel = np.stack([traj[:,1] - p_vio_start[0],
+                          traj[:,2] - p_vio_start[1]], axis=1)
+    p_aln = (R @ p_vio_rel.T).T + _p_gps_start
+    vio_yaw_aln = vio_yaw_arr + delta_yaw
+
+    return dict(p_aln=p_aln, vio_yaw_aln=vio_yaw_aln, delta_yaw=delta_yaw,
+                vio_yaw_arr=vio_yaw_arr, p_vio_start=p_vio_start,
+                yaw_src=meta.get('vio_src', 'n/a'), meta=meta)
 
 # ── 1. GPS → ENU ─────────────────────────────────────────────────────────────
 print('Loading GPS...', flush=True)
@@ -158,40 +298,45 @@ gc_t = np.array(gc_t); gc_v = np.array(gc_v); gc_spd = np.array(gc_spd)
 mask = gc_spd >= SPEED_GATE
 print(f'  GPS course speed-gated: {mask.sum()}/{len(mask)} (>{SPEED_GATE}m/s)')
 
-# ── 2. Initial yaw from GPS course in [T0, T0+YAW_WIN] ──────────────────────
-# Documented: use mean GPS course in speed-gated [T0, T0+YAW_WIN] = [618, 623]s
-yaw_win_mask = mask & (gc_t >= T0) & (gc_t <= T0 + YAW_WIN)
-if yaw_win_mask.sum() > 0:
-    # Circular mean for angles
-    sin_sum = np.sum(np.sin(gc_v[yaw_win_mask]))
-    cos_sum = np.sum(np.cos(gc_v[yaw_win_mask]))
-    yaw_gps_start = math.atan2(sin_sum, cos_sum)
-    n_yaw_samples = int(yaw_win_mask.sum())
-else:
-    # Fallback: first speed-gated sample
-    first_ok = np.argmax(mask)
+# ── 2. Reference GPS initial yaw (used as start_yaw default) ─────────────────
+yaw_gps_start, n_yaw_samples = _gps_course_mean(T0, T0 + YAW_WIN, SPEED_GATE,
+                                                  gc_t, gc_v, gc_spd, 0.0)
+if n_yaw_samples == 0:
+    first_ok = np.argmax(mask) if mask.any() else 0
     yaw_gps_start = float(gc_v[first_ok])
     n_yaw_samples = 1
     print('WARNING: no speed-gated GPS in yaw window, using first valid sample')
 
-print(f'  GPS initial yaw: {math.degrees(yaw_gps_start):.2f} deg '
+print(f'  GPS initial yaw (reference): {math.degrees(yaw_gps_start):.2f} deg '
       f'(from {n_yaw_samples} samples in [{T0:.0f},{T0+YAW_WIN:.0f}]s)')
 
 # GPS start position at T0
 p_gps_start = np.array([interp1(gps_t, gps_E, T0), interp1(gps_t, gps_N, T0)])
 
-# ── 3. IMU ───────────────────────────────────────────────────────────────────
+# ── 3. IMU (optional — used only for vbg_rms; skipped if unavailable) ────────
 print('Loading IMU...', flush=True)
 imu = []
-imu_reader = csv.DictReader(open(args.imu))
-t_col = next(k for k in imu_reader.fieldnames if 't_rel_s' in k)
-for r in imu_reader:
-    t = float(r[t_col])
-    if T0 - 0.1 <= t <= T1 + 0.1:
-        imu.append((t, float(r['wz'])))
+try:
+    import io
+    raw = open(args.imu, 'rb').read().replace(b'\x00', b'')
+    imu_reader = csv.DictReader(io.StringIO(raw.decode('utf-8', errors='replace')))
+    t_col = next((k for k in imu_reader.fieldnames if 't_rel_s' in k), None)
+    if t_col:
+        for r in imu_reader:
+            try:
+                t = float(r[t_col])
+                if T0 - 0.1 <= t <= T1 + 0.1:
+                    imu.append((t, float(r['wz'])))
+            except (ValueError, KeyError):
+                pass
+except Exception as e:
+    print(f'  IMU: skipped ({e})')
 imu_t  = np.array([x[0] for x in imu])
 imu_wz = np.array([x[1] for x in imu])
-print(f'  IMU: {len(imu)} pts ~{len(imu)/(T1-T0):.0f}Hz')
+if len(imu):
+    print(f'  IMU: {len(imu)} pts ~{len(imu)/(T1-T0):.0f}Hz')
+else:
+    print('  IMU: no data — vbg_rms will be nan')
 
 # ── 4. Load trajectories ─────────────────────────────────────────────────────
 print('Loading trajectories...', flush=True)
@@ -200,73 +345,44 @@ for tag, d in [('A', args.dir_a), ('B', args.dir_b)]:
     traj  = read_traj(f'{d}/traj.txt')
     bias  = read_bias(f'{d}/traj.txt.bias')
     scl   = read_schmidt_csv(f'{d}/schmidt_yaw_update_diag.csv')
-    neg_w = ('negative diag' in open(f'{d}/log.txt').read() or
-             'NEGATIVE' in open(f'{d}/log.txt').read())
+    log_txt = open(f'{d}/log.txt', encoding='utf-8', errors='ignore').read()
+    neg_w = ('negative diag' in log_txt or 'NEGATIVE' in log_txt)
     datasets[tag] = {'traj':traj,'bias':bias,'scl':scl,'neg_warn':neg_w,'dir':d}
     print(f'  {tag}: traj={len(traj)}, bias={len(bias)}, '
           f'schmidt_rows={scl.get("n",0)}, neg_warn={neg_w}')
 
-# ── 5. Start+yaw alignment ───────────────────────────────────────────────────
-print(f'\nAlignment: start+yaw only (YAW_WIN={YAW_WIN}s, SPEED_GATE={SPEED_GATE}m/s)')
-print(f'  p_aligned(t) = R(yaw_gps_start - yaw_vio_start) * (p_vio(t) - p_vio_start) + p_gps_start')
+# ── 5. Yaw alignment ─────────────────────────────────────────────────────────
+_main_mode = YAW_MODE if YAW_MODE != 'all' else 'start_yaw'
+print(f'\nAlignment mode: {_main_mode}  (use --yaw-align-mode to change)')
+print(f'  p_aligned(t) = R(delta_yaw) * (p_vio(t) - p_vio_start) + p_gps_start')
+
+_align_kwargs = dict(
+    _gc_t=gc_t, _gc_v=gc_v, _gc_spd=gc_spd,
+    _gps_t=gps_t, _gps_E=gps_E, _gps_N=gps_N,
+    _p_gps_start=p_gps_start, _T0=T0, _T1=T1,
+    _YAW_WIN=YAW_WIN, _SPEED_GATE=SPEED_GATE,
+    _yaw_fit_t0=args.yaw_fit_t0, _yaw_fit_t1=args.yaw_fit_t1,
+    _yaw_offset_deg=args.yaw_offset_deg,
+    _yaw_gps_default=yaw_gps_start,
+)
 
 for tag, ds in datasets.items():
-    traj = ds['traj']; ts = traj[:,0]
-    bias = ds['bias'];  bias_ts = bias[:,0]
-    vio_yaw_arr = np.array([quat_to_yaw(*traj[i,4:8]) for i in range(len(traj))])
-
-    p_vio_start = np.array([interp1(ts, traj[:,1], T0),
-                             interp1(ts, traj[:,2], T0)])
-
-    # Initial yaw from VIO VELOCITY direction at T0.
-    # traj.bias columns: t vx vy vz bg_x bg_y bg_z ...
-    # vx,vy are the IMU velocity in the VIO global frame.
-    # GPS course = direction of motion in ENU = atan2(dE, dN).
-    # VIO course at T0 = atan2(vx_vio, vy_vio) — same physical quantity.
-    # This eliminates the ~6 deg body/velocity sideslip offset that arises from
-    # comparing quaternion body-heading with GPS course heading.
-    vx0 = interp1(bias_ts, bias[:,1], T0)
-    vy0 = interp1(bias_ts, bias[:,2], T0)
-    speed0 = math.sqrt(vx0**2 + vy0**2)
-    if speed0 > 1.0:   # speed-gated: use velocity direction only if moving
-        yaw_vio_start = math.atan2(vx0, vy0)
-        yaw_src = 'vel'
-    else:
-        yaw_vio_start = interp1(ts, vio_yaw_arr, T0)
-        yaw_src = 'quat(fallback)'
-
-    delta_yaw = yaw_gps_start - yaw_vio_start
-    R_align   = np.array([[math.cos(delta_yaw), -math.sin(delta_yaw)],
-                          [math.sin(delta_yaw),  math.cos(delta_yaw)]])
-
-    # Relative VIO positions
-    p_vio_rel = np.stack([traj[:,1] - p_vio_start[0],
-                          traj[:,2] - p_vio_start[1]], axis=1)  # N×2
-    # Aligned
-    p_aln = (R_align @ p_vio_rel.T).T + p_gps_start  # N×2
-
-    # VIO yaw in GPS frame = body yaw from quat + same delta_yaw
-    # (delta_yaw corrects VIO frame to GPS frame, regardless of how we estimated it)
-    yaw_vio_quat_start = interp1(ts, vio_yaw_arr, T0)
-    yaw_offset_quat = yaw_gps_start - yaw_vio_quat_start
-    vio_yaw_aln = vio_yaw_arr + yaw_offset_quat  # body yaw in GPS frame
-
+    aln  = _align_dataset(_main_mode, ds, **_align_kwargs)
+    meta = aln['meta']
     ds.update({
-        'p_aln': p_aln,
-        'delta_yaw': delta_yaw,
-        'yaw_vio_start': yaw_vio_start,
-        'yaw_gps_start': yaw_gps_start,
-        'p_vio_start': p_vio_start,
-        'vio_yaw_arr': vio_yaw_arr,
-        'vio_yaw_aln': vio_yaw_aln,
-        'yaw_src': yaw_src,
+        'p_aln':         aln['p_aln'],
+        'delta_yaw':     aln['delta_yaw'],
+        'yaw_vio_start': meta.get('yaw_vio_deg', float('nan')),
+        'yaw_gps_start': meta.get('yaw_gps_deg', math.degrees(yaw_gps_start)),
+        'p_vio_start':   aln['p_vio_start'],
+        'vio_yaw_arr':   aln['vio_yaw_arr'],
+        'vio_yaw_aln':   aln['vio_yaw_aln'],
+        'yaw_src':       aln['yaw_src'],
     })
-    print(f'  {tag}: yaw_vio_start({yaw_src})={math.degrees(yaw_vio_start):.2f}deg  '
-          f'yaw_gps_start={math.degrees(yaw_gps_start):.2f}deg  '
-          f'delta={math.degrees(delta_yaw):.3f}deg')
+    print(f'  {tag}: delta_yaw={meta["delta_yaw_deg"]:+.3f} deg  '
+          f'n_gps_samples={meta.get("n_samples",0)}  {meta["notes"]}')
 
 # ── 6. XY ATE (GPS-interpolated at VIO timestamps) ───────────────────────────
-# Interpolate GPS ENU at VIO timestamps for per-frame ATE
 def compute_ate(p_aln, ts):
     gps_E_at_vio = np.array([interp1(gps_t, gps_E, t) for t in ts])
     gps_N_at_vio = np.array([interp1(gps_t, gps_N, t) for t in ts])
@@ -286,7 +402,6 @@ for tag, ds in datasets.items():
     bias = ds['bias']
     bias_t = bias[:,0]; bgz = bias[:,6]
 
-    # Start from VIO yaw at T0 (already aligned to GPS frame)
     y0 = ds['vio_yaw_arr'][0]
     gb_t_l = [float(ts[0])]; gb_yaw_l = [y0]
     for i in range(1, len(imu_t)):
@@ -295,8 +410,8 @@ for tag, ds in datasets.items():
         bz = interp1(bias_t, bgz, float(imu_t[i]))
         y0 += (float(imu_wz[i]) - bz) * dt
         gb_t_l.append(float(imu_t[i])); gb_yaw_l.append(y0)
-    ds['gb_t']   = np.array(gb_t_l)
-    ds['gb_yaw'] = np.array(gb_yaw_l)  # biasGyro yaw in VIO frame (same start as VIO)
+    ds['gb_t']   = np.array(gb_t_l) if len(imu_t) else np.array([float(ts[0])])
+    ds['gb_yaw'] = np.array(gb_yaw_l) if len(imu_t) else np.array([y0])
 
 # ── 8. Yaw error: VIO-aligned vs GPS course (speed-gated) ────────────────────
 def yaw_err_series(vio_yaw_aln, ts, gc_t_arr, gc_v_arr, gc_mask):
@@ -316,13 +431,15 @@ for tag, ds in datasets.items():
 
 # ── 9. Segment boundaries ────────────────────────────────────────────────────
 if T1 >= 1400:
-    segs = [('early',  T0,   900.0),
-            ('middle', 900.0,1200.0),
+    _seg1 = max(T0, 900.0)   # clamp so middle never includes pre-T0 data
+    segs = [('early',  T0,    _seg1),
+            ('middle', _seg1, 1200.0),
             ('late',   1200.0, T1)]
     late_start = 1300.0  # last 300s
 else:
-    segs = [('early',  T0,   750.0),
-            ('late',   750.0,  T1)]
+    _seg1 = max(T0, 750.0)
+    segs = [('early',  T0,    _seg1),
+            ('late',   _seg1,  T1)]
     late_start = T1 - 150.0
 
 # ── 10. Compute all metrics ───────────────────────────────────────────────────
@@ -341,36 +458,31 @@ for tag, ds in datasets.items():
     bgz  = bias[:,6]
     scl  = ds['scl']
 
-    # Full window
-    full = dict(rms=rms(err), max=float(err.max()), p95=pct(err,95), final=float(err[-1]))
+    win_mask = (ts >= T0) & (ts <= T1)
+    err_w = err[win_mask]; ts_w = ts[win_mask]
+    full = dict(rms=rms(err_w), max=float(err_w.max()) if len(err_w) else float('nan'),
+                p95=pct(err_w, 95), final=float(err_w[-1]) if len(err_w) else float('nan'))
 
-    # Per-segment XY ATE
     seg_xy = {name: seg_stats(err, ts, t0, t1) for name, t0, t1 in segs}
-
-    # Late window XY
     late_xy = seg_stats(err, ts, late_start, T1)
 
-    # Yaw error metrics
     ye_t = ds['yaw_err_t']; ye = ds['yaw_err']
     ye_full = dict(rms=rms(ye), max=float(np.max(np.abs(ye))) if len(ye) else float('nan'),
                    p95=pct(ye,95), final=float(ye[-1]) if len(ye) else float('nan'))
     ye_late = {k: v for k, v in seg_stats(np.abs(ye), ye_t, late_start, T1).items()}
     seg_ye  = {name: seg_stats(np.abs(ye), ye_t, t0, t1) for name,t0,t1 in segs}
 
-    # bg_z
     bgz_range = (float(bgz.min()), float(bgz.max()))
     bgz_final = float(bgz[-1])
     bgz_step  = float(np.abs(np.diff(bgz)).max())
 
-    # biasGyro-GPS yaw RMS
     gb_t  = ds['gb_t'];  gb_yaw = ds['gb_yaw']
-    gb_yaw_aln = gb_yaw + ds['delta_yaw']   # bias-gyro yaw in GPS frame
+    gb_yaw_aln = gb_yaw + ds['delta_yaw']
     gb_at_gc = np.array([interp1(gb_t, gb_yaw_aln, t) for t in gc_t[mask]])
     vbg_err = np.array([wrap180(math.degrees(float(b)-float(g)))
                         for b,g in zip(gb_at_gc, gc_v[mask])])
     vbg_rms = rms(vbg_err)
 
-    # Schmidt invariants
     n_sc   = scl.get('n', 0)
     sk_q_n = scl.get('qTdx_n',  np.array([]))
     sk_q_s = scl.get('qTdx_s',  np.array([]))
@@ -392,7 +504,7 @@ for tag, ds in datasets.items():
         'neg_warn':  int(ds['neg_warn']),
         'nan_traj':  int(not np.all(np.isfinite(ds['traj']))),
         'traj_lines':len(ds['traj']),
-        'final_t':   float(ts[-1]),
+        'final_t':   float(ts_w[-1]) if len(ts_w) else float('nan'),
         'sc_n':      n_sc,
         'sc_qn_mean': float(sk_q_n.mean()) if len(sk_q_n) else float('nan'),
         'sc_qn_max':  float(sk_q_n.max())  if len(sk_q_n) else float('nan'),
@@ -410,8 +522,8 @@ for tag, ds in datasets.items():
 labels = {'A': 'A_global_oc', 'B': 'B_fullstate_schmidt'}
 
 print('\n' + '═'*65)
-print(f'  STAGE VALIDATION  fly3 start={T0:.0f}s until={T1:.0f}s')
-print(f'  Alignment: start+yaw only (YAW_WIN={YAW_WIN}s, no global fit)')
+print(f'  STAGE VALIDATION  start={T0:.1f}s until={T1:.0f}s')
+print(f'  Alignment: {_main_mode}  (YAW_WIN={YAW_WIN}s  SPEED_GATE={SPEED_GATE}m/s)')
 print('═'*65)
 
 for tag in ('A','B'):
@@ -495,7 +607,7 @@ print()
 # ── 13. Write metrics_summary.csv ────────────────────────────────────────────
 rows_csv = [
     ['metric','A_global_oc','B_fullstate_schmidt'],
-    ['alignment','start+yaw_only','start+yaw_only'],
+    ['alignment', _main_mode, _main_mode],
     ['yaw_win_s', YAW_WIN, YAW_WIN],
     ['speed_gate_ms', SPEED_GATE, SPEED_GATE],
     ['xy_ate_rms_m',  mA['full_xy']['rms'],  mB['full_xy']['rms']],
@@ -531,7 +643,6 @@ print(f'Wrote: {args.out}/metrics_summary.csv')
 colors = {'A':'#e05a2b','B':'#2b6de0'}
 labels_short = {'A':'A global_oc','B':'B schmidt'}
 
-# GPS truth for reference (T0..T1)
 gps_in_win = (gps_t >= T0) & (gps_t <= T1)
 gps_E_win  = gps_E[gps_in_win]; gps_N_win = gps_N[gps_in_win]
 
@@ -544,7 +655,7 @@ for tag, ds in datasets.items():
     ax.plot(ds['p_aln'][:,0], ds['p_aln'][:,1], '-',
             color=colors[tag], lw=1.0, alpha=0.85, label=labels_short[tag])
 ax.set_xlabel('East (m)'); ax.set_ylabel('North (m)')
-ax.set_title(f'fly3 start={T0:.0f}–{T1:.0f}s  |  start+yaw aligned only, no global fitting\n'
+ax.set_title(f'fly3 start={T0:.0f}–{T1:.0f}s  |  {_main_mode} alignment\n'
              f'(yaw init from GPS course [{T0:.0f},{T0+YAW_WIN:.0f}]s, SPEED>{SPEED_GATE}m/s)')
 ax.legend(fontsize=9); ax.set_aspect('equal'); ax.grid(True, alpha=0.3)
 fig.tight_layout()
@@ -562,7 +673,7 @@ for tag, ds in datasets.items():
     ax.plot(ts, ds['err'], '-', color=colors[tag], lw=0.9, alpha=0.9,
             label=labels_short[tag])
 ax.set_xlabel('t (s)'); ax.set_ylabel('XY ATE (m)')
-ax.set_title(f'XY ATE vs time — start+yaw aligned only (fly3 until={T1:.0f}s)')
+ax.set_title(f'XY ATE vs time — {_main_mode} (fly3 until={T1:.0f}s)')
 ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
 fig.tight_layout()
 fig.savefig(f'{args.out}/xy_ate_vs_time.png', dpi=150)
@@ -578,7 +689,7 @@ for tag, ds in datasets.items():
             color=colors[tag], lw=0.9, alpha=0.8, label=labels_short[tag])
 ax.axhline(0, color='k', lw=0.6, ls='--')
 ax.set_xlabel('t (s)'); ax.set_ylabel('VIO yaw − GPS course (deg)')
-ax.set_title(f'Yaw error vs time — start+yaw aligned (fly3 until={T1:.0f}s)')
+ax.set_title(f'Yaw error vs time — {_main_mode} (fly3 until={T1:.0f}s)')
 ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
 fig.tight_layout()
 fig.savefig(f'{args.out}/yaw_err_vs_time.png', dpi=150)
@@ -600,7 +711,7 @@ for tag, ds in datasets.items():
             color=colors[tag], lw=1.2, alpha=0.9, label=labels_short[tag])
 ax.set_xlabel('t (s)'); ax.set_ylabel('Heading (deg, N=0 E=90)')
 ax.set_title(f'Local heading vs GPS course [{HEAD_T0:.0f}–{HEAD_T1:.0f}s]  '
-             f'(start+yaw aligned)')
+             f'({_main_mode})')
 ax.set_xlim(HEAD_T0, HEAD_T1)
 ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
 fig.tight_layout()
@@ -625,7 +736,6 @@ if scl_B.get('n', 0) > 0 and len(scl_B.get('ts', [])) > 0:
     yaw_d    = sc_arr('yaw_delta')
     neg_cl   = sc_arr('neg_clamp')
 
-    # q-energy over time (all 7 blocks)
     q_e_imu_ori  = sc_arr('q_e_ori')
     q_e_imu_pos  = sc_arr('q_e_pos')
     q_e_imu_vel  = sc_arr('q_e_vel')
@@ -634,48 +744,48 @@ if scl_B.get('n', 0) > 0 and len(scl_B.get('ts', [])) > 0:
     q_e_slam     = sc_arr('q_e_slam')
     q_e_bc       = sc_arr('q_e_bc')
 
-    # Pss old/new gauge comparison
     pss_old_q_arr = sc_arr('pss_after_old_q')
     pss_new_q_arr = sc_arr('pss_new_q')
 
-    # ── Correlation: 6-panel overlay ─────────────────────────────────────────
+    def _sp(ax, t, y, *args, **kwargs):
+        if len(y) == len(t) and len(t) > 0:
+            ax.plot(t, y, *args, **kwargs)
+
     fig, axes = plt.subplots(6, 1, figsize=(12, 18), sharex=True)
 
-    axes[0].plot(sc_ts_w, rel_hq, '-', color='#9b4dca', lw=0.7, alpha=0.7)
+    _sp(axes[0], sc_ts_w, rel_hq, '-', color='#9b4dca', lw=0.7, alpha=0.7)
     axes[0].set_ylabel('rel_norm_Hq'); axes[0].set_title(
-        f'B diagnostic correlations (start+yaw aligned, until={T1:.0f}s)\n'
+        f'B diagnostic correlations ({_main_mode}, until={T1:.0f}s)\n'
         f'rel_norm_Hq = ||H·q_H|| / ||H||  — if large, H observes yaw gauge')
     axes[0].axhline(0.1, color='r', lw=0.8, ls='--', label='0.1 threshold')
     axes[0].legend(fontsize=7); axes[0].grid(True, alpha=0.3)
 
-    axes[1].plot(sc_ts_w, ddx, '-', color='#2b6de0', lw=0.7, alpha=0.7)
+    _sp(axes[1], sc_ts_w, ddx, '-', color='#2b6de0', lw=0.7, alpha=0.7)
     axes[1].set_ylabel('norm_delta_dx'); axes[1].set_title(
         'norm_delta_dx = ||dx_normal - dx_eff||  — yaw-direction correction removed')
     axes[1].grid(True, alpha=0.3)
 
-    axes[2].plot(sc_ts_w, pas, '-', color='#1a8f4a', lw=0.7, alpha=0.7)
+    _sp(axes[2], sc_ts_w, pas, '-', color='#1a8f4a', lw=0.7, alpha=0.7)
     axes[2].set_ylabel('Pas_change_norm'); axes[2].set_title(
         'Pas_change_norm  — cross-cov active↔Schmidt; should be nonzero (real Schmidt)')
     axes[2].grid(True, alpha=0.3)
 
-    axes[3].plot(sc_ts_w, yaw_d, '-', color='#e05a2b', lw=0.7, alpha=0.7)
+    _sp(axes[3], sc_ts_w, yaw_d, '-', color='#e05a2b', lw=0.7, alpha=0.7)
     axes[3].axhline(0, color='k', lw=0.5, ls='--')
     axes[3].set_ylabel('current_imu_yaw_delta_deg'); axes[3].set_title(
         'current_imu_yaw_delta_deg (deg/update)  — IMU yaw shift caused by Schmidt update; should be small & zero-mean')
     axes[3].grid(True, alpha=0.3)
 
-    # XY ATE for B on same time axis (GPS-spaced, interpolated to sc_ts_w)
     traj_B = datasets['B']['traj']; p_aln_B = datasets['B']['p_aln']
     ts_B = traj_B[:, 0]
     gps_at_sc = np.array([
         math.sqrt((interp1(ts_B, p_aln_B[:,0], t) - interp1(gps_t, gps_E, t))**2 +
                   (interp1(ts_B, p_aln_B[:,1], t) - interp1(gps_t, gps_N, t))**2)
-        for t in sc_ts_w[::10]])  # subsample for speed
+        for t in sc_ts_w[::10]])
     axes[4].plot(sc_ts_w[::10], gps_at_sc, '-', color='k', lw=0.9)
-    axes[4].set_ylabel('XY ATE B (m)'); axes[4].set_title('XY ATE (B, start+yaw aligned)')
+    axes[4].set_ylabel('XY ATE B (m)'); axes[4].set_title('XY ATE (B, aligned)')
     axes[4].grid(True, alpha=0.3)
 
-    # Yaw error for B (interpolated)
     ye_B = datasets['B']
     if len(ye_B.get('yaw_err_t', [])) > 0:
         ye_at_sc = np.array([interp1(ye_B['yaw_err_t'], ye_B['yaw_err'], t)
@@ -685,7 +795,6 @@ if scl_B.get('n', 0) > 0 and len(scl_B.get('ts', [])) > 0:
     axes[5].set_ylabel('Yaw err B (deg)'); axes[5].set_title('VIO yaw − GPS course (B)')
     axes[5].set_xlabel('t (s)'); axes[5].grid(True, alpha=0.3)
 
-    # Segment band overlays
     for ax in axes:
         for (sname, st0, st1), sc_col in zip(segs, ['#e8f4e8','#fff3cd','#fde8e8']):
             ax.axvspan(st0, st1, alpha=0.12, color=sc_col)
@@ -694,10 +803,8 @@ if scl_B.get('n', 0) > 0 and len(scl_B.get('ts', [])) > 0:
     plt.close(fig)
     print(f'Wrote: {args.out}/schmidt_diag_correlations.png')
 
-    # ── q-energy decomposition plot ──────────────────────────────────────────
     if len(q_e_imu_ori) > 0:
         fig2, ax2 = plt.subplots(figsize=(12, 4))
-        # Subsample for readability
         step = max(1, len(sc_ts_w)//2000)
         t_s  = sc_ts_w[::step]
         slam_s = q_e_slam[::step] if len(q_e_slam) == len(sc_ts_w) else np.zeros(len(t_s))
@@ -721,7 +828,6 @@ if scl_B.get('n', 0) > 0 and len(scl_B.get('ts', [])) > 0:
         plt.close(fig2)
         print(f'Wrote: {args.out}/q_energy_decomp.png')
 
-    # ── Segmented Schmidt diagnostic summary ─────────────────────────────────
     print('\n── B Schmidt diagnostic segmented summary ──')
     print(f'  (NOTE: described as "full-state current-yaw-gauge projected-gain update")')
     print(f'  rel_norm_Hq meaning: if large, H observes the yaw gauge → '
@@ -740,7 +846,6 @@ if scl_B.get('n', 0) > 0 and len(scl_B.get('ts', [])) > 0:
         print(sp(yaw_d,   'current_imu_yaw_delta_deg'))
         clamp_count = int(neg_cl[m_s].sum()) if len(neg_cl) == len(sc_ts_w) else 0
         print(f'  [{sname:12s}] neg_diag_clamp_count: {clamp_count}')
-        # Pss gauge comparison (old q vs new q after update)
         def pss_seg(arr, label):
             v = arr[m_s] if len(arr) == len(sc_ts_w) else np.array([])
             if len(v) == 0: return f'  [{sname:12s}] {label}: no data'
@@ -749,7 +854,6 @@ if scl_B.get('n', 0) > 0 and len(scl_B.get('ts', [])) > 0:
         print(pss_seg(pss_old_q_arr, 'Pss(q_old^T P+ q_old)   '))
         print(pss_seg(pss_new_q_arr, 'Pss(q_new^T P+ q_new)   '))
 
-    # q-energy summary (mean over window) — all 7 blocks
     if len(q_e_imu_ori) > 0:
         print('\n── q-energy decomposition (mean over full window, Euclidean fraction of ||q||²) ──')
         print('   NOTE: q mixes rad(ori)/m(pos)/m·s⁻¹(vel) — fractions are unit-heterogeneous')
@@ -768,4 +872,95 @@ if scl_B.get('n', 0) > 0 and len(scl_B.get('ts', [])) > 0:
     print(f'  neg_diag_clamp_count TOTAL = {total_clamp}  '
           f'(must be 0 for valid run)')
 
+# ── 15. Multi-mode yaw alignment comparison table ─────────────────────────────
+_ALL_MODES = ['start_yaw', 'gps_course_window', 'segment_yaw_fit',
+              'fixed_yaw_offset', 'best_yaw_fit', 'no_yaw_align']
+
+print('\n' + '═'*80)
+print(f'  MULTI-MODE YAW ALIGNMENT COMPARISON  [{T0:.0f},{T1:.0f}]s')
+print(f'  Main mode for this report: {_main_mode}')
+print('═'*80)
+
+_mm_rows = []
+for _m in _ALL_MODES:
+    _row = {'mode': _m, 'tags': {}}
+    for _tag, _ds in datasets.items():
+        try:
+            _aln = _align_dataset(_m, _ds, **_align_kwargs)
+        except Exception as _ex:
+            _row['tags'][_tag] = {'err': str(_ex)}
+            continue
+        _meta = _aln['meta']
+        _ts   = _ds['traj'][:,0]
+        _win  = (_ts >= T0) & (_ts <= T1)
+        _ts_w = _ts[_win]; _p = _aln['p_aln'][_win]
+        _gE_w = np.array([interp1(gps_t, gps_E, t) for t in _ts_w])
+        _gN_w = np.array([interp1(gps_t, gps_N, t) for t in _ts_w])
+        _e_w  = np.sqrt((_p[:,0]-_gE_w)**2 + (_p[:,1]-_gN_w)**2)
+        _xy_rms = float(np.sqrt(np.mean(_e_w**2))) if len(_e_w) else float('nan')
+        _xy_max = float(np.max(_e_w))               if len(_e_w) else float('nan')
+        _xy_fin = float(_e_w[-1])                   if len(_e_w) else float('nan')
+        _vya = _aln['vio_yaw_aln']
+        _gcm = mask & (gc_t >= T0) & (gc_t <= T1)
+        _tg  = gc_t[_gcm]; _vg = gc_v[_gcm]
+        if len(_tg) > 0:
+            _vio_at_g = np.array([interp1(_ts, _vya, t) for t in _tg])
+            _ye_d = np.array([wrap180(math.degrees(v-g)) for v,g in zip(_vio_at_g, _vg)])
+            _yaw_rms = rms(_ye_d); _yaw_max = float(np.max(np.abs(_ye_d)))
+        else:
+            _yaw_rms = float('nan'); _yaw_max = float('nan')
+        _row['tags'][_tag] = {
+            'delta_deg': _meta['delta_yaw_deg'], 'n': _meta.get('n_samples', 0),
+            'xy_rms': _xy_rms, 'xy_max': _xy_max, 'xy_fin': _xy_fin,
+            'yaw_rms': _yaw_rms, 'yaw_max': _yaw_max,
+            'notes': _meta.get('notes', ''),
+        }
+    _mm_rows.append(_row)
+
+# Print table
+_TAG_HDR = f"{'mode':>20} tag  delta_yaw  n_gps  XY_RMS   XY_max   XY_fin  Yaw_RMS  Yaw_max"
+print(_TAG_HDR)
+print('-' * len(_TAG_HDR))
+for _r in _mm_rows:
+    _m = _r['mode']
+    _mark = ' ◄ MAIN' if _m == _main_mode else ''
+    _mark += ' *** OPTIMISTIC ***' if _m == 'best_yaw_fit' else ''
+    for _tag in ('A', 'B'):
+        _d = _r['tags'].get(_tag, {})
+        if 'err' in _d:
+            print(f"  {_m:>20} [{_tag}] ERROR: {_d['err']}")
+            continue
+        _suffix = (_mark if _tag == 'A' else '')
+        print(f"  {_m:>20}  [{_tag}]  "
+              f"{_d['delta_deg']:+7.2f}°  {_d['n']:>4}  "
+              f"{_d['xy_rms']:7.2f}m  {_d['xy_max']:7.2f}m  {_d['xy_fin']:7.2f}m  "
+              f"{_d['yaw_rms']:6.2f}°  {_d['yaw_max']:6.2f}°"
+              + _suffix)
+    print()
+
+# Write multi-mode CSV
+_mm_csv_rows = [['mode','tag','delta_deg','n_gps_samples',
+                 'xy_rms_m','xy_max_m','xy_final_m','yaw_rms_deg','yaw_max_deg','notes']]
+for _r in _mm_rows:
+    for _tag in ('A', 'B'):
+        _d = _r['tags'].get(_tag, {})
+        if 'err' in _d: continue
+        _mm_csv_rows.append([_r['mode'], _tag, _d['delta_deg'], _d['n'],
+                              _d['xy_rms'], _d['xy_max'], _d['xy_fin'],
+                              _d['yaw_rms'], _d['yaw_max'], _d['notes']])
+_mm_csv_path = f'{args.out}/yaw_mode_comparison.csv'
+with open(_mm_csv_path, 'w', newline='') as _f:
+    csv.writer(_f).writerows(_mm_csv_rows)
+print(f'Wrote: {_mm_csv_path}')
+
+print('\n── Alignment mode guide ──')
+print('  start_yaw        GPS course at T0 vs VIO velocity at T0 — CANONICAL DEFAULT')
+print('  gps_course_window Same logic; use --yaw-win and --speed-gate to tune window/gate')
+print('  segment_yaw_fit  GPS+VIO mean over [--yaw-fit-t0, --yaw-fit-t1] — first-turn check')
+print('  fixed_yaw_offset User-supplied rotation (--yaw-offset-deg) — sensitivity test')
+print('  best_yaw_fit     Analytical optimum over eval window — OPTIMISTIC, not headline metric')
+print('  no_yaw_align     No rotation — sanity check; large XY expected if frames differ')
+print()
+print(f'  Recommended default: start_yaw (physically interpretable, no future information)')
+print(f'  Diagnostic: best_yaw_fit shows XY floor given perfect yaw alignment')
 print(f'\nAll outputs in: {args.out}')

@@ -1,8 +1,0 @@
-Pre-descent eval window  [t = 1774463627.362 ⟶ 1774464059.857]   span = 432.5s
-GPS cutoff at t = 1774464240.912  (+613.5s rel).  Descent starts BEFORE GPS cutoff by 181.1s.
-
-run              XY RMSE   Z RMSE   XY max  XY final   Z max  Z final
----------------------------------------------------------------------
-R0_nogps          35.317    7.081    66.63     62.23   11.12     8.81
-R2f_stageA        57.509    1.647    97.45     66.71    5.33     1.65
-R5b_stageB        26.531    1.881    41.75     39.73    5.30     1.70

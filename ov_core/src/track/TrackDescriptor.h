@@ -24,6 +24,10 @@
 
 #include "TrackBase.h"
 
+#ifdef USE_ONNXRUNTIME
+#include <onnxruntime_cxx_api.h>
+#endif
+
 namespace ov_core {
 
 /**
@@ -51,15 +55,40 @@ public:
    * @param knnratio matching ratio needed (smaller value forces top two descriptors during match to be more different)
    */
   explicit TrackDescriptor(std::unordered_map<size_t, std::shared_ptr<CamBase>> cameras, int numfeats, int numaruco, bool stereo,
-                           HistogramMethod histmethod, int fast_threshold, int gridx, int gridy, int minpxdist, double knnratio)
+                           HistogramMethod histmethod, int fast_threshold, int gridx, int gridy, int minpxdist, double knnratio,
+                           double max_match_px_dist = 0.0, const std::string &xfeat_model_path = "",
+                           const std::string &sp_model_path = "")
       : TrackBase(cameras, numfeats, numaruco, stereo, histmethod), threshold(fast_threshold), grid_x(gridx), grid_y(gridy),
-        min_px_dist(minpxdist), knn_ratio(knnratio) {}
+        min_px_dist(minpxdist), knn_ratio(knnratio), max_match_px_dist_(max_match_px_dist) {
+#ifdef USE_ONNXRUNTIME
+    Ort::SessionOptions opts;
+    opts.SetIntraOpNumThreads(2);
+    if (!sp_model_path.empty()) {
+      sp_session_ = std::make_unique<Ort::Session>(ort_env_, sp_model_path.c_str(), opts);
+      use_sp_ = true;
+      PRINT_INFO("[SP] Loaded SuperPoint model: %s\n", sp_model_path.c_str());
+    } else if (!xfeat_model_path.empty()) {
+      xfeat_session_ = std::make_unique<Ort::Session>(ort_env_, xfeat_model_path.c_str(), opts);
+      use_xfeat_ = true;
+      PRINT_INFO("[XFEAT] Loaded model: %s\n", xfeat_model_path.c_str());
+    }
+#else
+    if (!sp_model_path.empty() || !xfeat_model_path.empty())
+      PRINT_WARNING("[NEURAL] model path set but built without USE_ONNXRUNTIME — falling back to ORB\n");
+#endif
+  }
 
   /**
    * @brief Process a new image
    * @param message Contains our timestamp, images, and camera ids
    */
   void feed_new_camera(const CameraData &message) override;
+
+  /**
+   * @brief Return per-frame descriptor tracking diagnostics for the given camera.
+   * Populated fields: n_desc_detected, n_desc_pre_gate, n_desc_post_gate, n_desc_post_ransac.
+   */
+  bool get_warp_viz_packet(size_t cam_id, TrackerWarpVizPacket &packet) override;
 
 protected:
   /**
@@ -91,7 +120,17 @@ protected:
    * See robust_match() for the matching.
    */
   void perform_detection_monocular(const cv::Mat &img0, const cv::Mat &mask0, std::vector<cv::KeyPoint> &pts0, cv::Mat &desc0,
-                                   std::vector<size_t> &ids0);
+                                   std::vector<size_t> &ids0, const std::vector<cv::KeyPoint> *pts_hint = nullptr);
+
+  /// XFeat neural detector (64-dim float descriptors, 3-channel BGR input).
+  void detect_xfeat(const cv::Mat &img, const cv::Mat &mask, std::vector<cv::KeyPoint> &pts, cv::Mat &desc,
+                    std::vector<size_t> &ids, const std::vector<cv::KeyPoint> *pts_hint = nullptr);
+
+  /// SuperPoint neural detector (256-dim float descriptors, 1-channel grayscale input).
+  /// pts_hint: previous frame's keypoints for temporal continuity (same as XFeat hint).
+  /// SP outputs integer NMS keypoints so hint does not cause phantom motion.
+  void detect_superpoint(const cv::Mat &img, const cv::Mat &mask, std::vector<cv::KeyPoint> &pts, cv::Mat &desc,
+                         std::vector<size_t> &ids, const std::vector<cv::KeyPoint> *pts_hint = nullptr);
 
   /**
    * @brief Detects new features in the current stereo pair
@@ -149,8 +188,17 @@ protected:
   cv::Ptr<cv::ORB> orb0 = cv::ORB::create();
   cv::Ptr<cv::ORB> orb1 = cv::ORB::create();
 
-  // Our descriptor matcher
+  // Our descriptor matcher (Hamming for ORB; overridden to L2 for float descriptors inside robust_match)
   cv::Ptr<cv::DescriptorMatcher> matcher = cv::DescriptorMatcher::create("BruteForce-Hamming");
+
+  // Neural extractors
+  bool use_xfeat_ = false;
+  bool use_sp_    = false;
+#ifdef USE_ONNXRUNTIME
+  Ort::Env ort_env_{ORT_LOGGING_LEVEL_WARNING, "neural_tracker"};
+  std::unique_ptr<Ort::Session> xfeat_session_;
+  std::unique_ptr<Ort::Session> sp_session_;
+#endif
 
   // Parameters for our FAST grid detector
   int threshold;
@@ -163,6 +211,34 @@ protected:
   // The ratio between two kNN matches, if that ratio is larger then this threshold
   // then the two features are too close, so should be considered ambiguous/bad match
   double knn_ratio;
+
+  // Max pixel distance for spatial gating of descriptor matches (0 = disabled).
+  // Matches where |pt_prev - pt_curr| > this value are discarded before RANSAC.
+  double max_match_px_dist_ = 0.0;
+
+  // Per-call intermediate counts written by robust_match and consumed by feed_monocular.
+  // Not thread-safe for simultaneous calls on the same instance, but monocular mode is fine.
+  int match_n_knn_      = 0; // total kNN pairs before any filtering
+  int match_n_ratio_    = 0; // after Lowe ratio test (one direction)
+  int match_pre_gate_   = 0; // after symmetry test (= pre spatial gate)
+  int match_post_gate_  = 0; // after spatial gate
+  int match_n_ransac_   = 0; // RANSAC inliers (final geometric matches)
+
+public:
+  // Whether to pass previous frame's feature locations as detection hints (Method 2).
+  // When true, detect_xfeat prioritises candidates near previous features before grid-fill.
+  // Settable from VioManager after construction so it can be toggled from YAML.
+  bool xfeat_temporal_hint_ = true;
+
+protected:
+
+  // Per-feature consecutive-frame age counter (for track-lifetime histogram).
+  // Maps feature_id → number of consecutive frames it has been tracked.
+  std::unordered_map<size_t, int> track_age_;
+
+  // Per-camera diagnostic packets returned by get_warp_viz_packet().
+  std::unordered_map<size_t, TrackerWarpVizPacket> desc_viz_packets_;
+  std::mutex mtx_desc_diag_;
 
   // Descriptor matrices
   std::unordered_map<size_t, cv::Mat> desc_last;

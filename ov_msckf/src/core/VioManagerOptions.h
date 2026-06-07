@@ -506,6 +506,25 @@ struct VioManagerOptions {
   /// KNN ration between top two descriptor matcher which is required to be a good match
   double knn_ratio = 0.85;
 
+  /// Max pixel distance for descriptor match spatial gating (0 = disabled).
+  /// Matches where |pt_prev - pt_curr| > this value are discarded before RANSAC.
+  /// Recommended for fast drone flight (e.g. 100 px at 40 m/s, 10 Hz, 200 m altitude).
+  double desc_max_match_px_dist = 0.0;
+
+  /// Path to XFeat ONNX model file.  Empty string = disabled (falls back to ORB).
+  /// Requires building with -DONNXRUNTIME_DIR=/path/to/onnxruntime-linux-x64-<ver>.
+  /// Download xfeat.onnx from https://github.com/DavideCatto/XFeat-ONNX weights/
+  std::string xfeat_model_path = "";
+
+  /// When true (default), XFeat detection prioritises candidates near the previous
+  /// frame's feature locations (Method 2) before grid-filling new features.
+  /// Set false to use the original per-frame independent grid selection (Method 1).
+  bool xfeat_temporal_hint = true;
+
+  /// Path to SuperPoint ONNX model. If set, overrides xfeat_model_path.
+  /// Use fabio-sim/LightGlue-ONNX v1.0.0 superpoint.onnx (256-dim descriptors).
+  std::string sp_model_path = "";
+
   /// Frequency we want to track images at (higher freq ones will be dropped)
   double track_frequency = 20.0;
 
@@ -606,6 +625,10 @@ struct VioManagerOptions {
         std::exit(EXIT_FAILURE);
       }
       parser->parse_config("knn_ratio", knn_ratio);
+      parser->parse_config("desc_max_match_px_dist", desc_max_match_px_dist, false);
+      parser->parse_config("xfeat_model_path", xfeat_model_path, false);
+      parser->parse_config("xfeat_temporal_hint", xfeat_temporal_hint, false);
+      parser->parse_config("sp_model_path", sp_model_path, false);
       parser->parse_config("track_frequency", track_frequency);
       parser->parse_config("use_gyro_aided_klt", use_gyro_aided_klt, false);
     parser->parse_config("use_gyro_aided_klt_min_rot_rad", use_gyro_aided_klt_min_rot_rad, false);
@@ -629,6 +652,8 @@ struct VioManagerOptions {
     PRINT_DEBUG("  - min px dist: %d\n", min_px_dist);
     PRINT_DEBUG("  - hist method: %d\n", (int)histogram_method);
     PRINT_DEBUG("  - knn ratio: %.3f\n", knn_ratio);
+    PRINT_DEBUG("  - desc_max_match_px_dist: %.1f\n", desc_max_match_px_dist);
+    PRINT_DEBUG("  - xfeat_model_path: %s\n", xfeat_model_path.empty() ? "(ORB)" : xfeat_model_path.c_str());
     PRINT_DEBUG("  - track frequency: %.1f\n", track_frequency);
     PRINT_DEBUG("  - use gyro-aided KLT: %d\n", use_gyro_aided_klt);
   PRINT_DEBUG("  - gyro-KLT min_rot_rad:    %.4f (%.2f deg)\n",

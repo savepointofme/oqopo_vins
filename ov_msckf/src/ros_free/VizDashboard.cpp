@@ -735,7 +735,7 @@ bool VizDashboard::render_and_show(int wait_ms) {
     video_.write(canvas_);
 
   if (opts_.show_window) {
-    cv::imshow("OpenVINS ROS-free Dashboard", canvas_);
+    cv::imshow(opts_.window_title, canvas_);
     int k = cv::waitKey(std::max(1, wait_ms));
     if (k == 'q' || k == 27)
       return false;

@@ -280,7 +280,9 @@ bool UpdaterGroundPlaneFeature::try_update(
   // -- snapshot mean to measure actual delta --
   Eigen::Vector3d p_pre = state->_imu->pos();
 
-  ov_msckf::StateHelper::EKFUpdate(state, Hx_order, H, res, R);
+  ov_msckf::StateHelper::EKFUpdate(state, Hx_order, H, res, R,
+                                   visual_yaw_update_mode_, visual_yaw_update_scale_,
+                                   visual_global_yaw_oc_alpha_);
 
   Eigen::Vector3d p_post = state->_imu->pos();
   Eigen::Vector3d dp = p_post - p_pre;

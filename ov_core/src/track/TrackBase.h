@@ -64,6 +64,11 @@ struct TrackerWarpVizPacket {
   // Diagnostic counters — populated by TrackKLT::feed_monocular
   int n_klt_attempted = 0;   // total points entering KLT (prev tracks + newly detected on prev frame)
   int n_newly_detected = 0;  // FAST corners added to prev frame this step
+  // Descriptor-tracker diagnostics — populated by TrackDescriptor, zero for KLT
+  int n_desc_detected    = 0;  // FAST keypoints detected this frame
+  int n_desc_pre_gate    = 0;  // matches after kNN+ratio+symmetry, before spatial gate
+  int n_desc_post_gate   = 0;  // matches after spatial gate (== pre_gate when gate disabled)
+  int n_desc_post_ransac = 0;  // matches surviving RANSAC (= tracked from previous frame)
 };
 
 /**
@@ -212,6 +217,7 @@ public:
   /// Convenience accessor: returns true if a rotation has been set for the
   /// given camera id, and writes it into @p R_out.
   bool get_predicted_rotation(size_t cam_id, cv::Matx33d &R_out);
+
 
   /// Accessor for the latest per-camera warp visualization packet.
   /// Base returns false; TrackKLT overrides with the real packet.

@@ -2,7 +2,7 @@
 
 # D455 fly2 (2026-05-18) estimator config.
 # Hardware identical to fly1. Same Kalibr calibration applies.
-# FC init: use fc_init_state_930_correct.csv (frd_to_xright_yfwd_zup + yaw_sign=-1).
+# FC init: currently under re-audit; do not use deleted ad-hoc fly2 init CSVs.
 # Key changes vs fly1 base: up_msckf_sigma_px=2.0 (fly1 A1=RECOMMENDED).
 #
 # GPS time offset: fly2 gps_runner.csv uses absolute D455 device nanoseconds.

@@ -101,7 +101,9 @@ struct Args {
   double gps_alt_guard_dxy = 0.0;        // [中文] 交叉协方差 guard: |dxy|_pred > 此值则拒 (0=禁用, 建议 0.5)
   double gps_alt_guard_kxy_ratio = 0.0;  // [中文] 交叉协方差 guard: |K_xy|/|K_pz| > 此值则拒 (0=禁用, 建议 0.3)
   double gps_alt_guard_dbias = 0.0;      // [中文] 交叉协方差 guard: |dbias|_pred > 此值则拒 (0=禁用)
-  bool gps_alt_zonly = false;            // [中文] Z-only 模式: 只更新 p_z, 其他状态不全改, cov 只降 P_zz
+  bool gps_alt_arch_g = false;           // Architecture G: h_offset Vec(1) augmented state
+  bool gps_alt_zonly = false;            // legacy Z-only: full cov update, state p_z only
+  bool gps_alt_joseph = false;           // PX4-style masked Joseph update (Gate 2)
   bool gps_alt_ground_plane = false;     // [中文] 地面平面伪测距模式: 将 GPS 高度转换为斜距观测
   // -- Stage B (ground-plane feature update) --
   // Shared defaults between v0 and v1 — chosen to match the empirically-best
@@ -133,7 +135,10 @@ struct Args {
   double init_bg_sigma = 0.05;
   double init_ba_sigma = 1.0;
   bool show = true;              // [中文] 显示窗口
+  std::string dash_title = "OpenVINS ROS-free Dashboard";
   int dash_every = 1;            // [中文] 每 N 帧刷新仪表板
+  int cam_subsample = 1;         // --cam-subsample N: feed only 1 of every N camera frames to VIO
+  bool use_ground_parallel_warp = false; // --use-ground-parallel-warp: warp prev image by gravity rotation
   bool viz_fast = false;         // [中文] 快速仪表板模式 (轨迹/曲线抽帧, 特征限 200)
   bool verbose_timing = false;
   bool no_vio_yaw_update = false; // alias for --vio-yaw-update-scale 0.0
@@ -149,6 +154,8 @@ struct Args {
   std::string vio_yaw_diag_path;           // per-visual-update yaw CSV
   std::string visual_obs_diag_path;        // VisualObservabilityPolicy per-update CSV
   std::string schmidt_yaw_diag_path;       // Schmidt yaw update diagnostics CSV
+  // High-level gauge-mode alias: expands to vio_yaw_update_mode + alpha
+  std::string vio_yaw_gauge_mode;
   // Visual update guard (commit 1)
   double visual_skip_t0 = -1.0;           // --visual-update-skip-window start
   double visual_skip_t1 = -1.0;           // --visual-update-skip-window end
@@ -157,6 +164,8 @@ struct Args {
   // Guarded-B thresholds (commit 2)
   StateHelper::SchmidtGuardConfig guard_cfg;  // defaults already set in struct
   std::string guard_diag_log_path;        // --visual-guard-diag-log
+  // VINS-inspired numerical nullspace (Route 4 candidate)
+  StateHelper::VinsNullspaceConfig vins_cfg;  // defaults in struct: eig_thresh=1e-6
   // Diagnostic overrides
   double cam_toff_override = std::numeric_limits<double>::quiet_NaN(); // override timeshift_cam_imu; disables online calib
   int diag_chi2_trigger = 5;    // trigger detailed diagnostics when chi2_rej >= this in one frame
@@ -187,8 +196,13 @@ void print_help() {
                "  --gps-alt-guard-dxy M Reject update if predicted |dXY| > M (0=off, try 0.5)\n"
                "  --gps-alt-guard-kxy R Reject if |K_xy|/|K_pz| > R (0=off, try 0.3)\n"
                "  --gps-alt-guard-dbias V Reject if predicted |dbias| > V (0=off)\n"
-               "  --gps-alt-zonly       Only apply IMU p_z correction; zero all other corrections.\n"
-               "                        Covariance: only reduce P_zz, cross-terms unchanged.\n"
+               "  --gps-alt-arch-g      Architecture G: augment state with h_offset Vec(1) bias.\n"
+               "                            Measurement: GPS_z = p_z + h_offset. Standard EKF update.\n"
+               "                            Requires --gps-alt-update. Mutually exclusive with --gps-alt-zonly.\n"
+               "  --gps-alt-zonly       Legacy Z-only: only p_z state correction; full cov updated.\n"
+               "  --gps-alt-joseph-update  PX4-style masked Joseph update (Gate 2):\n"
+               "                            only p_z state DOF and p_z row/col of P updated.\n"
+               "                            All guard flags still apply. Takes priority over --gps-alt-zonly.\n"
                "  --gps-alt-ground-plane   Pseudo-rangefinder mode: treat GPS altitude as\n"
                "                            slant range to a local flat ground plane.\n"
                "                            Bootstraps z_ground on first GPS sample.\n"
@@ -226,8 +240,10 @@ void print_help() {
                "  --video-fps N         Video FPS (default 20)\n"
                "  --align-seconds X     Seconds of data to collect before SE3 align (default 8)\n"
                "  --no-display          Do not create a window (useful headless)\n"
+               "  --dash-title TITLE    Window title (default: 'OpenVINS ROS-free Dashboard')\n"
                "  --dash-every N        Refresh dashboard every N camera frames (default 1)\n"
-               "                        Recommended: --dash-every 5 with --viz-fast for live runs\n"
+               "  --cam-subsample N     Feed only 1 of every N camera frames to VIO (default 1 = all frames)\n"
+               "  --use-ground-parallel-warp  Warp previous image by gravity rotation before KLT (removes rotational component)\n"
                "  --viz-fast            Fast dashboard mode: decimate curves/trajectories,\n"
                "                        cap SLAM/MSCKF features at 200, skip expensive resize.\n"
                "                        Keeps all panels. Reduces render time ~5-10x.\n"
@@ -237,6 +253,7 @@ void print_help() {
                "                            visual_yaw_schmidt_current_gauge|visual_yaw_schmidt_fej_gauge\n"
                "  --vio-yaw-update-scale S  Scale visual yaw correction for *_scale modes (1=orig, 0=off)\n"
                "  --vio-global-yaw-oc-alpha A  H-projection alpha for global_yaw_oc_projection (0=orig, 1=full)\n"
+               "  --vio-vins-nullspace-eig-thresh T  Eigenvalue threshold for vins_numeric_nullspace (relative, default 1e-6)\n"
                "  --vio-yaw-control-start-after-init S  Delay requested visual yaw control until S seconds after init\n"
                "  --visual-bgz-update-scale S  Scale bg_z row of visual K_eff (1.0=normal, 0.0=freeze bg_z from visual)\n"
                "  --vio-yaw-switch-mode M   After --vio-yaw-switch-time, switch to this mode (staged B→A)\n"
@@ -250,6 +267,24 @@ void print_help() {
                "  Modes for --vio-yaw-update-mode (new pre-chi2 OC modes):\n"
                "    global_yaw_oc_fej_prechi2  1-D FEJ yaw OC applied before chi2 gating\n"
                "    visual_4d_oc_fej_prechi2   4-D FEJ (yaw+xyz) OC applied before chi2 gating\n"
+               "\n"
+               "  --vio-yaw-gauge-mode M   High-level alias (expands to --vio-yaw-update-mode + alpha):\n"
+               "    baseline / r1            global_yaw_oc_projection + alpha=1.0  [R1: 216.27m]\n"
+               "    original                 original (no gauge protection)\n"
+               "    oc_legacy                global_yaw_oc_projection + alpha=1.0  (same as baseline)\n"
+               "    oc_prechi2               global_yaw_oc_fej_prechi2  (1-D FEJ, pre-chi2)\n"
+               "    oc_4d                    visual_4d_oc_fej_prechi2   (4-D FEJ, pre-chi2)\n"
+               "    schmidt                  visual_yaw_schmidt_current_gauge\n"
+               "    schmidt_fej              visual_yaw_schmidt_fej_gauge\n"
+               "    h_proj                   visual_yaw_h_projection_current  (hard H-space null-space)\n"
+               "    no_yaw                   hard_gyro_yaw  (zero visual yaw entirely)\n"
+               "    oc_legacy_fej            global_yaw_oc_fej_projection + alpha=1.0  (FEJ-gauge M0, post-chi2)\n"
+               "    msckf2                   global_yaw_oc_fej_prechi2  (Li&Mourikis IJRR 2013: FEJ+OC+pre-chi2)\n"
+               "    msckf2_pure              original  (pure Li&Mourikis 2013: FEJ only, no OC)\n"
+               "    constrained_yaw_nullspace  constrained_yaw_nullspace (rank-1 post-update nᵀδx=0 constraint)\n"
+               "    dso                      RETIRED (v1 K-projection failed); redirects to global_yaw_oc_fej_projection\n"
+               "    vins_nullspace           RETIRED (S-EVD v1 failed); redirects to original\n"
+               "    Note: --vio-yaw-update-mode overrides --vio-yaw-gauge-mode if both specified.\n"
                "\n"
                "\n"
                "Diagnostic logging (all off by default; independent of --verbose):\n"
@@ -295,7 +330,9 @@ bool parse_args(int argc, char **argv, Args &a) {
     else if (s == "--gps-alt-guard-dxy") a.gps_alt_guard_dxy = std::atof(next("--gps-alt-guard-dxy").c_str());
     else if (s == "--gps-alt-guard-kxy") a.gps_alt_guard_kxy_ratio = std::atof(next("--gps-alt-guard-kxy").c_str());
     else if (s == "--gps-alt-guard-dbias") a.gps_alt_guard_dbias = std::atof(next("--gps-alt-guard-dbias").c_str());
+    else if (s == "--gps-alt-arch-g") a.gps_alt_arch_g = true;
     else if (s == "--gps-alt-zonly") a.gps_alt_zonly = true;
+    else if (s == "--gps-alt-joseph-update") a.gps_alt_joseph = true;
     else if (s == "--gps-alt-ground-plane") a.gps_alt_ground_plane = true;
     else if (s == "--gplane-feat") a.gplane_feat_enable = true;
     else if (s == "--gplane-feat-sigma-px") a.gplane_feat_sigma_px = std::atof(next("--gplane-feat-sigma-px").c_str());
@@ -322,7 +359,10 @@ bool parse_args(int argc, char **argv, Args &a) {
     else if (s == "--init-bg-sigma") a.init_bg_sigma = std::atof(next("--init-bg-sigma").c_str());
     else if (s == "--init-ba-sigma") a.init_ba_sigma = std::atof(next("--init-ba-sigma").c_str());
     else if (s == "--no-display") a.show = false;
+    else if (s == "--dash-title") a.dash_title = next("--dash-title");
     else if (s == "--dash-every") a.dash_every = std::atoi(next("--dash-every").c_str());
+    else if (s == "--cam-subsample") a.cam_subsample = std::max(1, std::atoi(next("--cam-subsample").c_str()));
+    else if (s == "--use-ground-parallel-warp") a.use_ground_parallel_warp = true;
     else if (s == "--viz-fast") a.viz_fast = true;
     else if (s == "--verbose") a.verbose_timing = true;
     else if (s == "--no-vio-yaw-update") a.no_vio_yaw_update = true;
@@ -330,11 +370,13 @@ bool parse_args(int argc, char **argv, Args &a) {
     else if (s == "--vio-yaw-update-scale") a.vio_yaw_update_scale = std::atof(next("--vio-yaw-update-scale").c_str());
     else if (s == "--vio-global-yaw-oc-alpha") a.vio_global_yaw_oc_alpha = std::atof(next("--vio-global-yaw-oc-alpha").c_str());
     else if (s == "--vio-global-yaw-schmidt-alpha") a.vio_global_yaw_oc_alpha = std::atof(next("--vio-global-yaw-schmidt-alpha").c_str());
+    else if (s == "--vio-vins-nullspace-eig-thresh") a.vins_cfg.eig_thresh = std::atof(next("--vio-vins-nullspace-eig-thresh").c_str());
     else if (s == "--vio-yaw-control-start-after-init") a.vio_yaw_control_start_after_init = std::atof(next("--vio-yaw-control-start-after-init").c_str());
     else if (s == "--visual-bgz-update-scale") a.visual_bgz_update_scale = std::atof(next("--visual-bgz-update-scale").c_str());
     else if (s == "--vio-yaw-switch-mode") a.vio_yaw_switch_mode = next("--vio-yaw-switch-mode");
     else if (s == "--vio-yaw-switch-time") a.vio_yaw_switch_time = std::atof(next("--vio-yaw-switch-time").c_str());
     else if (s == "--vio-yaw-switch-alpha") a.vio_yaw_switch_alpha = std::atof(next("--vio-yaw-switch-alpha").c_str());
+    else if (s == "--vio-yaw-gauge-mode") a.vio_yaw_gauge_mode = next("--vio-yaw-gauge-mode");
     else if (s == "--vio-yaw-diag") a.vio_yaw_diag_path = next("--vio-yaw-diag");
     else if (s == "--visual-obs-diag") a.visual_obs_diag_path = next("--visual-obs-diag");
     else if (s == "--schmidt-yaw-diag") a.schmidt_yaw_diag_path = next("--schmidt-yaw-diag");
@@ -422,6 +464,93 @@ int main(int argc, char **argv) {
                args.cam_toff_override);
   }
 
+  // --vio-yaw-gauge-mode: high-level alias that expands to update_mode + alpha.
+  // Applied BEFORE individual --vio-yaw-update-mode overrides, so the explicit
+  // flag always wins if both are given.
+  if (!args.vio_yaw_gauge_mode.empty()) {
+    const std::string &gm = args.vio_yaw_gauge_mode;
+    std::string mapped_mode; double mapped_alpha = std::numeric_limits<double>::quiet_NaN();
+    // ── Descriptive implementation aliases (use these in scripts and results) ─
+    // openvins_fej: OpenVINS original update, FEJ Jacobians, no OC projection
+    if (gm == "openvins_fej" || gm == "original") {
+      mapped_mode = "original";
+    // oc_postchi2_current_gauge: H-space global-yaw OC, current-state gauge, post-chi2
+    } else if (gm == "oc_postchi2_current_gauge" || gm == "baseline") {
+      mapped_mode = "global_yaw_oc_projection"; mapped_alpha = 1.0;
+    // oc_prechi2_fej_gauge: H-space global-yaw OC, FEJ-frozen gauge, pre-chi2
+    } else if (gm == "oc_prechi2_fej_gauge" || gm == "oc_prechi2") {
+      mapped_mode = "global_yaw_oc_fej_prechi2";
+    // oc_4d_prechi2_fej_gauge: 4-DOF OC H-projection, FEJ-frozen gauge, pre-chi2
+    } else if (gm == "oc_4d_prechi2_fej_gauge" || gm == "oc_4d") {
+      mapped_mode = "visual_4d_oc_fej_prechi2";
+    // oc_postchi2_fej_gauge: H-space global-yaw OC, FEJ-frozen gauge, post-chi2 (fly1 Cond3 reference)
+    } else if (gm == "oc_postchi2_fej_gauge" || gm == "oc_legacy_fej") {
+      mapped_mode = "global_yaw_oc_fej_projection"; mapped_alpha = 1.0;
+    // ── Legacy short aliases (accepted, map silently) ────────────────────────
+    } else if (gm == "r1" || gm == "oc_legacy") {
+      mapped_mode = "global_yaw_oc_projection"; mapped_alpha = 1.0;
+    } else if (gm == "fej") {
+      mapped_mode = "original";
+    // ── Disabled ambiguous labels (error + stop) ────────────────────────────
+    } else if (gm == "msckf2" || gm == "msckf2_0" || gm == "msckf2_pure") {
+      PRINT_ERROR("[ros-free] DISABLED LABEL: --vio-yaw-gauge-mode=%s\n"
+                  "  'msckf2' was used ambiguously and does not uniquely identify an implementation.\n"
+                  "  Use a descriptive name:\n"
+                  "    openvins_fej          — OpenVINS FEJ, no OC projection\n"
+                  "    oc_prechi2_fej_gauge  — H-space OC, FEJ gauge, pre-chi2\n"
+                  "    oc_postchi2_current_gauge — H-space OC, current gauge, post-chi2\n",
+                  gm.c_str());
+      std::exit(1);
+    // ── Experimental-only modes (loud warning, proceed) ──────────────────────
+    } else if (gm == "schmidt") {
+      PRINT_WARNING(YELLOW "[ros-free] EXPERIMENTAL_ONLY: --vio-yaw-gauge-mode=schmidt "
+                            "(not validated for GPS-Z flights; not for official results)\n" RESET);
+      mapped_mode = "visual_yaw_schmidt_current_gauge";
+    } else if (gm == "schmidt_fej") {
+      PRINT_WARNING(YELLOW "[ros-free] EXPERIMENTAL_ONLY: --vio-yaw-gauge-mode=schmidt_fej "
+                            "(not validated for GPS-Z flights; not for official results)\n" RESET);
+      mapped_mode = "visual_yaw_schmidt_fej_gauge";
+    } else if (gm == "no_yaw") {
+      PRINT_WARNING(YELLOW "[ros-free] EXPERIMENTAL_ONLY: --vio-yaw-gauge-mode=no_yaw "
+                            "(gyro-yaw substitution; debug use only)\n" RESET);
+      mapped_mode = "hard_gyro_yaw";
+    // ── Retired modes (error + stop) ─────────────────────────────────────────
+    } else if (gm == "dso") {
+      PRINT_ERROR("[ros-free] RETIRED MODE: --vio-yaw-gauge-mode=dso\n"
+                  "  DSO v1 K-projection failed fly3 smoke (P_{z,x} corrupted, altitude diverges t=450s).\n"
+                  "  Use 'oc_legacy_fej' (mode 10) or 'baseline' (mode 2) instead.\n"
+                  "  See failed_modes_retirement_log_20260606.md\n");
+      std::exit(1);
+    } else if (gm == "vins_nullspace") {
+      PRINT_ERROR("[ros-free] RETIRED MODE: --vio-yaw-gauge-mode=vins_nullspace\n"
+                  "  VINS v1 smoke showed n_zeroed=0; EVD on S is not VINS marginalization.\n"
+                  "  No valid replacement for the VINS nullspace route exists yet.\n"
+                  "  See failed_modes_retirement_log_20260606.md\n");
+      std::exit(1);
+    } else if (gm == "constrained_yaw_nullspace") {
+      PRINT_ERROR("[ros-free] RETIRED MODE: --vio-yaw-gauge-mode=constrained_yaw_nullspace\n"
+                  "  Smoke FAILED 2026-06-06: P_n exhausted after ~40 calls (time-varying n),\n"
+                  "  covariance became indefinite, GPS-Z diverged at t=397.8s.\n"
+                  "  See constrained_yaw_nullspace_smoke_report.md\n");
+      std::exit(1);
+    } else if (gm == "h_proj") {
+      PRINT_ERROR("[ros-free] RETIRED MODE: --vio-yaw-gauge-mode=h_proj\n"
+                  "  visual_yaw_h_projection_current is superseded by mode 2 (baseline).\n"
+                  "  Use '--vio-yaw-gauge-mode baseline' instead.\n");
+      std::exit(1);
+    } else {
+      PRINT_WARNING(YELLOW "[ros-free] Unknown --vio-yaw-gauge-mode '%s'; ignoring\n" RESET, gm.c_str());
+    }
+    if (!mapped_mode.empty() && args.vio_yaw_update_mode.empty()) {
+      args.vio_yaw_update_mode = mapped_mode;
+      if (!std::isnan(mapped_alpha) && std::isnan(args.vio_global_yaw_oc_alpha))
+        args.vio_global_yaw_oc_alpha = mapped_alpha;
+      PRINT_INFO(CYAN "[ros-free] --vio-yaw-gauge-mode=%s → mode=%s alpha=%.1f\n" RESET,
+                 gm.c_str(), mapped_mode.c_str(),
+                 std::isnan(mapped_alpha) ? -1.0 : mapped_alpha);
+    }
+  }
+
   if (args.no_vio_yaw_update) {
     params.enable_vio_yaw_update = false;
     params.vio_yaw_update_mode = "per_block_scale";
@@ -451,6 +580,11 @@ int main(int argc, char **argv) {
     params.vio_global_yaw_oc_alpha = std::max(0.0, std::min(1.0, args.vio_global_yaw_oc_alpha));
     PRINT_INFO(CYAN "[ros-free] CLI override: vio_global_yaw_oc_alpha=%.3f\n" RESET,
                params.vio_global_yaw_oc_alpha);
+  }
+  if (args.use_ground_parallel_warp) {
+    params.use_ground_parallel_warp = true;
+    params.use_gyro_aided_klt = false; // suppressed when warp active (avoids double rotation)
+    PRINT_INFO(CYAN "[ros-free] CLI override: use_ground_parallel_warp=true (gyro_aided_klt suppressed)\n" RESET);
   }
   if (args.visual_bgz_update_scale < 1.0 - 1e-12) {
     params.visual_bgz_update_scale = std::max(0.0, std::min(1.0, args.visual_bgz_update_scale));
@@ -491,6 +625,14 @@ int main(int argc, char **argv) {
                delayed_vio_yaw_mode.c_str(), delayed_vio_yaw_scale, delayed_vio_yaw_alpha,
                args.vio_yaw_control_start_after_init);
   }
+  // Architecture G: must set use_gps_h_offset BEFORE VioManager (State) is constructed
+  if (args.gps_alt_arch_g) {
+    params.state_options.use_gps_h_offset = true;
+    PRINT_INFO(CYAN "[ros-free] Architecture G: state_options.use_gps_h_offset=true "
+               "(h_offset Vec(1) added to state, init_sigma=%.1fm walk_sigma=%.4fm/sqrt(s))\n" RESET,
+               params.state_options.gps_h_offset_init_sigma,
+               params.state_options.gps_h_offset_walk_sigma);
+  }
   auto sys = std::make_shared<VioManager>(params);
   bool delayed_vio_yaw_control_applied = !delayed_vio_yaw_control;
   bool timed_yaw_switch_applied = args.vio_yaw_switch_mode.empty() || args.vio_yaw_switch_time < 0.0;
@@ -516,6 +658,8 @@ int main(int argc, char **argv) {
   }
   // Guarded-B: push thresholds and open guard diag log
   StateHelper::set_schmidt_guard_config(args.guard_cfg);
+  // VinsNullspaceConfig is a no-op (VINS_NUMERIC_NULLSPACE mode retired)
+  StateHelper::set_vins_nullspace_config(args.vins_cfg);
   if (!args.guard_diag_log_path.empty()) {
     StateHelper::open_schmidt_guard_log(args.guard_diag_log_path);
     PRINT_INFO(CYAN "[ros-free] Guard diag log: %s\n" RESET, args.guard_diag_log_path.c_str());
@@ -591,12 +735,25 @@ int main(int argc, char **argv) {
     sys->set_gps_alt_guard_dbias_max(args.gps_alt_guard_dbias);
     PRINT_INFO(CYAN "[ros-free] GPS alt guard |dbias| max = %.5f\n" RESET, args.gps_alt_guard_dbias);
   }
+  if (args.gps_alt_arch_g) {
+    if (!params.state_options.use_gps_h_offset) {
+      PRINT_ERROR(RED "[ros-free] --gps-alt-arch-g requires state_options.use_gps_h_offset=true "
+                  "(set via --gps-alt-arch-g which auto-enables it)\n" RESET);
+    }
+    sys->set_gps_alt_arch_g(true);
+    PRINT_INFO(CYAN "[ros-free] GPS alt ARCHITECTURE-G ENABLED "
+               "(h_offset augmented state; GPS_z = p_z + h_offset; standard EKF update)\n" RESET);
+  }
   if (args.gps_alt_zonly) {
     sys->set_gps_alt_zonly_update(true);
-    PRINT_INFO(CYAN "[ros-free] GPS alt Z-only update mode ENABLED "
-               "(only p_z correction, cov: only P_zz reduced)\n" RESET);
+    PRINT_INFO(CYAN "[ros-free] GPS alt ZONLY-LEGACY mode ENABLED "
+               "(only p_z state correction; full covariance update applied)\n" RESET);
   }
-
+  if (args.gps_alt_joseph) {
+    sys->set_gps_alt_joseph_update(true);
+    PRINT_INFO(CYAN "[ros-free] GPS alt JOSEPH-MASKED mode ENABLED "
+               "(PX4-style: p_z state + p_z row/col of P only; Brink 2017)\n" RESET);
+  }
   const int num_cams = params.state_options.num_cameras;
   if (args.stereo && num_cams < 2) {
     PRINT_ERROR(RED "[ros-free] --stereo requested but config has num_cameras=%d\n" RESET, num_cams);
@@ -722,6 +879,7 @@ int main(int argc, char **argv) {
   // -------------------- dashboard --------------------
   VizDashboard::Options vo;
   vo.show_window = args.show;
+  vo.window_title = args.dash_title;
   vo.video_path = args.video_path;
   vo.video_fps = args.video_fps;
   vo.fast = args.viz_fast;
@@ -861,7 +1019,9 @@ int main(int argc, char **argv) {
     }
 
     double t0 = cv::getTickCount() / cv::getTickFrequency();
-    sys->feed_measurement_camera(msg);
+    bool do_cam_feed = (args.cam_subsample <= 1) || (frame_idx % args.cam_subsample == 0);
+    if (do_cam_feed)
+      sys->feed_measurement_camera(msg);
     double dt_ms = 1000.0 * (cv::getTickCount() / cv::getTickFrequency() - t0);
 
     // ------ query latest state ------
@@ -1030,6 +1190,8 @@ int main(int argc, char **argv) {
         if (diag_frames_left > 0) {
           diag_frames_left--;
 
+          if (do_cam_feed) { // only print DIAG for frames actually fed to VIO
+
           // --- Timing diagnostics ---
           double dt_cam = (prev_t_cam > 0) ? (t_cam - prev_t_cam) : -1.0;
           int n_imu_this = (int)imu_i - (int)imu_i_prev_cam;
@@ -1037,7 +1199,7 @@ int main(int argc, char **argv) {
           int imu_dt_count = 0;
           bool imu_gap_detected = false, imu_backward = false;
           const double nominal_imu_dt = 1.0 / 200.0; // 200 Hz
-          const double nominal_cam_dt = 1.0 / 31.0;  // 31 Hz
+          const double nominal_cam_dt = std::max(1, args.cam_subsample) / 31.0; // accounts for subsampling
           for (size_t k = imu_i_prev_cam; k + 1 < imu_i && k + 1 < imu.size(); ++k) {
             double d = imu[k + 1].timestamp - imu[k].timestamp;
             imu_dt_min = std::min(imu_dt_min, d);
@@ -1157,13 +1319,18 @@ int main(int argc, char **argv) {
         prev_p_wi = p_wi;
         prev_p_wi_valid = true;
 
-        // KLT tracker counts from the warp viz packet
+        // Tracker counts from the warp viz packet (KLT fields and descriptor fields are disjoint)
         int klt_raw_now = 0, tracked_now = 0;
+        int desc_detected_now = 0, desc_pre_gate_now = 0, desc_post_gate_now = 0, desc_tracked_now = 0;
         {
           ov_core::TrackerWarpVizPacket pkt_m;
           if (sys->get_warp_viz_packet(0, pkt_m)) {
-            klt_raw_now = pkt_m.n_klt_attempted;
-            tracked_now = (int)pkt_m.curr_pts_raw.size();
+            klt_raw_now        = pkt_m.n_klt_attempted;
+            tracked_now        = (int)pkt_m.curr_pts_raw.size();
+            desc_detected_now  = pkt_m.n_desc_detected;
+            desc_pre_gate_now  = pkt_m.n_desc_pre_gate;
+            desc_post_gate_now = pkt_m.n_desc_post_gate;
+            desc_tracked_now   = pkt_m.n_desc_post_ransac;
           }
         }
 
@@ -1205,6 +1372,10 @@ int main(int argc, char **argv) {
         m.aligned       = aligner.solved();
         m.klt_raw       = klt_raw_now;
         m.tracked       = tracked_now;
+        m.desc_detected  = desc_detected_now;
+        m.desc_pre_gate  = desc_pre_gate_now;
+        m.desc_post_gate = desc_post_gate_now;
+        m.desc_tracked   = desc_tracked_now;
         m.n_acc         = mstats.n_accepted;
         m.msckf_in      = mstats.n_features_in;
         m.slam_count    = slam_count;
@@ -1281,6 +1452,7 @@ int main(int argc, char **argv) {
         // ---- Per-frame CSV row ----
         diag_logger.write_row(m);
       } // end DiagMetrics block
+          } // end do_cam_feed check
 
       // latest GT sample (nearest within 0.05s)
       if (!gt_pos_map.empty()) {
@@ -1372,9 +1544,11 @@ int main(int argc, char **argv) {
       }
     }
 
-    // Update diagnostic tracking for next frame
-    prev_t_cam = t_cam;
-    imu_i_prev_cam = imu_i;
+    // Update diagnostic tracking for next frame (only for frames actually fed to VIO)
+    if (do_cam_feed) {
+      prev_t_cam = t_cam;
+      imu_i_prev_cam = imu_i;
+    }
 
     frame_idx++;
     if (frame_idx % std::max(1, args.dash_every) == 0) {
