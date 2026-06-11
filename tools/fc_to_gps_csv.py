@@ -2,12 +2,16 @@
 """Convert the GSMQ FC CSV into a ros-free OpenVINS GPS comparison CSV.
 
 Output format:
-  ts_ns,lat,lon,alt
+  ts_ns,lat,lon,alt,Ve,Vn,Vu,satellites
 
 `ts_ns` is camera-relative dataset time in nanoseconds, matching the D455
 `imu0/data.csv` / `cam0/data.csv` time base. This file is intended for
 `run_serial_msckf_ros_free --gps` visualization/evaluation only. It does not
 enable GPS fusion unless the runner is also given explicit GPS update flags.
+
+The first four columns remain backward-compatible with the ros-free runner.
+The ENU velocity and satellite columns are preserved for evaluation instead
+of reconstructing velocity by differentiating latitude/longitude.
 """
 
 import argparse
@@ -65,7 +69,7 @@ def main():
         next(reader, None)
         fc0_unix = None
         for raw in reader:
-            if len(raw) < 8:
+            if len(raw) < 11:
                 continue
             try:
                 unix = parse_fc_time_utc(raw[3])
@@ -78,9 +82,18 @@ def main():
                 lat = float(raw[5])
                 lon = float(raw[6])
                 alt = float(raw[7])
+                ve = float(raw[8])
+                vn = float(raw[9])
+                vu = float(raw[10])
+                satellites = int(float(raw[4]))
             except Exception:
                 continue
-            rows.append((int(round(t_s * 1e9)), lat, lon, alt))
+            if satellites <= 0 or (lat == 0.0 and lon == 0.0):
+                continue
+            rows.append((
+                int(round(t_s * 1e9)), lat, lon, alt,
+                ve, vn, vu, satellites,
+            ))
 
     if not rows:
         raise RuntimeError("No GPS rows parsed from FC CSV")
@@ -89,7 +102,7 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     with open(args.output, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["ts_ns", "lat", "lon", "alt"])
+        writer.writerow(["ts_ns", "lat", "lon", "alt", "Ve", "Vn", "Vu", "satellites"])
         writer.writerows(rows)
 
     print("wrote", args.output)
@@ -101,6 +114,8 @@ def main():
     print("time_s range %.3f %.3f" % (rows[0][0] * 1e-9, rows[-1][0] * 1e-9))
     print("first lat/lon/alt %.8f %.8f %.3f" % (rows[0][1], rows[0][2], rows[0][3]))
     print("last  lat/lon/alt %.8f %.8f %.3f" % (rows[-1][1], rows[-1][2], rows[-1][3]))
+    print("first Ve/Vn/Vu %.4f %.4f %.4f" % (rows[0][4], rows[0][5], rows[0][6]))
+    print("last  Ve/Vn/Vu %.4f %.4f %.4f" % (rows[-1][4], rows[-1][5], rows[-1][6]))
 
 
 if __name__ == "__main__":

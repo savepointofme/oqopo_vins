@@ -254,6 +254,12 @@ public:
   /// Returns true if a gravity warp is set for the given camera, writes it to R_out.
   bool get_gravity_warp(size_t cam_id, cv::Matx33d &R_out);
 
+  /// Set constant camera-fixed optical-axis curl correction rate (rad/s, positive = CCW in
+  /// image). Applied per-frame in TrackKLT after optical flow: corrects a persistent bias in
+  /// the apparent in-plane rotation measured by the tracker. Set from
+  /// VioManagerOptions::curl_correction_rate_degps at initialization; not updated per-frame.
+  void set_curl_correction_rate(double rate_radps) { curl_correction_rate_radps = rate_radps; }
+
 protected:
   /// Camera object which has all calibration in it
   std::unordered_map<size_t, std::shared_ptr<CamBase>> camera_calib;
@@ -306,6 +312,13 @@ protected:
   /// each feed_new_camera when use_ground_parallel_warp is enabled; cleared after).
   std::mutex mtx_gravity_warp;
   std::unordered_map<size_t, cv::Matx33d> gravity_warp_per_cam;
+
+  /// Constant camera-fixed optical-axis curl correction rate (rad/s, positive = CCW in image).
+  double curl_correction_rate_radps = 0.0;
+
+  /// Per-camera previous-frame timestamp for the curl-correction dt computation.
+  /// Written inside mtx_last_vars alongside pts_last.
+  std::unordered_map<size_t, double> time_last;
 };
 
 } // namespace ov_core

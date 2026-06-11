@@ -152,6 +152,7 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
     img_mask_last[cam_id] = mask;
     pts_last[cam_id] = good_left;
     ids_last[cam_id] = good_ids_left;
+    time_last[cam_id] = message.timestamp;
     return;
   }
 
@@ -216,6 +217,32 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
   perform_matching(imgpyr_last_klt, imgpyr, pts_left_old, pts_left_new, cam_id, cam_id, mask_ll);
   // NO un-warp: pts_left_new is already in raw current coords regardless of warp mode.
 
+  // [Curl correction] Apply a constant per-frame rotation to all tracked positions.
+  // Corrects the camera-fixed optical-axis rotation bias measured by the LK diagnostic.
+  // For a nadir-facing camera, a CCW body yaw produces a CW feature motion on screen.
+  // Measured LK-gyro = -159.6 mdeg/s means features rotate *slower* than gyro predicts.
+  // To compensate we rotate features in the SAME direction as their natural motion (CW),
+  // i.e. a negative CCW angle.  Positive CLI rate therefore maps to a negative angle here.
+  if (curl_correction_rate_radps != 0.0) {
+    auto it = time_last.find(cam_id);
+    if (it != time_last.end() && it->second > 0.0) {
+      double dt = message.timestamp - it->second;
+      if (dt > 1e-4 && dt < 2.0) {
+        double angle = -curl_correction_rate_radps * dt;
+        double c = std::cos(angle), s = std::sin(angle);
+        auto K = camera_calib.at(cam_id)->get_K();
+        float cx = (float)K(0, 2), cy_val = (float)K(1, 2);
+        for (auto &kp : pts_left_new) {
+          float x = kp.pt.x - cx, y = kp.pt.y - cy_val;
+          kp.pt.x = (float)(c * x - s * y) + cx;
+          kp.pt.y = (float)(s * x + c * y) + cy_val;
+        }
+        PRINT_DEBUG("[CURL-CORR] mono cam%zu  dt=%.4fs  angle=%.5f deg  %zu pts\n",
+                    cam_id, dt, angle * 180.0 / M_PI, pts_left_new.size());
+      }
+    }
+  }
+
   assert(pts_left_new.size() == ids_left_old.size());
   rT4 = boost::posix_time::microsec_clock::local_time();
 
@@ -268,6 +295,7 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
     img_mask_last[cam_id] = mask;
     pts_last[cam_id] = good_left;
     ids_last[cam_id] = good_ids_left;
+    time_last[cam_id] = message.timestamp;
   }
   rT5 = boost::posix_time::microsec_clock::local_time();
 
@@ -347,6 +375,8 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
     pts_last[cam_id_right] = good_right;
     ids_last[cam_id_left] = good_ids_left;
     ids_last[cam_id_right] = good_ids_right;
+    time_last[cam_id_left] = message.timestamp;
+    time_last[cam_id_right] = message.timestamp;
     return;
   }
 
@@ -405,6 +435,7 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
 
   // Track temporally: warped-last vs raw-current for each camera.
   // pts_left_new / pts_right_new exit in raw current-image coords (no un-warp needed).
+  // [Curl correction] Applied after both temporal tracks complete (see below).
   parallel_for_(cv::Range(0, 2), LambdaBody([&](const cv::Range &range) {
                   for (int i = range.start; i < range.end; i++) {
                     bool is_left = (i == 0);
@@ -418,6 +449,32 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
                   }
                 }));
   // NO un-warp: pts are already in raw current coords.
+
+  // [Curl correction] Apply per-frame CCW rotation to temporal tracks (left and right).
+  // Same sign convention and justification as in feed_monocular.
+  if (curl_correction_rate_radps != 0.0) {
+    auto it = time_last.find(cam_id_left);
+    if (it != time_last.end() && it->second > 0.0) {
+      double dt = message.timestamp - it->second;
+      if (dt > 1e-4 && dt < 2.0) {
+        double angle = curl_correction_rate_radps * dt;
+        double c = std::cos(angle), s = std::sin(angle);
+        auto apply_rot = [&](std::vector<cv::KeyPoint> &kps, size_t cam_id) {
+          auto K = camera_calib.at(cam_id)->get_K();
+          float cx = (float)K(0, 2), cy_val = (float)K(1, 2);
+          for (auto &kp : kps) {
+            float x = kp.pt.x - cx, y = kp.pt.y - cy_val;
+            kp.pt.x = (float)(c * x - s * y) + cx;
+            kp.pt.y = (float)(s * x + c * y) + cy_val;
+          }
+        };
+        apply_rot(pts_left_new, cam_id_left);
+        apply_rot(pts_right_new, cam_id_right);
+        PRINT_DEBUG("[CURL-CORR] stereo  dt=%.4fs  angle=%.5f deg  L=%zu R=%zu pts\n",
+                    dt, angle * 180.0 / M_PI, pts_left_new.size(), pts_right_new.size());
+      }
+    }
+  }
 
   rT4 = boost::posix_time::microsec_clock::local_time();
 
@@ -529,6 +586,8 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
     img_pyramid_last[cam_id_right] = imgpyr_right;
     img_mask_last[cam_id_left] = mask_left;
     img_mask_last[cam_id_right] = mask_right;
+    time_last[cam_id_left] = message.timestamp;
+    time_last[cam_id_right] = message.timestamp;
     pts_last[cam_id_left] = good_left;
     pts_last[cam_id_right] = good_right;
     ids_last[cam_id_left] = good_ids_left;

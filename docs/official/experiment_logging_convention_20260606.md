@@ -5,7 +5,28 @@ No undocumented runs. No result folders without status markers.
 
 ---
 
-## Folder Structure
+## Current Folder Structure
+
+This convention supersedes the legacy in-repository layout below.
+
+```text
+C:/Users/baloney/Desktop/实验目录/
+  <original_experiment_folder_name>/
+    <YYYYMMDD_flight_MODE_key-config_STATUS>/
+      plots/
+      tables/
+      data/
+      reports/
+      metadata/
+      raw/                    optional original run files
+      logs/                   optional stdout/stderr
+```
+
+The run folder name must include experiment date, flight, applied mode and key
+configuration, and final status. `metadata/` preserves exact source files,
+configuration, commit when available, and status.
+
+## Legacy Folder Structure
 
 ```
 experiments/YYYYMMDD_short_name/
@@ -29,6 +50,13 @@ experiments/YYYYMMDD_short_name/
         gps_xy_overlay.png
         xy_ate_vs_time.png
         yaw_err_vs_time.png
+      analysis/
+        analysis_provenance.json
+        global_summary.csv
+        metric_statistics.csv
+        segment_error_summary.csv
+        figures/
+        FULL_FLIGHT_ERROR_ANALYSIS.md
       STATUS_OK.txt           ← OR one of: STATUS_DIVERGED, STATUS_CRASH,
                               ←            STATUS_INTERRUPTED, STATUS_PARTIAL
   fly2/ fly3/ fly4/           ← same structure

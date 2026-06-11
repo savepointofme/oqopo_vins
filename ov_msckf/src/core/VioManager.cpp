@@ -292,6 +292,13 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
     std::dynamic_pointer_cast<TrackDescriptor>(trackFEATS)->xfeat_temporal_hint_ = false;
   }
 
+  if (params.curl_correction_rate_degps != 0.0 && params.use_klt) {
+    double rate_radps = params.curl_correction_rate_degps * M_PI / 180.0;
+    trackFEATS->set_curl_correction_rate(rate_radps);
+    PRINT_INFO(CYAN "[VioManager] curl_correction_rate=%.3f deg/s (%.6f rad/s) enabled\n" RESET,
+               params.curl_correction_rate_degps, rate_radps);
+  }
+
   // Initialize our aruco tag extractor
   if (params.use_aruco) {
     trackARUCO = std::shared_ptr<TrackBase>(new TrackAruco(state->_cam_intrinsics_cameras, state->_options.max_aruco_features,

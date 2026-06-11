@@ -555,6 +555,13 @@ struct VioManagerOptions {
   /// visual residual cross-cov.
   double use_gyro_aided_klt_max_bg_sigma = 0.005;
 
+  /// Constant camera-fixed optical-axis curl correction (deg/s, positive = CCW in image).
+  /// Corrects a persistent bias in the apparent in-plane rotation of the LK tracker,
+  /// applied per-frame to tracked feature pixel positions after optical flow.
+  /// Set to the negated measured LK−gyro mean bias (e.g. +159.6 for fly4 which
+  /// showed LK−gyro = −159.6 mdeg/s). Zero = disabled (default).
+  double curl_correction_rate_degps = 0.0;
+
   /// If > 0, drop MSCKF candidate features whose max 2-D pixel parallax
   /// across the active clone window is below this threshold. Most
   /// effective single lever in low-info downward-looking high-altitude.

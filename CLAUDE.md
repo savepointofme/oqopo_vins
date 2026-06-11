@@ -116,3 +116,14 @@ This branch (`fix/alt-scale-realtime-landing-20260512`) adds several features no
 ## Code Style & Formatting
 
 Run `./run_format.sh` (clang-format based) before committing C++ changes. Copyright headers must be preserved on all modified files.
+
+## Flight Error Analysis
+
+Use `analysis/full_flight_error_analysis.py` and follow
+`analysis/FLIGHT_ERROR_ANALYSIS_SKILL.md` for GPS-referenced flight analysis.
+Do not create a separate one-off metrics script or change alignment/metric
+definitions silently. Single-run analysis is the primary workflow and belongs
+under `C:/Users/baloney/Desktop/实验目录/<original_experiment_folder_name>/`.
+Each run folder name must include date, flight, applied configuration, and
+success/failure status, with `plots/`, `tables/`, `data/`, `reports/`, and
+`metadata/` kept separate.

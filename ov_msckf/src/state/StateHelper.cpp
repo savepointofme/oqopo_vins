@@ -686,17 +686,32 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
   }
 
   // Scale bg_z row of K for visual bg_z ablation (default scale=1.0 = no change)
+  bool bgz_row_scaled = false;
   if (visual_bgz_update_scale < 1.0 - 1e-12 &&
       state->_imu != nullptr && state->_imu->bg() != nullptr) {
     int bgz_row = state->_imu->bg()->id() + 2;
-    if (bgz_row >= 0 && bgz_row < (int)K.rows())
+    if (bgz_row >= 0 && bgz_row < (int)K.rows()) {
       K.row(bgz_row) *= visual_bgz_update_scale;
+      bgz_row_scaled = true;
+    }
   }
 
-
-  // Covariance update (standard for all modes; K is unmodified so K = M_a S^{-1} holds).
-  state->_Cov.triangularView<Eigen::Upper>() -= K * M_a.transpose();
-  state->_Cov = state->_Cov.selfadjointView<Eigen::Upper>();
+  if (bgz_row_scaled) {
+    // K no longer equals M_a S^{-1}, so the standard form P -= K M_a^T is invalid
+    // (non-symmetric, goes non-PSD).  Use the gain-agnostic consistent form
+    //   P+ = P - K' M_a^T - M_a K'^T + K' S K'^T
+    // which reduces to the standard form when K' = K, and keeps bg_z a proper
+    // "considered" state: its variance is not reduced by the visual update.
+    Eigen::MatrixXd KM = K * M_a.transpose();
+    Eigen::MatrixXd Sfull = S.selfadjointView<Eigen::Upper>();
+    Eigen::MatrixXd KSK = K * Sfull * K.transpose();
+    state->_Cov += KSK - KM - KM.transpose();
+    state->_Cov = (0.5 * (state->_Cov + state->_Cov.transpose())).eval();
+  } else {
+    // Covariance update (standard for all modes; K is unmodified so K = M_a S^{-1} holds).
+    state->_Cov.triangularView<Eigen::Upper>() -= K * M_a.transpose();
+    state->_Cov = state->_Cov.selfadjointView<Eigen::Upper>();
+  }
 
   // We should check if we are not positive semi-definitate (i.e. negative diagionals is not s.p.d)
   Eigen::VectorXd diags = state->_Cov.diagonal();
