@@ -1,0 +1,33 @@
+{
+  "experiment_id": "NEWCALIB_FIBASE50_20260612",
+  "flight_name": "fly4",
+  "method_name": "newcalib_antivib_locked_fibase50",
+  "date": "20260612",
+  "status": "success",
+  "source_experiment_folder": "yaw_floor_fix_20260610/NEWCALIB_FIBASE_SWEEP_ANTIVIB_LOCKED_20260612/fi_dist1200_baseline50",
+  "gps_csv": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/fc_rebuild_20260528/gps_from_mems_offsetm202p2_cam_time.csv",
+  "vio_traj": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/yaw_floor_fix_20260610/NEWCALIB_FIBASE_SWEEP_ANTIVIB_LOCKED_20260612/fi_dist1200_baseline50/traj.txt",
+  "vio_bias": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/yaw_floor_fix_20260610/NEWCALIB_FIBASE_SWEEP_ANTIVIB_LOCKED_20260612/fi_dist1200_baseline50/traj.txt.bias",
+  "diag_csv": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/yaw_floor_fix_20260610/NEWCALIB_FIBASE_SWEEP_ANTIVIB_LOCKED_20260612/fi_dist1200_baseline50/diag.csv",
+  "vio_yaw_diag": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/yaw_floor_fix_20260610/NEWCALIB_FIBASE_SWEEP_ANTIVIB_LOCKED_20260612/fi_dist1200_baseline50/vio_yaw_diag.csv",
+  "lk_traj": "optional",
+  "lk_flow_csv": "optional",
+  "t0": 924.4,
+  "t1": 2816.0,
+  "alignment": {
+    "mode": "start_heading",
+    "course_window_s": 60.0
+  },
+  "sampling": {
+    "mode": "gps_update_after_vio",
+    "max_delay_s": 0.2
+  },
+  "segmentation": {
+    "mode": "four_side_lap",
+    "min_speed_mps": 5.0,
+    "primary_heading_tolerance_deg": 20.0,
+    "min_primary_side_len_m": 2000.0
+  },
+  "velocity_source": "flight_controller_raw",
+  "notes": "d455_fly1 high-altitude config; fi_max_dist=1200; fi_max_baseline=50; anti-vibration IMU noise; new camera calibration locked; global_yaw_oc_projection alpha=1; GPS-Z off."
+}

@@ -1,0 +1,129 @@
+{
+  "package_path": "D:/vscode_dir/open_vins/artifacts/packages/three_condition_comparison_package_20260605_1727.zip",
+  "out_dir": "result/oc_package_analysis_20260605",
+  "primary_condition": "cond3_oc_gpsz",
+  "heading_window_s": 60.0,
+  "heading_stable_window_s": 5.0,
+  "min_speed_mps": 5.0,
+  "max_course_rate_degps": 1.0,
+  "max_line_fit_rmse_m": 25.0,
+  "max_heading_std_deg": 5.0,
+  "min_straight_len_m": 2000.0,
+  "straight_split_len_m": 500.0,
+  "runs": [
+    {
+      "flight_name": "fly1",
+      "method_name": "cond1_nogpsz",
+      "gps": "config/d455_fly1/fc_gps_cam_time.csv",
+      "vio_traj": "artifacts/extracted/three_condition_comparison_package_20260605_1727/three_condition_comparison/cond1_nogpsz/fly1/traj.txt",
+      "vio_bias": "artifacts/extracted/three_condition_comparison_package_20260605_1727/three_condition_comparison/cond1_nogpsz/fly1/traj.txt.bias"
+      ,"t0": 930.0, "t1": 1744.0
+    },
+    {
+      "flight_name": "fly1",
+      "method_name": "cond2_gpsz_original",
+      "gps": "config/d455_fly1/fc_gps_cam_time.csv",
+      "vio_traj": "artifacts/extracted/three_condition_comparison_package_20260605_1727/three_condition_comparison/cond2_gpsz_original/fly1/traj.txt",
+      "vio_bias": "artifacts/extracted/three_condition_comparison_package_20260605_1727/three_condition_comparison/cond2_gpsz_original/fly1/traj.txt.bias"
+      ,"t0": 930.0, "t1": 1744.0
+    },
+    {
+      "flight_name": "fly1",
+      "method_name": "cond3_oc_gpsz",
+      "gps": "config/d455_fly1/fc_gps_cam_time.csv",
+      "vio_traj": "artifacts/extracted/three_condition_comparison_package_20260605_1727/three_condition_comparison/cond3_oc_gpsz/fly1/traj.txt",
+      "vio_bias": "artifacts/extracted/three_condition_comparison_package_20260605_1727/three_condition_comparison/cond3_oc_gpsz/fly1/traj.txt.bias"
+      ,"t0": 930.0, "t1": 1744.0
+    },
+    {
+      "flight_name": "fly2",
+      "method_name": "cond1_nogpsz",
+      "gps": "C:/Users/baloney/Desktop/20260518_gsmq_d455_fly2/result/fc_rebuild_20260525/gps_from_mems_offset447p5_cam_time.csv",
+      "vio_traj": "artifacts/extracted/three_condition_comparison_package_20260605_1727/three_condition_comparison/cond1_nogpsz/fly2/traj.txt",
+      "vio_bias": "artifacts/extracted/three_condition_comparison_package_20260605_1727/three_condition_comparison/cond1_nogpsz/fly2/traj.txt.bias"
+      ,"t0": 700.0, "t1": 2500.0
+    },
+    {
+      "flight_name": "fly2",
+      "method_name": "cond2_gpsz_original",
+      "gps": "C:/Users/baloney/Desktop/20260518_gsmq_d455_fly2/result/fc_rebuild_20260525/gps_from_mems_offset447p5_cam_time.csv",
+      "vio_traj": "artifacts/extracted/three_condition_comparison_package_20260605_1727/three_condition_comparison/cond2_gpsz_original/fly2/traj.txt",
+      "vio_bias": "artifacts/extracted/three_condition_comparison_package_20260605_1727/three_condition_comparison/cond2_gpsz_original/fly2/traj.txt.bias",
+      "notes": "FAILED partial run: negative covariance diagonal crash at about 1858.27 s."
+      ,"t0": 700.0, "t1": 2500.0
+    },
+    {
+      "flight_name": "fly2",
+      "method_name": "cond3_oc_gpsz",
+      "gps": "C:/Users/baloney/Desktop/20260518_gsmq_d455_fly2/result/fc_rebuild_20260525/gps_from_mems_offset447p5_cam_time.csv",
+      "vio_traj": "artifacts/extracted/three_condition_comparison_package_20260605_1727/three_condition_comparison/cond3_oc_gpsz/fly2/traj.txt",
+      "vio_bias": "artifacts/extracted/three_condition_comparison_package_20260605_1727/three_condition_comparison/cond3_oc_gpsz/fly2/traj.txt.bias"
+      ,"t0": 700.0, "t1": 2500.0
+    },
+    {
+      "flight_name": "fly3",
+      "method_name": "cond1_nogpsz",
+      "gps": "C:/Users/baloney/Desktop/20260527_gsmq_d455_fly3/result/fc_rebuild_20260527/gps_from_mems_offset438p0_cam_time.csv",
+      "vio_traj": "artifacts/extracted/three_condition_comparison_package_20260605_1727/three_condition_comparison/cond1_nogpsz/fly3/traj.txt",
+      "vio_bias": "artifacts/extracted/three_condition_comparison_package_20260605_1727/three_condition_comparison/cond1_nogpsz/fly3/traj.txt.bias",
+      "notes": "Truncated relative to the two GPS-Z fly3 conditions."
+      ,"t0": 618.0, "t1": 1600.0
+    },
+    {
+      "flight_name": "fly3",
+      "method_name": "cond2_gpsz_original",
+      "gps": "C:/Users/baloney/Desktop/20260527_gsmq_d455_fly3/result/fc_rebuild_20260527/gps_from_mems_offset438p0_cam_time.csv",
+      "vio_traj": "D:/vscode_dir/open_vins/artifacts/packages/traj_1e4_fly34_20260606.zip::traj_1e4_fly34/fly3_fej/traj.txt",
+      "source_package": "D:/vscode_dir/open_vins/artifacts/packages/traj_1e4_fly34_20260606.zip",
+      "source_member": "traj_1e4_fly34/fly3_fej/traj.txt",
+      "experiment_id": "20260606_fly3_fej_gpsz_fi1e4",
+      "experiment_config": "FEJ original mode0; fi_max_cond_number=10000; GPS-Z on",
+      "expected_xy_rmse_m": 416.0,
+      "t0": 618.0, "t1": 1837.0
+    },
+    {
+      "flight_name": "fly3",
+      "method_name": "cond3_oc_gpsz",
+      "gps": "C:/Users/baloney/Desktop/20260527_gsmq_d455_fly3/result/fc_rebuild_20260527/gps_from_mems_offset438p0_cam_time.csv",
+      "vio_traj": "D:/vscode_dir/open_vins/artifacts/packages/traj_1e4_fly34_20260606.zip::traj_1e4_fly34/fly3_oc2/traj.txt",
+      "source_package": "D:/vscode_dir/open_vins/artifacts/packages/traj_1e4_fly34_20260606.zip",
+      "source_member": "traj_1e4_fly34/fly3_oc2/traj.txt",
+      "experiment_id": "20260606_fly3_oc2_gpsz_fi1e4",
+      "experiment_config": "OC mode2 global_yaw_oc_projection; fi_max_cond_number=10000; GPS-Z on",
+      "expected_xy_rmse_m": 323.0,
+      "t0": 618.0, "t1": 1837.0
+    },
+    {
+      "flight_name": "fly4",
+      "method_name": "cond1_nogpsz",
+      "gps": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/fc_rebuild_20260528/gps_from_mems_offsetm202p2_cam_time.csv",
+      "vio_traj": "artifacts/extracted/three_condition_comparison_package_20260605_1727/three_condition_comparison/cond1_nogpsz/fly4/traj.txt",
+      "vio_bias": "artifacts/extracted/three_condition_comparison_package_20260605_1727/three_condition_comparison/cond1_nogpsz/fly4/traj.txt.bias"
+      ,"t0": 924.4, "t1": 2816.0
+    },
+    {
+      "flight_name": "fly4",
+      "method_name": "cond2_gpsz_original",
+      "gps": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/fc_rebuild_20260528/gps_from_mems_offsetm202p2_cam_time.csv",
+      "vio_traj": "D:/vscode_dir/open_vins/artifacts/packages/traj_1e4_fly34_20260606.zip::traj_1e4_fly34/fly4_fej/traj.txt",
+      "source_package": "D:/vscode_dir/open_vins/artifacts/packages/traj_1e4_fly34_20260606.zip",
+      "source_member": "traj_1e4_fly34/fly4_fej/traj.txt",
+      "experiment_id": "20260606_fly4_fej_gpsz_fi1e4",
+      "experiment_config": "FEJ original mode0; fi_max_cond_number=10000; GPS-Z on",
+      "expected_xy_rmse_m": 967.0,
+      "t0": 924.4, "t1": 2840.0
+    },
+    {
+      "flight_name": "fly4",
+      "method_name": "cond3_oc_gpsz",
+      "gps": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/fc_rebuild_20260528/gps_from_mems_offsetm202p2_cam_time.csv",
+      "vio_traj": "D:/vscode_dir/open_vins/artifacts/packages/traj_1e4_fly34_20260606.zip::traj_1e4_fly34/fly4_oc2/traj.txt",
+      "source_package": "D:/vscode_dir/open_vins/artifacts/packages/traj_1e4_fly34_20260606.zip",
+      "source_member": "traj_1e4_fly34/fly4_oc2/traj.txt",
+      "experiment_id": "20260606_fly4_oc2_gpsz_fi1e4",
+      "experiment_config": "OC mode2 global_yaw_oc_projection; fi_max_cond_number=10000; GPS-Z on",
+      "expected_xy_rmse_m": 827.0,
+      "t0": 924.4, "t1": 2840.0
+    }
+  ]
+}

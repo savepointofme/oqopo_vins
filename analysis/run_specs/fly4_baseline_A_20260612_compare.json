@@ -1,0 +1,34 @@
+{
+  "experiment_id": "fly4_baseline_A_compare_20260612",
+  "flight_name": "fly4",
+  "method_name": "baseline_A_global_yaw_oc_projection_online_calib",
+  "date": "20260612",
+  "status": "success",
+  "source_experiment_folder": "sigma1_stab_20260610/A_fly4",
+  "gps_csv": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/fc_rebuild_20260528/gps_from_mems_offsetm202p2_cam_time.csv",
+  "vio_traj": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/sigma1_stab_20260610/A_fly4/traj.txt",
+  "vio_bias": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/sigma1_stab_20260610/A_fly4/traj.txt.bias",
+  "diag_csv": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/sigma1_stab_20260610/A_fly4/diag.csv",
+  "vio_yaw_diag": "optional",
+  "lk_traj": "optional",
+  "lk_flow_csv": "optional",
+  "t0": 924.4,
+  "t1": 2773.0,
+  "crop_reason": "Common last valid time before sustained visual-observation collapse after 2773 s; excludes low-feature flight tail and landing drift.",
+  "alignment": {
+    "mode": "start_heading",
+    "course_window_s": 60.0
+  },
+  "sampling": {
+    "mode": "gps_update_after_vio",
+    "max_delay_s": 0.2
+  },
+  "segmentation": {
+    "mode": "four_side_lap",
+    "min_speed_mps": 5.0,
+    "primary_heading_tolerance_deg": 20.0,
+    "min_primary_side_len_m": 2000.0
+  },
+  "velocity_source": "flight_controller_raw",
+  "notes": "Controlled baseline A: global_yaw_oc_projection alpha=1, GPS-Z guarded, fi_max_cond=1e4, online camera intrinsics/extrinsics/time-offset calibration enabled."
+}

@@ -1,0 +1,31 @@
+{
+  "experiment_id": "fly3_oc2_gpsz_fi1e4",
+  "flight_name": "fly3",
+  "method_name": "oc2_gpsz_fi1e4",
+  "date": "20260606",
+  "status": "success",
+  "source_experiment_folder": "gpsz_oc2_1e4_fly3",
+
+  "gps_csv": "C:/Users/baloney/Desktop/20260527_gsmq_d455_fly3/result/fc_rebuild_20260527/gps_from_mems_offset438p0_cam_time.csv",
+  "vio_traj": "zip://D:/vscode_dir/open_vins/artifacts/packages/traj_1e4_fly34_20260606.zip::traj_1e4_fly34/fly3_oc2/traj.txt",
+  "vio_bias": "C:/Users/baloney/Desktop/20260527_gsmq_d455_fly3/result/gpsz_oc2_1e4_fly3/traj.txt.bias",
+  "diag_csv": "optional",
+  "vio_yaw_diag": "optional",
+  "lk_traj": "optional",
+  "lk_flow_csv": "optional",
+
+  "t0": 618.0,
+  "t1": 1600.0,
+
+  "alignment": {
+    "mode": "start_heading",
+    "course_window_s": 60.0
+  },
+  "sampling": {
+    "mode": "gps_update_after_vio",
+    "max_delay_s": 0.2
+  },
+  "velocity_source": "flight_controller_raw",
+
+  "notes": "fly3 oc2 gpsz fi1e4. GPS CSV is already in camera time (offset438p0). Bias file provides VIO velocity (vx/vy/vz). t0=618 avoids pre-flight static; t1=1600 avoids camera failure tail."
+}

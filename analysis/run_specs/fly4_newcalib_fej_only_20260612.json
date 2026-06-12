@@ -1,0 +1,21 @@
+{
+  "experiment_id": "NEWCALIB_FEJ_ONLY_20260612",
+  "flight_name": "fly4",
+  "method_name": "newcalib_fej_only",
+  "date": "20260612",
+  "status": "success",
+  "source_experiment_folder": "yaw_floor_fix_20260610/NEWCALIB_CONSISTENCY_ABLATION_20260612/fej_only",
+  "gps_csv": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/fc_rebuild_20260528/gps_from_mems_offsetm202p2_cam_time.csv",
+  "vio_traj": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/yaw_floor_fix_20260610/NEWCALIB_CONSISTENCY_ABLATION_20260612/fej_only/traj.txt",
+  "vio_bias": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/yaw_floor_fix_20260610/NEWCALIB_CONSISTENCY_ABLATION_20260612/fej_only/traj.txt.bias",
+  "diag_csv": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/yaw_floor_fix_20260610/NEWCALIB_CONSISTENCY_ABLATION_20260612/fej_only/diag.csv",
+  "vio_yaw_diag": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/yaw_floor_fix_20260610/NEWCALIB_CONSISTENCY_ABLATION_20260612/fej_only/vio_yaw_diag.csv",
+  "t0": 924.4,
+  "t1": 2773.0,
+  "crop_reason": "Common last valid time before sustained visual-observation collapse after 2773 s.",
+  "alignment": {"mode": "start_heading", "course_window_s": 60.0},
+  "sampling": {"mode": "gps_update_after_vio", "max_delay_s": 0.2},
+  "segmentation": {"mode": "four_side_lap", "min_speed_mps": 5.0, "primary_heading_tolerance_deg": 20.0, "min_primary_side_len_m": 2000.0},
+  "velocity_source": "flight_controller_raw",
+  "notes": "Atomic consistency mode fej: use_fej=true, original visual update, no OC. New locked calibration, accel noise density 0.009143029881205223, guarded GPS-Z."
+}

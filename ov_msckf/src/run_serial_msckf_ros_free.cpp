@@ -155,6 +155,8 @@ struct Args {
   std::string vio_yaw_diag_path;           // per-visual-update yaw CSV
   std::string visual_obs_diag_path;        // VisualObservabilityPolicy per-update CSV
   std::string schmidt_yaw_diag_path;       // Schmidt yaw update diagnostics CSV
+  // Atomic experiment selection for explicit OC / FEJ combinations.
+  std::string vio_consistency_mode;
   // High-level gauge-mode alias: expands to vio_yaw_update_mode + alpha
   std::string vio_yaw_gauge_mode;
   // Visual update guard (commit 1)
@@ -263,6 +265,11 @@ void print_help() {
                "  --vio-yaw-switch-alpha A  Alpha for the switched-to mode (e.g. 1.0 for global_yaw_oc_projection)\n"
                "  --vio-yaw-diag PATH   Write per-MSCKF/SLAM yaw update CSV\n"
                "  --visual-obs-diag PATH  Write VisualObservabilityPolicy diagnostics CSV\n"
+               "  --vio-consistency-mode M  Explicit consistency ablation mode:\n"
+               "    oc    use_fej=false, current-gauge global-yaw OC alpha=1\n"
+               "    fej   use_fej=true, original visual update (no OC)\n"
+               "    none  use_fej=false, original visual update (no OC)\n"
+               "    oc_fej use_fej=true, current-gauge global-yaw OC alpha=1\n"
                "  --visual-update-skip-window T0 T1  Skip visual EKF updates in [T0,T1] seconds (ablation)\n"
                "  --visual-update-guard-log PATH      Write per-update guard decision CSV\n"
                "  --visual-update-reject-topn-file PATH  CSV of t or t0,t1 intervals to reject\n"
@@ -379,6 +386,7 @@ bool parse_args(int argc, char **argv, Args &a) {
     else if (s == "--vio-yaw-switch-mode") a.vio_yaw_switch_mode = next("--vio-yaw-switch-mode");
     else if (s == "--vio-yaw-switch-time") a.vio_yaw_switch_time = std::atof(next("--vio-yaw-switch-time").c_str());
     else if (s == "--vio-yaw-switch-alpha") a.vio_yaw_switch_alpha = std::atof(next("--vio-yaw-switch-alpha").c_str());
+    else if (s == "--vio-consistency-mode") a.vio_consistency_mode = next("--vio-consistency-mode");
     else if (s == "--vio-yaw-gauge-mode") a.vio_yaw_gauge_mode = next("--vio-yaw-gauge-mode");
     else if (s == "--vio-yaw-diag") a.vio_yaw_diag_path = next("--vio-yaw-diag");
     else if (s == "--visual-obs-diag") a.visual_obs_diag_path = next("--visual-obs-diag");
@@ -465,6 +473,49 @@ int main(int argc, char **argv) {
     params.state_options.do_calib_camera_timeoffset = false;
     PRINT_INFO(CYAN "[ros-free] CLI override: cam_toff=%.6fs (online cam-IMU time-cal DISABLED)\n" RESET,
                args.cam_toff_override);
+  }
+
+  // Historical yaw aliases only selected the visual update path and left the
+  // YAML use_fej value untouched. This atomic mode makes OC-only, FEJ-only,
+  // neither, and OC+FEJ explicit and rejects ambiguous legacy flag mixtures.
+  if (!args.vio_consistency_mode.empty()) {
+    const bool has_conflicting_yaw_cli =
+        !args.vio_yaw_gauge_mode.empty() ||
+        !args.vio_yaw_update_mode.empty() ||
+        !std::isnan(args.vio_global_yaw_oc_alpha) ||
+        args.no_vio_yaw_update;
+    if (has_conflicting_yaw_cli) {
+      PRINT_ERROR("[ros-free] --vio-consistency-mode cannot be combined with "
+                  "visual yaw mode/alpha flags.\n");
+      return EXIT_FAILURE;
+    }
+
+    if (args.vio_consistency_mode == "oc") {
+      params.state_options.do_fej = false;
+      args.vio_yaw_update_mode = "global_yaw_oc_projection";
+      args.vio_global_yaw_oc_alpha = 1.0;
+    } else if (args.vio_consistency_mode == "oc_fej") {
+      params.state_options.do_fej = true;
+      args.vio_yaw_update_mode = "global_yaw_oc_projection";
+      args.vio_global_yaw_oc_alpha = 1.0;
+    } else if (args.vio_consistency_mode == "fej") {
+      params.state_options.do_fej = true;
+      args.vio_yaw_update_mode = "original";
+    } else if (args.vio_consistency_mode == "none") {
+      params.state_options.do_fej = false;
+      args.vio_yaw_update_mode = "original";
+    } else {
+      PRINT_ERROR("[ros-free] invalid --vio-consistency-mode=%s; expected oc, fej, none, or oc_fej.\n",
+                  args.vio_consistency_mode.c_str());
+      return EXIT_FAILURE;
+    }
+
+    PRINT_INFO(CYAN "[ros-free] resolved consistency_mode=%s use_fej=%d "
+                    "vio_yaw_update_mode=%s alpha=%s\n" RESET,
+               args.vio_consistency_mode.c_str(),
+               params.state_options.do_fej ? 1 : 0,
+               args.vio_yaw_update_mode.c_str(),
+               std::isnan(args.vio_global_yaw_oc_alpha) ? "n/a" : "1.0");
   }
 
   // --vio-yaw-gauge-mode: high-level alias that expands to update_mode + alpha.

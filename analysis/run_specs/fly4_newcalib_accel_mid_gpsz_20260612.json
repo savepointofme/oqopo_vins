@@ -1,0 +1,34 @@
+{
+  "experiment_id": "NEWCALIB_ACCEL_MID_GPSZ_20260612",
+  "flight_name": "fly4",
+  "method_name": "newcalib_accel_mid005_gpsz",
+  "date": "20260612",
+  "status": "success",
+  "source_experiment_folder": "yaw_floor_fix_20260610/NEWCALIB_ACCEL_NOISE_ABLATION_GPSZ_RERUN_20260612/accel_mid",
+  "gps_csv": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/fc_rebuild_20260528/gps_from_mems_offsetm202p2_cam_time.csv",
+  "vio_traj": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/yaw_floor_fix_20260610/NEWCALIB_ACCEL_NOISE_ABLATION_GPSZ_RERUN_20260612/accel_mid/traj.txt",
+  "vio_bias": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/yaw_floor_fix_20260610/NEWCALIB_ACCEL_NOISE_ABLATION_GPSZ_RERUN_20260612/accel_mid/traj.txt.bias",
+  "diag_csv": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/yaw_floor_fix_20260610/NEWCALIB_ACCEL_NOISE_ABLATION_GPSZ_RERUN_20260612/accel_mid/diag.csv",
+  "vio_yaw_diag": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/yaw_floor_fix_20260610/NEWCALIB_ACCEL_NOISE_ABLATION_GPSZ_RERUN_20260612/accel_mid/vio_yaw_diag.csv",
+  "lk_traj": "optional",
+  "lk_flow_csv": "optional",
+  "t0": 924.4,
+  "t1": 2773.0,
+  "crop_reason": "Common last valid time before sustained visual-observation collapse: n_acc drops sharply after 2773 s while GPS horizontal speed remains about 31 m/s; exclude the invalid low-feature flight tail and post-landing drift.",
+  "alignment": {
+    "mode": "start_heading",
+    "course_window_s": 60.0
+  },
+  "sampling": {
+    "mode": "gps_update_after_vio",
+    "max_delay_s": 0.2
+  },
+  "segmentation": {
+    "mode": "four_side_lap",
+    "min_speed_mps": 5.0,
+    "primary_heading_tolerance_deg": 20.0,
+    "min_primary_side_len_m": 2000.0
+  },
+  "velocity_source": "flight_controller_raw",
+  "notes": "accel noise density=0.05; new Allan random walks and gyro noise; new camera calibration locked; fi_max_dist=1200; fi_max_baseline=50; global yaw OC alpha=1; guarded GPS-Z enabled. Formal comparison uses the common valid flight window [924.4, 2773.0]."
+}
