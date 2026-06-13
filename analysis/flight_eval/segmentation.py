@@ -325,35 +325,103 @@ def segment_four_side_laps(df: pd.DataFrame, cfg: SegConfig) -> pd.DataFrame:
 
 
 def segment_errors(df: pd.DataFrame, seg_index: pd.DataFrame) -> pd.DataFrame:
-    """每段误差汇总：局部段漂移（主）+ 全局段误差（参考）。"""
+    """每段误差汇总：段局部坐标系（主）+ 全局累计误差（参考）。
+
+    局部坐标系定义：
+      ea  = 该段 GPS 起止点净位移方向（end - start，归一化）
+      ec  = ea 的左手垂直方向
+      原点 = 该段 GPS 起始点
+      VIO  先做段起点对齐（VIO 起点平移到 GPS 起点），再在局部系中量测
+
+    这样对于回程边（side 3），ea 指向出发方向的反向，局部 along 误差
+    仅反映段内 VIO 相对 GPS 的偏移积累，不包含之前段的累计漂移。
+    """
     rows = []
     for _, r in seg_index.iterrows():
         seg = df.iloc[int(r["i0"]):int(r["i1"]) + 1]
         v = seg[seg["valid"]]
         if len(v) < 2:
             continue
-        e0 = v.iloc[0]
-        e1 = v.iloc[-1]
-        dist = float(v["cum_dist"].iloc[-1] - v["cum_dist"].iloc[0])
-        # 局部: 段起点误差归零
-        local_final = float(np.hypot(e1["err_E"] - e0["err_E"], e1["err_N"] - e0["err_N"]))
-        local_pct = round(local_final / dist * 100, 2) if dist > 50 else None
-        # 全局
+
+        gps_e = v["gps_E"].values
+        gps_n = v["gps_N"].values
+        gps_u = v["gps_U"].values if "gps_U" in v.columns else np.zeros(len(v))
+        vio_e = v["vio_E"].values
+        vio_n = v["vio_N"].values
+        vio_u = v["vio_U"].values if "vio_U" in v.columns else np.zeros(len(v))
+
+        dist_m = float(v["cum_dist"].iloc[-1] - v["cum_dist"].iloc[0])
+
+        # 段航向：GPS 起止点净位移方向
+        dE = gps_e[-1] - gps_e[0]
+        dN = gps_n[-1] - gps_n[0]
+        seg_span = float(np.hypot(dE, dN))
+        if seg_span >= 10.0:
+            ea = np.array([dE / seg_span, dN / seg_span], dtype=float)
+        else:
+            # 直线短或原地：取该段 GPS 平均航向
+            cr = np.deg2rad(v["gps_course_deg"].values)
+            nm = float(np.hypot(np.mean(np.cos(cr)), np.mean(np.sin(cr))))
+            ea = np.array([np.mean(np.cos(cr)), np.mean(np.sin(cr))], dtype=float)
+            if nm > 0.05:
+                ea /= nm
+            else:
+                ea = np.array([1.0, 0.0])
+        ec = np.array([-ea[1], ea[0]], dtype=float)  # 左手垂直
+
+        # GPS 相对段起点（局部系）
+        gps_rel_e, gps_rel_n = gps_e - gps_e[0], gps_n - gps_n[0]
+        gps_along = gps_rel_e * ea[0] + gps_rel_n * ea[1]
+        gps_cross = gps_rel_e * ec[0] + gps_rel_n * ec[1]
+        gps_vert  = gps_u - gps_u[0]
+
+        # VIO 相对 VIO 段起点（局部系），段起点对齐到 GPS 起点
+        vio_rel_e, vio_rel_n = vio_e - vio_e[0], vio_n - vio_n[0]
+        vio_along = vio_rel_e * ea[0] + vio_rel_n * ea[1]
+        vio_cross = vio_rel_e * ec[0] + vio_rel_n * ec[1]
+        vio_vert  = vio_u - vio_u[0]
+
+        # 局部误差（逐样本）
+        loc_err_along = vio_along - gps_along
+        loc_err_cross = vio_cross - gps_cross
+        loc_err_vert  = vio_vert  - gps_vert
+
+        lf_along = float(loc_err_along[-1])
+        lf_cross = float(loc_err_cross[-1])
+        lf_vert  = float(loc_err_vert[-1])
+        lf_xy    = float(np.hypot(lf_along, lf_cross))
+
+        local_pct       = round(lf_xy / dist_m * 100, 2) if dist_m > 50 else None
+        local_cross_pct = round(abs(lf_cross) / dist_m * 100, 2) if dist_m > 50 else None
+
+        along_rmse = float(np.sqrt(np.mean(loc_err_along ** 2)))
+        cross_rmse = float(np.sqrt(np.mean(loc_err_cross ** 2)))
+        vert_rmse  = float(np.sqrt(np.mean(loc_err_vert ** 2)))
+
+        e1_row = v.iloc[-1]
         global_rmse = float(np.sqrt(np.mean(v["err_XY"] ** 2)))
+
         rows.append({
-            "segment_id": int(r["segment_id"]),
-            "segment_type": r["segment_type"],
-            "lap_id": int(r.get("lap_id", -1)),
-            "side_id": int(r.get("side_id", -1)),
-            "label": r.get("label", f"segment {int(r['segment_id'])}"),
-            "dist_m": round(dist, 1),
-            "local_final_xy_error_m": round(local_final, 2),
-            "local_drift_percent": local_pct,
-            "global_xy_rmse_m": round(global_rmse, 2),
-            "global_final_xy_error_m": round(float(e1["err_XY"]), 2),
-            "along_rmse_m": round(float(np.sqrt(np.mean(v["err_along"] ** 2))), 2),
-            "cross_rmse_m": round(float(np.sqrt(np.mean(v["err_cross"] ** 2))), 2),
-            "speed_rmse_mps": round(float(np.sqrt(np.mean(v["err_speed_xy"] ** 2))), 3),
-            "vxy_vec_rmse_mps": round(float(np.sqrt(np.mean(v["err_vXY_vec"] ** 2))), 3),
+            "segment_id":                   int(r["segment_id"]),
+            "segment_type":                 r["segment_type"],
+            "lap_id":                       int(r.get("lap_id", -1)),
+            "side_id":                      int(r.get("side_id", -1)),
+            "label":                        r.get("label", f"segment {int(r['segment_id'])}"),
+            "dist_m":                       round(dist_m, 1),
+            # 局部系（主判据）
+            "local_final_along_error_m":    round(lf_along, 2),
+            "local_final_cross_error_m":    round(lf_cross, 2),
+            "local_final_vertical_error_m": round(lf_vert, 2),
+            "local_final_xy_error_m":       round(lf_xy, 2),
+            "local_drift_percent":          local_pct,
+            "local_cross_drift_percent":    local_cross_pct,
+            "along_rmse_m":                 round(along_rmse, 2),
+            "cross_rmse_m":                 round(cross_rmse, 2),
+            "vertical_rmse_m":              round(vert_rmse, 2),
+            # 全局参考
+            "global_xy_rmse_m":             round(global_rmse, 2),
+            "global_final_xy_error_m":      round(float(e1_row["err_XY"]), 2),
+            "speed_rmse_mps":               round(float(np.sqrt(np.mean(v["err_speed_xy"] ** 2))), 3),
+            "vxy_vec_rmse_mps":             round(float(np.sqrt(np.mean(v["err_vXY_vec"] ** 2))), 3),
         })
     return pd.DataFrame(rows)

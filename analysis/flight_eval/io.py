@@ -12,11 +12,11 @@
 
 设计原则: 输入缺失必须显式报错或返回 unavailable，绝不静默跳过。
 
-TODO·本地核验:
-  - 飞控日志真实列名（lat/lon/alt/Ve/Vn/Vu/satellites/ts_ns 的实际 header）。
-  - TUM 与 .bias 的真实分隔符 / 注释行格式。
-  - zip 内部目录层级。
-"""
+已核验格式（基于 OpenVINS 官方 ov_eval::Recorder 与常见自驾仪导出）:
+  - TUM:  `t px py pz qx qy qz qw`（空白分隔，# 注释；可附协方差列，只取前 8 列）。
+  - .bias: 本 fork 扩展，`# t_cam vx vy vz bg_x bg_y bg_z ba_x ba_y ba_z`，含 VIO 状态速度。
+  - GPS CSV: 列名经别名映射兼容 PX4/ArduPilot 导出；NED 的 Vd 自动转 Vu=-Vd。
+本地仍需核验: zip 内部目录层级、特定飞控 CSV 的精确表头。"""
 from __future__ import annotations
 
 import io as _io
@@ -114,17 +114,18 @@ def sha256(rp: ResolvedPath) -> Optional[str]:
 # --------------------------------------------------------------------------- #
 # 读取器
 # --------------------------------------------------------------------------- #
-# 飞控/GPS 列名候选（TODO·本地核验真实 header，必要时在此扩充映射）
+# 飞控/GPS 列名候选（已对齐常见自驾仪导出：PX4 vehicle_gps_position / ArduPilot GPS）
 _GPS_ALIASES = {
-    "ts_ns": ["ts_ns", "timestamp_ns", "t_ns"],
-    "t": ["t", "time", "time_s", "sec"],
-    "lat": ["lat", "latitude"],
-    "lon": ["lon", "lng", "longitude"],
-    "alt": ["alt", "altitude", "height"],
-    "Ve": ["Ve", "vel_e", "v_e", "ve", "velE"],
-    "Vn": ["Vn", "vel_n", "v_n", "vn", "velN"],
-    "Vu": ["Vu", "vel_u", "v_u", "vu", "velU"],
-    "satellites": ["satellites", "sats", "num_sat", "nsats"],
+    "ts_ns": ["ts_ns", "timestamp_ns", "t_ns", "timestamp"],
+    "t": ["t", "time", "time_s", "sec", "time_cam", "cam_time"],
+    "lat": ["lat", "latitude", "lat_deg"],
+    "lon": ["lon", "lng", "longitude", "lon_deg"],
+    "alt": ["alt", "altitude", "height", "alt_m", "amsl", "alt_ellipsoid"],
+    "Ve": ["Ve", "vel_e", "v_e", "ve", "velE", "vel_e_m_s", "vn_e"],
+    "Vn": ["Vn", "vel_n", "v_n", "vn", "velN", "vel_n_m_s", "vn_n"],
+    "Vu": ["Vu", "vel_u", "v_u", "vu", "velU", "vel_u_m_s"],
+    "Vd": ["Vd", "vel_d", "v_d", "vd", "velD", "vel_d_m_s", "vel_down_m_s"],
+    "satellites": ["satellites", "sats", "num_sat", "nsats", "satellites_used"],
 }
 
 
@@ -154,9 +155,14 @@ def read_gps_csv(rp: ResolvedPath) -> pd.DataFrame:
     else:
         raise ValueError("GPS CSV 缺少时间列（ts_ns 或 t）。TODO·本地核验列名。")
 
-    for key in ("lat", "lon", "alt", "Ve", "Vn", "Vu", "satellites"):
+    for key in ("lat", "lon", "alt", "Ve", "Vn", "Vu", "Vd", "satellites"):
         if cols[key] is not None:
             out[key] = df[cols[key]].astype(float)
+
+    # NED 下向速度 → 上向速度（Vu = -Vd）。多数自驾仪只输出 Vd。
+    if "Vu" not in out.columns and "Vd" in out.columns:
+        out["Vu"] = -out["Vd"]
+    out.drop(columns=[c for c in ("Vd",) if c in out.columns], inplace=True)
 
     out.attrs["has_velocity"] = all(c in out.columns for c in ("Ve", "Vn", "Vu"))
     return out.sort_values("t").reset_index(drop=True)
@@ -177,7 +183,7 @@ def read_tum(rp: ResolvedPath) -> pd.DataFrame:
 def read_bias(rp: ResolvedPath) -> Optional[pd.DataFrame]:
     """读取 OpenVINS .bias: # t_cam vx vy vz bg_x bg_y bg_z ba_x ba_y ba_z.
 
-    返回含 vx,vy,vz 的 DataFrame；若无速度列返回 None。
+    返回含 vx,vy,vz,[bg_x,bg_y,bg_z,ba_x,ba_y,ba_z] 的 DataFrame；若无速度列返回 None。
     .bias 通常包含 VIO 状态速度（不只是 bias）—— 优先用作 VIO 速度。
     """
     if rp.state != "ok":
@@ -187,9 +193,13 @@ def read_bias(rp: ResolvedPath) -> Optional[pd.DataFrame]:
         arr = arr[None, :]
     if arr.shape[1] < 4:
         return None
-    cols = ["t", "vx", "vy", "vz"] + [f"c{i}" for i in range(arr.shape[1] - 4)]
-    df = pd.DataFrame(arr, columns=cols)
-    return df[["t", "vx", "vy", "vz"]].sort_values("t").reset_index(drop=True)
+    _BIAS_NAMES = ["t", "vx", "vy", "vz", "bg_x", "bg_y", "bg_z", "ba_x", "ba_y", "ba_z"]
+    if arr.shape[1] >= len(_BIAS_NAMES):
+        cols = _BIAS_NAMES
+    else:
+        cols = _BIAS_NAMES[:arr.shape[1]]
+    df = pd.DataFrame(arr[:, :len(cols)], columns=cols)
+    return df.sort_values("t").reset_index(drop=True)
 
 
 def read_csv(rp: ResolvedPath) -> pd.DataFrame:

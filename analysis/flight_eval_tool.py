@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import io as _io
 import os
 import sys
@@ -54,14 +55,15 @@ def cmd_single(args):
     st.ok("inspect", "run spec resolved")
 
     # ---- 读取 GPS（飞控参考） ----
-    gps = io.read_gps_csv(spec.inputs["gps_csv"])
-    has_vel = gps.attrs.get("has_velocity", False)
+    gps_full = io.read_gps_csv(spec.inputs["gps_csv"])
+    has_vel = gps_full.attrs.get("has_velocity", False)
     ref_src = "flight_controller_raw" if has_vel else "gps_position_diff"
     if not has_vel:
         st.warn("飞控速度列缺失 → 参考速度使用位置差分 fallback")
 
-    # 限制到有效窗口
-    gps = gps[(gps["t"] >= spec.t0) & (gps["t"] <= spec.t1)].reset_index(drop=True)
+    # 限制到有效窗口（保留 mask 供 fc_log 行过滤）
+    _gps_window_mask = (gps_full["t"] >= spec.t0) & (gps_full["t"] <= spec.t1)
+    gps = gps_full[_gps_window_mask].reset_index(drop=True)
     lat0, lon0, alt0 = gps["lat"].iloc[0], gps["lon"].iloc[0], gps.get("alt", pd.Series([0])).iloc[0]
     gps_ENU = trajectory.lla_to_enu(gps["lat"], gps["lon"], gps.get("alt", 0), lat0, lon0, alt0)
     gps_EN = gps_ENU[:, :2]
@@ -140,6 +142,54 @@ def cmd_single(args):
     seg_err = segmentation.segment_errors(df, seg_index)
     st.ok("segment", f"{len(seg_index)} segments")
 
+    # ---- 扩充大表：GPS 大地坐标 + VIO 四元数 + bias ----
+    # GPS lat/lon/alt/satellites（与 gps 表行对行对齐）
+    if "lat" in gps.columns:
+        df["gps_lat"] = gps["lat"].values
+    if "lon" in gps.columns:
+        df["gps_lon"] = gps["lon"].values
+    if "alt" in gps.columns:
+        df["gps_alt"] = gps["alt"].values
+    if "satellites" in gps.columns:
+        df["gps_satellites"] = gps["satellites"].values
+    # VIO 四元数（由 vio_idx 对齐到最近 VIO 时刻）
+    for qcol in ("qx", "qy", "qz", "qw"):
+        if qcol in vio.columns:
+            df[f"vio_{qcol}"] = vio[qcol].values[vio_idx]
+    # VIO bias（bg/ba：由 bvi 对齐，仅在 bias 可用时添加）
+    if bias is not None:
+        for bcol in ("bg_x", "bg_y", "bg_z", "ba_x", "ba_y", "ba_z"):
+            if bcol in bias.columns:
+                df[f"vio_{bcol}"] = bias[bcol].values[bvi]
+    # MEMS 姿态角（可选 fc_log，仅当 run spec 提供且与 GPS CSV 行对齐时添加）
+    fc_log_rp = spec.inputs.get("fc_log")
+    if fc_log_rp is not None and fc_log_rp.state == "ok":
+        try:
+            raw_fc = pd.read_csv(io.open_bytes(fc_log_rp), encoding="utf-8-sig")
+            if raw_fc.shape[1] >= 4:
+                # 前三列固定为 pitch/roll/yaw；第四列为 GPS 时间
+                raw_fc.columns = (
+                    ["mems_pitch_deg", "mems_roll_deg", "mems_yaw_deg"] +
+                    list(raw_fc.columns[3:])
+                )
+                gps_time_col = raw_fc.columns[3]
+                # 全量 GPS 有效行
+                fc_gps_rows_all = raw_fc[raw_fc[gps_time_col].notna()].reset_index(drop=True)
+                # 与全量 GPS CSV 行对行对齐，再用窗口 mask 过滤到窗口内
+                if len(fc_gps_rows_all) == len(gps_full):
+                    fc_gps_win = fc_gps_rows_all[_gps_window_mask.values].reset_index(drop=True)
+                    if len(fc_gps_win) == len(gps):
+                        df["mems_pitch_deg"] = fc_gps_win["mems_pitch_deg"].values
+                        df["mems_roll_deg"] = fc_gps_win["mems_roll_deg"].values
+                        df["mems_yaw_deg"] = fc_gps_win["mems_yaw_deg"].values
+                        st.ok("fc_log", f"mems pitch/roll/yaw added ({len(gps)} rows)")
+                    else:
+                        st.warn(f"fc_log 窗口行数({len(fc_gps_win)})与GPS窗口({len(gps)})不符，跳过姿态列")
+                else:
+                    st.warn(f"fc_log GPS行数({len(fc_gps_rows_all)})与全量GPS CSV({len(gps_full)})不符，跳过姿态列")
+        except Exception as _e:
+            st.warn(f"fc_log 读取失败（不阻断）: {_e}")
+
     # ---- 输出 data/ tables/ ----
     df.to_csv(os.path.join(dirs["data"], "gps_time_aligned_samples.csv"), index=False)
     summary = metrics.global_summary(df)
@@ -150,7 +200,7 @@ def cmd_single(args):
     seg_err.to_csv(os.path.join(dirs["tables"], "segment_error_summary.csv"), index=False)
     seg_err[seg_err["segment_type"] == "straight"].to_csv(
         os.path.join(dirs["tables"], "straight_leg_summary.csv"), index=False)
-    seg_err[seg_err["segment_type"].isin(["turn", "transition"])].to_csv(
+    seg_err[seg_err["segment_type"].isin(["turn", "transition", "connector"])].to_csv(
         os.path.join(dirs["tables"], "turn_transition_summary.csv"), index=False)
     lk_summary = None
     if lk.diagnostic is not None:
@@ -194,7 +244,8 @@ def cmd_single(args):
         "status": spec.status, "t0": spec.t0, "t1": spec.t1,
         "alignment": spec.alignment["mode"], "course_window_s": spec.alignment["course_window_s"],
         "velocity_source": ref_src, "vio_velocity_source": vio_velocity_source,
-        "lk": {"available": lk.available, "mode": lk.mode},
+        "lk": {"available": lk.available, "mode": lk.mode,
+               "reason": (', '.join(lk.missing) if lk.missing else '输入文件不可用') if not lk.available else None},
         "out_folder": spec.out_folder_name, "gaps": gaps,
     }
     if not args.no_dashboard:
@@ -268,15 +319,14 @@ def cmd_align_time(args):
 def cmd_build_fc_gps(args):
     """从飞控原始日志提取 GPS + 速度（Ve,Vn,Vu）+ 卫星数 → 标准 gps.csv。
 
-    TODO·本地核验: 飞控日志真实解析（MAVLink/ULog/自定义二进制）。
-    这里给出标准输出列约定，解析逻辑由本地 agent 按日志格式实现。
+    支持 .csv/.tsv（表格归一化）、.ulg（PX4，pyulog）、.bin（ArduPilot，pymavlink）。
+    速度取飞控原始 Ve/Vn/Vu（NED 的 Vd 自动转 Vu=-Vd），缺速度列则报错不伪造。
     """
-    raise NotImplementedError(
-        "build-fc-gps 解析依赖本地飞控日志格式。\n"
-        "Unavailable in repository context. Expected local implementation:\n"
-        "  输入: 飞控原始日志（如 .bin/.ulg/.tlog）\n"
-        "  输出 gps.csv 列: ts_ns, lat, lon, alt, Ve, Vn, Vu, satellites\n"
-        "  关键: 必须提取原始速度 Ve/Vn/Vu，不要用位置差分。")
+    from flight_eval import fc_gps
+    df = fc_gps.build_fc_gps(args.fc_log, args.out)
+    print(f"[build-fc-gps] 完成 → {args.out}（{len(df)} 行）")
+    has_v = df[["Ve", "Vn", "Vu"]].notna().all(axis=None)
+    print(f"  速度列完整={bool(has_v)}  时间范围={df['ts_ns'].iloc[0]*1e-9:.2f}~{df['ts_ns'].iloc[-1]*1e-9:.2f}s")
 
 
 # --------------------------------------------------------------------------- #
@@ -309,7 +359,30 @@ def cmd_dashboard(args):
     seg_err = pd.read_csv(os.path.join(d, "tables", "segment_error_summary.csv"))
     summary = pd.read_csv(os.path.join(d, "tables", "global_summary.csv")).iloc[0].to_dict()
     quality = pd.read_csv(os.path.join(d, "tables", "gps_sampling_quality.csv")).iloc[0].to_dict()
+    # 从 metadata 还原完整 meta，使重建页面的溯源/速度标注与首次一致
+    rs_path = os.path.join(d, "metadata", "run_spec_resolved.json")
     meta = {"experiment_id": os.path.basename(d), "out_folder": os.path.basename(d), "gaps": []}
+    if os.path.isfile(rs_path):
+        with open(rs_path, "r", encoding="utf-8") as f:
+            rs = json.load(f)
+        vs = rs.get("velocity_source", {})
+        meta.update({
+            "experiment_id": rs.get("experiment_id", meta["experiment_id"]),
+            "flight": rs.get("flight_name", ""), "method": rs.get("method_name", ""),
+            "status": rs.get("status", ""), "t0": rs.get("t0"), "t1": rs.get("t1"),
+            "alignment": (rs.get("alignment") or {}).get("mode", ""),
+            "course_window_s": (rs.get("alignment") or {}).get("course_window_s", ""),
+            "velocity_source": vs.get("reference", quality.get("velocity_source", "")),
+            "vio_velocity_source": vs.get("vio", ""),
+        })
+    # 还原 LK 模式（从 LK 报告标题判断是否可用）
+    lk_rep = os.path.join(d, "reports", "LK_ONLY_ANALYSIS.md")
+    if os.path.isfile(lk_rep):
+        txt = open(lk_rep, "r", encoding="utf-8").read()
+        avail = "不可用" not in txt and "unavailable" not in txt.lower()
+        mode = "LK_ONLY_DIAGNOSTIC" if "LK_ONLY_DIAGNOSTIC" in txt else ("trajectory" if avail else "unavailable")
+        meta["lk"] = {"available": avail, "mode": mode}
+    # 还原缺口（从采样质量推断不到精确区间时留空，前端按 gap 标记降级）
     payload = dashboard.build_payload(df, seg_index, seg_err, summary, quality, meta)
     p = dashboard.write_dashboard(payload, os.path.join(d, "reports"))
     print(f"[dashboard] 重建 → {p}")

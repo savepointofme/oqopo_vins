@@ -1,0 +1,32 @@
+{
+  "experiment_id": "NEWCALIB_ACCEL_ALLAN_GPSZ_20260612",
+  "flight_name": "fly4",
+  "method_name": "newcalib_accel_allan_gpsz",
+  "date": "20260612",
+  "status": "success",
+  "source_experiment_folder": "yaw_floor_fix_20260610/NEWCALIB_ACCEL_NOISE_ABLATION_GPSZ_RERUN_20260612/accel_allan",
+  "gps_csv": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/fc_rebuild_20260528/gps_from_mems_offsetm202p2_cam_time.csv",
+  "vio_traj": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/yaw_floor_fix_20260610/NEWCALIB_ACCEL_NOISE_ABLATION_GPSZ_RERUN_20260612/accel_allan/traj.txt",
+  "vio_bias": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/yaw_floor_fix_20260610/NEWCALIB_ACCEL_NOISE_ABLATION_GPSZ_RERUN_20260612/accel_allan/traj.txt.bias",
+  "fc_log": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/2026_05_27_17_41_28_1_mems_fly7.csv",
+  "lk_traj": "optional",
+  "lk_flow_csv": "optional",
+  "t0": 924.4,
+  "t1": 2816.0,
+  "alignment": {
+    "mode": "start_heading",
+    "course_window_s": 60.0
+  },
+  "sampling": {
+    "mode": "gps_update_after_vio",
+    "max_delay_s": 0.2
+  },
+  "segmentation": {
+    "mode": "four_side_lap",
+    "min_speed_mps": 5.0,
+    "primary_heading_tolerance_deg": 20.0,
+    "min_primary_side_len_m": 2000.0
+  },
+  "velocity_source": "flight_controller_raw",
+  "notes": "Allan variance accel noise ablation with GPS-Z rerun. New camera calib (intrinsics+extrinsics+T_cam_imu). Online calib enabled."
+}
