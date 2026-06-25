@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "state/StateOptions.h"
+#include "core/ImuFilter.h"
 #include "update/UpdaterOptions.h"
 #include "utils/NoiseManager.h"
 
@@ -114,6 +115,9 @@ struct VioManagerOptions {
   /// If we should record the timing performance to file
   bool record_timing_information = false;
 
+  /// Optional real-time causal filtering applied once at the VioManager IMU entry.
+  ImuFilterOptions imu_filter;
+
   /// The path to the file we will record the timing information into
   std::string record_timing_filepath = "ov_msckf_timing.txt";
 
@@ -165,6 +169,26 @@ struct VioManagerOptions {
       parser->parse_config("gps_time_offset", gps_time_offset, false);
       parser->parse_config("record_timing_information", record_timing_information);
       parser->parse_config("record_timing_filepath", record_timing_filepath);
+      parser->parse_config("imu_filter", "enabled", imu_filter.enabled, false);
+      parser->parse_config("imu_filter", "sample_rate_hz", imu_filter.sample_rate_hz, false);
+      parser->parse_config("imu_filter", "log_raw_and_filtered", imu_filter.log_raw_and_filtered, false);
+      parser->parse_config("imu_filter", "log_path", imu_filter.log_path, false);
+      parser->parse_config("imu_filter", "gyro", "notch0", "enabled", imu_filter.gyro_notch0.enabled, false);
+      parser->parse_config("imu_filter", "gyro", "notch0", "frequency_hz", imu_filter.gyro_notch0.frequency_hz, false);
+      parser->parse_config("imu_filter", "gyro", "notch0", "bandwidth_hz", imu_filter.gyro_notch0.bandwidth_hz, false);
+      parser->parse_config("imu_filter", "gyro", "notch1", "enabled", imu_filter.gyro_notch1.enabled, false);
+      parser->parse_config("imu_filter", "gyro", "notch1", "frequency_hz", imu_filter.gyro_notch1.frequency_hz, false);
+      parser->parse_config("imu_filter", "gyro", "notch1", "bandwidth_hz", imu_filter.gyro_notch1.bandwidth_hz, false);
+      parser->parse_config("imu_filter", "gyro", "lowpass", "enabled", imu_filter.gyro_lowpass.enabled, false);
+      parser->parse_config("imu_filter", "gyro", "lowpass", "cutoff_hz", imu_filter.gyro_lowpass.cutoff_hz, false);
+      parser->parse_config("imu_filter", "gyro_notch0_enabled", imu_filter.gyro_notch0.enabled, false);
+      parser->parse_config("imu_filter", "gyro_notch0_frequency_hz", imu_filter.gyro_notch0.frequency_hz, false);
+      parser->parse_config("imu_filter", "gyro_notch0_bandwidth_hz", imu_filter.gyro_notch0.bandwidth_hz, false);
+      parser->parse_config("imu_filter", "gyro_notch1_enabled", imu_filter.gyro_notch1.enabled, false);
+      parser->parse_config("imu_filter", "gyro_notch1_frequency_hz", imu_filter.gyro_notch1.frequency_hz, false);
+      parser->parse_config("imu_filter", "gyro_notch1_bandwidth_hz", imu_filter.gyro_notch1.bandwidth_hz, false);
+      parser->parse_config("imu_filter", "gyro_lowpass_enabled", imu_filter.gyro_lowpass.enabled, false);
+      parser->parse_config("imu_filter", "gyro_lowpass_cutoff_hz", imu_filter.gyro_lowpass.cutoff_hz, false);
       parser->parse_config("enable_vio_yaw_update", enable_vio_yaw_update, false);
       parser->parse_config("vio_yaw_update_mode", vio_yaw_update_mode, false);
       parser->parse_config("vio_yaw_update_scale", vio_yaw_update_scale, false);
@@ -191,6 +215,15 @@ struct VioManagerOptions {
     PRINT_DEBUG("  - gps_time_offset: %+.3f s (0=disabled)\n", gps_time_offset);
     PRINT_DEBUG("  - record timing?: %d\n", (int)record_timing_information);
     PRINT_DEBUG("  - record timing filepath: %s\n", record_timing_filepath.c_str());
+    PRINT_DEBUG("  - IMU filter enabled?: %d\n", (int)imu_filter.enabled);
+    PRINT_DEBUG("  - IMU gyro notch0: %d freq=%.3f Hz bandwidth=%.3f Hz\n", (int)imu_filter.gyro_notch0.enabled,
+                imu_filter.gyro_notch0.frequency_hz, imu_filter.gyro_notch0.bandwidth_hz);
+    PRINT_DEBUG("  - IMU gyro notch1: %d freq=%.3f Hz bandwidth=%.3f Hz\n", (int)imu_filter.gyro_notch1.enabled,
+                imu_filter.gyro_notch1.frequency_hz, imu_filter.gyro_notch1.bandwidth_hz);
+    PRINT_DEBUG("  - IMU gyro low-pass: %d cutoff=%.3f Hz\n", (int)imu_filter.gyro_lowpass.enabled,
+                imu_filter.gyro_lowpass.cutoff_hz);
+    PRINT_DEBUG("  - IMU nominal sample rate: %.3f Hz (0=timestamp estimate)\n", imu_filter.sample_rate_hz);
+    PRINT_DEBUG("  - IMU raw/filtered log: %d path=%s\n", (int)imu_filter.log_raw_and_filtered, imu_filter.log_path.c_str());
     PRINT_DEBUG("  - enable VIO yaw update?: %d\n", (int)enable_vio_yaw_update);
     PRINT_DEBUG("  - VIO yaw update mode: %s\n", vio_yaw_update_mode.c_str());
     PRINT_DEBUG("  - VIO yaw update scale: %.3f\n", vio_yaw_update_scale);

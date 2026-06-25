@@ -43,8 +43,11 @@
 #define OV_MSCKF_STATE_PROPAGATOR_H
 
 #include <atomic>
+#include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <string>
 
 #include "utils/sensor_data.h"
 
@@ -125,6 +128,12 @@ public:
    * @brief Will invalidate the cache used for fast propagation
    */
   void invalidate_cache() { cache_imu_valid = false; }
+
+  void set_yaw_diag_window(double t0, double t1) {
+    yaw_diag_t0_ = t0;
+    yaw_diag_t1_ = t1;
+  }
+  void set_yaw_diag_path(const std::string &path);
 
   /**
    * @brief Propagate state up to given timestamp and then clone
@@ -505,6 +514,10 @@ protected:
   /// Our history of IMU messages (time, angular, linear)
   std::vector<ov_core::ImuData> imu_data;
   std::mutex imu_data_mtx;
+
+  std::ofstream of_yaw_diag_;
+  double yaw_diag_t0_ = -std::numeric_limits<double>::infinity();
+  double yaw_diag_t1_ = std::numeric_limits<double>::infinity();
 
   /// Gravity vector
   Eigen::Vector3d _gravity;

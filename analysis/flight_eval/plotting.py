@@ -1,11 +1,11 @@
-"""plotting.py — 中文静态图 (PNG+SVG) + 关键图 Plotly HTML.
+"""plotting.py — 中文静态图 (SVG).
 
 所有图: 中文标题/坐标轴/图例/单位/说明。
 语义配色: GPS=绿(参考), VIO=蓝, LK-only=橙(诊断), 误差=红, 无效=灰, 选中段=紫。
 空白必须解释（GPS 未更新 / 样本 invalid / 速度列缺失 / 时间不覆盖），
 不通过删除尖峰伪造连续曲线。
 
-依赖: matplotlib（PNG/SVG），plotly（HTML）。中文字体见 set_chinese_font。
+依赖: matplotlib（SVG）。Plotly HTML 输出已废弃；交互页使用 SVG v2 dashboard。
 """
 from __future__ import annotations
 
@@ -42,7 +42,8 @@ def set_chinese_font():
     return selected
 
 
-# 13 张必需图清单（名称 → 标题/问题），供 dashboard 与报告引用
+# 默认静态图清单（名称 → 标题/问题），供 dashboard 与报告引用。
+# 柱状图不再默认输出；分段对比保留轨迹示意和误差剖面。
 PLOT_SPECS = [
     ("xy_trajectory_gps_vio_lk", "XY 轨迹对比", "VIO/LK 何时何地相对 GPS 发散？"),
     ("xy_error_distance", "XY 误差 vs 里程", "水平误差是否随里程线性累积？"),
@@ -54,18 +55,15 @@ PLOT_SPECS = [
     ("enu_velocity_component_error", "ENU 各方向速度误差", "vE/vN/vU误差如何变化？"),
     ("speed_error_distance", "速度模值/向量误差", "标量匹配但向量不匹配→航向误差？"),
     ("course_yaw_error", "航向 / course 误差", "是否存在持续增长的航向漂移？"),
-    ("segment_xy_drift_bar", "各段局部漂移率", "漂移主要在直线还是转弯？"),
-    ("segment_velocity_error_bar", "各段速度 RMSE", "哪段速度估计最差？"),
     ("straight_leg_error_profiles", "每圈四边误差剖面", "同一条边在不同圈内的误差如何增长？"),
     ("gps_sampling_quality", "GPS 采样质量", "统计网格是否可信？"),
 ]
 
 
 def _save(fig, plots_dir: str, name: str):
-    """同时存 PNG + SVG。"""
+    """Save one SVG plot. PNG output is intentionally disabled."""
     os.makedirs(plots_dir, exist_ok=True)
-    for ext in ("png", "svg"):
-        fig.savefig(os.path.join(plots_dir, f"{name}.{ext}"), bbox_inches="tight", dpi=140)
+    fig.savefig(os.path.join(plots_dir, f"{name}.svg"), bbox_inches="tight")
 
 
 def _finish(ax):
@@ -233,24 +231,6 @@ def plot_all(df: pd.DataFrame, seg_err: pd.DataFrame, quality: dict,
         _note(fig, "边1和边3为相反方向的主航线；边2和边4为两端转向连接边。残段不进入圈间比较。")
         _save(fig, plots_dir, "lap_side_segmentation_map"); plt.close(fig)
 
-        def grouped_bar(metric, ylabel, title, name):
-            pivot = complete.pivot(index="lap_id", columns="side_id", values=metric)
-            fig, ax = plt.subplots(figsize=(10, 4.8))
-            x = np.arange(len(pivot.index)); width = .19
-            for j, side in enumerate(range(1, 5)):
-                vals = pivot[side] if side in pivot else np.full(len(x), np.nan)
-                ax.bar(x + (j - 1.5) * width, vals, width,
-                       color=palette[side], label=side_names[side])
-            ax.set_xticks(x); ax.set_xticklabels([f"第{int(i)}圈" for i in pivot.index])
-            ax.set_ylabel(ylabel); ax.set_title(title); _finish(ax)
-            _note(fig, "每根柱表示一整条航线边，不再按500米机械切段。局部量均以该边起点为零。")
-            _save(fig, plots_dir, name); plt.close(fig)
-
-        grouped_bar("local_drift_percent", "该边局部XY漂移率 / %",
-                    "每圈四条边的局部XY漂移率", "segment_xy_drift_bar")
-        grouped_bar("vxy_vec_rmse_mps", "该边XY速度向量RMSE / m/s",
-                    "每圈四条边的XY速度误差", "segment_velocity_error_bar")
-
         fig, axes = plt.subplots(2, 2, figsize=(11, 7), sharey=True)
         for side, ax in zip(range(1, 5), axes.flat):
             for lap in sorted(complete["lap_id"].unique()):
@@ -291,20 +271,11 @@ def plot_all(df: pd.DataFrame, seg_err: pd.DataFrame, quality: dict,
 
 
 def plot_plotly_html(df: pd.DataFrame, plots_dir: str):
-    """关键图导出 Plotly HTML（hover/zoom/legend toggle）。TODO·补齐全部关键图。"""
-    try:
-        import plotly.graph_objects as go
-    except ImportError:
-        return
-    v = df[df["valid"]]
-    fig = go.Figure()
-    fig.add_scatter(x=v["cum_dist"] / 1000, y=v["err_along"], name="沿航向位置误差 / m",
-                    line=dict(color=COLORS["vio"]))
-    fig.add_scatter(x=v["cum_dist"] / 1000, y=v["err_cross"], name="垂直航线位置误差（XY）/ m",
-                    line=dict(color=COLORS["err"]))
-    fig.update_layout(title="XY平面：沿航向与垂直航线的位置误差",
-                      xaxis_title="GPS 累计里程 / km", yaxis_title="位置误差 / m")
-    fig.write_html(os.path.join(plots_dir, "cross_vertical_error.html"), include_plotlyjs="cdn")
+    """Deprecated: flight_eval no longer emits Plotly HTML artifacts."""
+    raise RuntimeError(
+        "ERROR: Plotly HTML plotting is deprecated for flight_eval. "
+        "Use the SVG v2 / window.RUN_DATA dashboard instead."
+    )
 
 
 def plot_lk_yaw_diagnostic(diag: pd.DataFrame, plots_dir: str):

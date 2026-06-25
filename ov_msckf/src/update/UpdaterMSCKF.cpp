@@ -35,10 +35,110 @@
 
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/math/distributions/chi_squared.hpp>
+#include <cmath>
+#include <limits>
 
 using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
+
+namespace {
+
+double diag_nan() {
+  return std::numeric_limits<double>::quiet_NaN();
+}
+
+double roll_deg_from_state(const std::shared_ptr<State> &state) {
+  if (!state || !state->_imu)
+    return diag_nan();
+  Eigen::Matrix3d R_ItoG = state->_imu->Rot().transpose();
+  const double roll = std::atan2(R_ItoG(2, 1), R_ItoG(2, 2));
+  return roll * 180.0 / M_PI;
+}
+
+std::string image_side_from_u(double u) {
+  if (!std::isfinite(u))
+    return "unknown";
+  return u < 320.0 ? "left" : "right";
+}
+
+std::string image_quadrant_from_uv(double u, double v) {
+  if (!std::isfinite(u) || !std::isfinite(v))
+    return "unknown";
+  if (u < 320.0 && v < 240.0)
+    return "q1";
+  if (u >= 320.0 && v < 240.0)
+    return "q2";
+  if (u < 320.0 && v >= 240.0)
+    return "q3";
+  return "q4";
+}
+
+struct FeatureUvSummary {
+  int num_measurements = 0;
+  double u_mean = diag_nan();
+  double v_mean = diag_nan();
+};
+
+FeatureUvSummary summarize_feature_uv(const std::shared_ptr<Feature> &feature) {
+  FeatureUvSummary out;
+  if (feature == nullptr)
+    return out;
+  double sum_u = 0.0;
+  double sum_v = 0.0;
+  int count = 0;
+  for (const auto &pair : feature->timestamps) {
+    const size_t cam_id = pair.first;
+    const auto &times = pair.second;
+    const auto it_uv = feature->uvs.find(cam_id);
+    if (it_uv == feature->uvs.end())
+      continue;
+    const auto &uvs = it_uv->second;
+    const size_t n = std::min(times.size(), uvs.size());
+    for (size_t k = 0; k < n; k++) {
+      sum_u += uvs[k](0);
+      sum_v += uvs[k](1);
+      count++;
+    }
+  }
+  out.num_measurements = count;
+  if (count > 0) {
+    out.u_mean = sum_u / (double)count;
+    out.v_mean = sum_v / (double)count;
+  }
+  return out;
+}
+
+void accumulate_latest_uv(const std::shared_ptr<Feature> &feature, int &count, double &sum_u, double &sum_v) {
+  if (feature == nullptr)
+    return;
+  bool found = false;
+  double best_t = -1e100;
+  Eigen::Vector2f best_uv = Eigen::Vector2f::Zero();
+  for (const auto &pair : feature->timestamps) {
+    const size_t cam_id = pair.first;
+    const auto &times = pair.second;
+    const auto it_uv = feature->uvs.find(cam_id);
+    if (it_uv == feature->uvs.end())
+      continue;
+    const auto &uvs = it_uv->second;
+    const size_t n = std::min(times.size(), uvs.size());
+    for (size_t k = 0; k < n; k++) {
+      if (times[k] > best_t) {
+        best_t = times[k];
+        best_uv = uvs[k];
+        found = true;
+      }
+    }
+  }
+  if (!found)
+    return;
+  count++;
+  sum_u += best_uv(0);
+  sum_v += best_uv(1);
+}
+
+} // namespace
 
 UpdaterMSCKF::UpdaterMSCKF(UpdaterOptions &options, ov_core::FeatureInitializerOptions &feat_init_options) : _options(options) {
 
@@ -191,6 +291,68 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
   // 4. Compute linear system for each feature, nullspace project, and reject
   // [中文] 单特征线性系统 + 左零空间投影 + 卡方检验
   const bool vop_active = vop_ && vop_->is_active();
+  const double diag_time = state ? state->_timestamp : diag_nan();
+  const double diag_roll = roll_deg_from_state(state);
+  const double diag_bgz = (state && state->_imu) ? state->_imu->bias_g()(2) : diag_nan();
+  std::vector<double> diag_residual_norms;
+  std::vector<double> diag_whitened_norms;
+  std::vector<double> diag_chi2s;
+  std::vector<double> diag_thresholds;
+  std::vector<double> diag_us;
+  std::vector<double> diag_left_flags;
+  int diag_num_accepted = 0;
+  int diag_num_rejected = 0;
+  int diag_high_residual_accepted = 0;
+  auto record_visual_residual =
+      [&](const std::shared_ptr<Feature> &feature, const Eigen::VectorXd &res,
+          double chi2, double chi2_threshold, bool accepted,
+          const std::string &reject_reason, int track_len) {
+        if (!visual_residual_diag_ || !visual_residual_diag_->enabled(diag_time))
+          return;
+        FeatureUvSummary uv = summarize_feature_uv(feature);
+        const double residual_norm = res.norm();
+        const double whitened_norm = (std::isfinite(chi2) && chi2 >= 0.0) ? std::sqrt(chi2) : diag_nan();
+        diag_residual_norms.push_back(residual_norm);
+        diag_whitened_norms.push_back(whitened_norm);
+        diag_chi2s.push_back(chi2);
+        diag_thresholds.push_back(chi2_threshold);
+        if (std::isfinite(uv.u_mean)) {
+          diag_us.push_back(uv.u_mean);
+          diag_left_flags.push_back(uv.u_mean < 320.0 ? 1.0 : 0.0);
+        }
+        if (accepted) {
+          diag_num_accepted++;
+          if (std::isfinite(chi2) && std::isfinite(chi2_threshold) && chi2_threshold > 0.0 &&
+              chi2 / chi2_threshold > 0.8) {
+            diag_high_residual_accepted++;
+          }
+        } else {
+          diag_num_rejected++;
+        }
+
+        VisualResidualDiag::FeatureRow row;
+        row.time = diag_time;
+        row.update_type = "MSCKF";
+        row.feature_id = feature ? feature->featid : 0;
+        row.feature_kind = "msckf";
+        row.track_age = track_len;
+        row.num_measurements = uv.num_measurements;
+        row.u_mean = uv.u_mean;
+        row.v_mean = uv.v_mean;
+        row.image_side = image_side_from_u(uv.u_mean);
+        row.image_quadrant = image_quadrant_from_uv(uv.u_mean, uv.v_mean);
+        row.residual_norm = residual_norm;
+        row.whitened_residual_norm = whitened_norm;
+        row.chi2 = chi2;
+        row.chi2_threshold = chi2_threshold;
+        row.accepted_by_chi2 = accepted;
+        row.rejected_by_chi2 = !accepted;
+        row.reject_reason = reject_reason;
+        row.measurement_sigma_px = _options.sigma_pix;
+        row.roll = diag_roll;
+        row.bg_z = diag_bgz;
+        visual_residual_diag_->log_feature(row);
+      };
   auto it2 = feature_vec.begin();
   while (it2 != feature_vec.end()) {
 
@@ -281,7 +443,14 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
 
     // Check if we should delete or not
     if (chi2 > _options.chi2_multipler * chi2_check) {
+      record_visual_residual(*it2, res, chi2, _options.chi2_multipler * chi2_check,
+                             false, "chi2", track_len);
       (*it2)->to_delete = true;
+      last_stats_.chi2_threshold_sum_rej += _options.chi2_multipler * chi2_check;
+      last_stats_.chi2_threshold_max_rej =
+          std::max(last_stats_.chi2_threshold_max_rej, _options.chi2_multipler * chi2_check);
+      accumulate_latest_uv(*it2, last_stats_.uv_count_rej,
+                           last_stats_.uv_sum_u_rej, last_stats_.uv_sum_v_rej);
       it2 = feature_vec.erase(it2);
       last_stats_.n_chi2_rejected++;
       last_stats_.chi2_sum_rej += chi2;
@@ -292,10 +461,17 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     }
 
     // Accepted — accumulate stats
+    record_visual_residual(*it2, res, chi2, _options.chi2_multipler * chi2_check,
+                           true, "", track_len);
     last_stats_.chi2_sum_acc += chi2;
     last_stats_.chi2_max_acc = std::max(last_stats_.chi2_max_acc, chi2);
+    last_stats_.chi2_threshold_sum_acc += _options.chi2_multipler * chi2_check;
+    last_stats_.chi2_threshold_max_acc =
+        std::max(last_stats_.chi2_threshold_max_acc, _options.chi2_multipler * chi2_check);
     last_stats_.track_len_sum_acc += track_len;
     last_stats_.track_len_max_acc = std::max(last_stats_.track_len_max_acc, track_len);
+    accumulate_latest_uv(*it2, last_stats_.uv_count_acc,
+                         last_stats_.uv_sum_u_acc, last_stats_.uv_sum_v_acc);
 
     // We are good!!! Append to our large H vector.
     // Use H_x_for_gate (OC-projected when vop active, else raw H_x) so that
@@ -322,6 +498,31 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
     it2++;
   }
   rT3 = boost::posix_time::microsec_clock::local_time();
+
+  if (visual_residual_diag_ && visual_residual_diag_->summary_enabled(diag_time)) {
+    VisualResidualDiag::FrameSummary summary;
+    summary.time = diag_time;
+    summary.update_type = "MSCKF";
+    summary.num_features = diag_num_accepted + diag_num_rejected;
+    summary.num_accepted = diag_num_accepted;
+    summary.num_rejected = diag_num_rejected;
+    summary.mean_residual_norm = VisualResidualDiag::mean(diag_residual_norms);
+    summary.p95_residual_norm = VisualResidualDiag::percentile(diag_residual_norms, 0.95);
+    summary.mean_whitened_residual_norm = VisualResidualDiag::mean(diag_whitened_norms);
+    summary.p95_whitened_residual_norm = VisualResidualDiag::percentile(diag_whitened_norms, 0.95);
+    summary.mean_chi2 = VisualResidualDiag::mean(diag_chi2s);
+    summary.p95_chi2 = VisualResidualDiag::percentile(diag_chi2s, 0.95);
+    summary.chi2_threshold = VisualResidualDiag::mean(diag_thresholds);
+    summary.accepted_ratio = summary.num_features > 0 ?
+        (double)summary.num_accepted / (double)summary.num_features : diag_nan();
+    summary.high_residual_accepted_count = diag_high_residual_accepted;
+    summary.high_residual_accepted_ratio = summary.num_accepted > 0 ?
+        (double)diag_high_residual_accepted / (double)summary.num_accepted : diag_nan();
+    summary.u_mean = VisualResidualDiag::mean(diag_us);
+    summary.left_frac = VisualResidualDiag::mean(diag_left_flags);
+    summary.roll = diag_roll;
+    visual_residual_diag_->log_summary(summary);
+  }
 
   // We have appended all features to our Hx_big, res_big
   // Delete it so we do not reuse information

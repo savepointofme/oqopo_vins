@@ -24,6 +24,7 @@ endif ()
 # Include our header files
 include_directories(
         src
+        src/thirdparty/px4
         ${EIGEN3_INCLUDE_DIR}
         ${Boost_INCLUDE_DIRS}
         ${CERES_INCLUDE_DIRS}
@@ -92,6 +93,7 @@ list(APPEND LIBRARY_SOURCES
         src/state/State.cpp
         src/state/StateHelper.cpp
         src/state/Propagator.cpp
+        src/core/ImuFilter.cpp
         src/core/VioManager.cpp
         src/core/VioManagerHelper.cpp
         src/update/UpdaterHelper.cpp
@@ -109,7 +111,7 @@ endif ()
 file(GLOB_RECURSE LIBRARY_HEADERS "src/*.h")
 add_library(ov_msckf_lib SHARED ${LIBRARY_SOURCES} ${LIBRARY_HEADERS})
 target_link_libraries(ov_msckf_lib ${thirdparty_libraries})
-target_include_directories(ov_msckf_lib PUBLIC src/)
+target_include_directories(ov_msckf_lib PUBLIC src/ src/thirdparty/px4/)
 install(TARGETS ov_msckf_lib
         ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
         LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
@@ -142,7 +144,7 @@ if (catkin_FOUND AND ENABLE_ROS)
             LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
             RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
     )
-    
+
     install(DIRECTORY launch/
             DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/launch
     )
@@ -197,12 +199,35 @@ install(TARGETS test_joseph_update
         RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
-# Gate 2: Constrained-yaw-nullspace rank-1 projection unit tests (pure Eigen, no pipeline)
-add_executable(test_constrained_yaw_nullspace src/test_constrained_yaw_nullspace.cpp)
-target_link_libraries(test_constrained_yaw_nullspace ov_msckf_lib ${thirdparty_libraries})
-install(TARGETS test_constrained_yaw_nullspace
+# Gate 2: Constrained-yaw-nullspace rank-1 projection unit tests (pure Eigen, no pipeline).
+# Some experiment snapshots contain the target declaration but not its source;
+# keep those snapshots configurable while emitting an explicit warning.
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/test_constrained_yaw_nullspace.cpp")
+    add_executable(test_constrained_yaw_nullspace src/test_constrained_yaw_nullspace.cpp)
+    target_link_libraries(test_constrained_yaw_nullspace ov_msckf_lib ${thirdparty_libraries})
+    install(TARGETS test_constrained_yaw_nullspace
+            ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+            LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+            RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+    )
+else ()
+    message(WARNING "test_constrained_yaw_nullspace.cpp is absent; its target is not rebuilt")
+endif ()
+
+# Pure causal-policy tests for --adaptive-stride-shadow/--adaptive-stride.
+add_executable(test_adaptive_stride src/test_adaptive_stride.cpp)
+target_link_libraries(test_adaptive_stride ov_msckf_lib ${thirdparty_libraries})
+install(TARGETS test_adaptive_stride
         ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
         LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
         RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
+# Pure causal IMU filter and timestamp-policy tests.
+add_executable(test_imu_filter src/test_imu_filter.cpp)
+target_link_libraries(test_imu_filter ov_msckf_lib ${thirdparty_libraries})
+install(TARGETS test_imu_filter
+        ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+        LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+        RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)

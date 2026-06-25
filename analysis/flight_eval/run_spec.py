@@ -74,7 +74,7 @@ class RunSpec:
 
 
 # 可选输入键
-OPTIONAL_INPUTS = ["vio_bias", "diag_csv", "vio_yaw_diag", "lk_traj", "lk_flow_csv", "fc_log"]
+OPTIONAL_INPUTS = ["vio_bias", "diag_csv", "vio_yaw_diag", "lk_traj", "lk_flow_csv"]
 REQUIRED_INPUTS = ["gps_csv", "vio_traj"]
 
 

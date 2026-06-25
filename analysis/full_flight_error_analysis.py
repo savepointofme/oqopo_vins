@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 import zipfile
 
+from flight_eval import dashboard
 import matplotlib
 
 matplotlib.use("Agg")
@@ -362,6 +363,120 @@ def segment_flight(
     return df, pd.DataFrame(rows).sort_values("t_start").reset_index(drop=True)
 
 
+def segment_flight_from_macro_csv(
+    df: pd.DataFrame,
+    segment_csv: Path,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Apply one GPS-defined four-side-per-lap segmentation to a run.
+
+    The same time boundaries are intentionally reused by every method/stride of
+    a flight.  Samples before/after the supplied complete-lap window remain
+    explicit partial segments instead of being discarded or split every 500 m.
+    """
+    source = pd.read_csv(segment_csv).sort_values("t_start").reset_index(drop=True)
+    required = {"lap_id", "segment_type", "t_start", "t_end"}
+    missing = sorted(required - set(source.columns))
+    if missing:
+        raise ValueError(
+            f"Macro segment CSV {segment_csv} is missing: {', '.join(missing)}")
+
+    t = df["t"].to_numpy(dtype=float)
+    n = len(df)
+    seg_id = np.full(n, -1, dtype=int)
+    seg_type = np.full(n, "partial", dtype=object)
+    leg_id = np.full(n, -1, dtype=int)
+    lap_id = np.full(n, -1, dtype=int)
+    side_id = np.zeros(n, dtype=int)
+    rows: list[dict[str, Any]] = []
+    sid = 0
+    cursor = 0
+    side_counter: dict[int, int] = {}
+
+    def add(a: int, b_exclusive: int, kind: str, lap: int, side: int,
+            complete: bool, label: str, notes: str) -> None:
+        nonlocal sid
+        if b_exclusive <= a:
+            return
+        current_sid = sid
+        idx = np.arange(a, b_exclusive)
+        seg_id[idx] = current_sid
+        seg_type[idx] = kind
+        lap_id[idx] = lap
+        side_id[idx] = side
+        current_leg = current_sid if kind == "straight" else -1
+        leg_id[idx] = current_leg
+        row = segment_row(
+            df, current_sid, kind, current_leg, a, b_exclusive - 1, notes)
+        row.update({
+            "lap_id": lap,
+            "side_id": side,
+            "is_complete_lap": bool(complete),
+            "label": label,
+            "segmentation_source": str(segment_csv),
+        })
+        rows.append(row)
+        sid += 1
+
+    side_names = {
+        1: "主航线去程边",
+        2: "远端转向连接边",
+        3: "主航线回程边",
+        4: "近端转向连接边",
+    }
+    complete_lap_ids: set[int] = set()
+    for lap_value, lap_rows in source.groupby("lap_id", sort=False):
+        complete_flags = lap_rows.get(
+            "is_complete_lap", pd.Series([True] * len(lap_rows), index=lap_rows.index))
+        complete_flags = complete_flags.map(
+            lambda value: str(value).strip().lower() in {"true", "1", "yes"})
+        if (len(lap_rows) == 4 and complete_flags.all()
+                and float(lap_rows["t_end"].max()) <= float(t[-1]) + 1e-6):
+            complete_lap_ids.add(int(lap_value))
+    for _, src in source.iterrows():
+        raw_a = int(np.searchsorted(t, float(src["t_start"]), side="left"))
+        raw_b = int(np.searchsorted(t, float(src["t_end"]), side="left"))
+        if raw_b <= 0 or raw_a >= n:
+            continue
+        a = max(cursor, max(0, raw_a))
+        b = min(n, raw_b)
+        if a > cursor:
+            add(cursor, a, "partial", -1, 0, False,
+                "圈外残段（不计入完整圈）",
+                "gap outside the shared four-side lap definition")
+        if b <= a:
+            cursor = max(cursor, b)
+            continue
+        lap = int(src["lap_id"])
+        side_counter[lap] = side_counter.get(lap, 0) + 1
+        side = side_counter[lap]
+        complete = lap in complete_lap_ids
+        if not complete or side > 4:
+            add(a, b, "partial", -1, 0, False,
+                "不完整圈残段（不计入完整圈）",
+                "source lap is incomplete or clipped at per-trajectory stable end")
+        else:
+            source_kind = str(src["segment_type"]).lower()
+            kind = "straight" if source_kind == "straight" else "connector"
+            label = f"第{lap}圈·边{side} {side_names.get(side, '航线边')}"
+            add(a, b, kind, lap, side, True, label,
+                "shared GPS-defined four-side lap boundary")
+        cursor = b
+
+    if cursor < n:
+        add(cursor, n, "partial", -1, 0, False,
+            "结束残段（不计入完整圈）",
+            "tail after the shared complete-lap window")
+    if not rows:
+        raise ValueError(f"Macro segment CSV {segment_csv} does not overlap the run")
+
+    df["segment_id"] = seg_id
+    df["segment_type"] = seg_type
+    df["leg_id"] = leg_id
+    df["lap_id"] = lap_id
+    df["side_id"] = side_id
+    return df, pd.DataFrame(rows).sort_values("t_start").reset_index(drop=True)
+
+
 def contiguous_runs(mask: np.ndarray) -> list[tuple[int, int]]:
     idx = np.flatnonzero(mask)
     if not len(idx):
@@ -397,6 +512,17 @@ def segment_row(df: pd.DataFrame, sid: int, kind: str, leg: int, a: int, b: int,
     course = np.unwrap(np.deg2rad(course_series.to_numpy()))
     heading_mean = math.degrees(circular_mean(course)) if len(course) else np.nan
     heading_change = math.degrees(course[-1] - course[0]) if len(course) else np.nan
+    net_en = (
+        df[["gps_E", "gps_N"]].iloc[b].to_numpy(dtype=float)
+        - df[["gps_E", "gps_N"]].iloc[a].to_numpy(dtype=float)
+    )
+    net_span = float(np.linalg.norm(net_en))
+    if net_span >= 10.0:
+        segment_heading = math.degrees(math.atan2(net_en[1], net_en[0]))
+        heading_source = "gps_segment_net_displacement"
+    else:
+        segment_heading = heading_mean
+        heading_source = "gps_course_circular_mean_fallback"
     return {
         "segment_id": sid, "segment_type": kind, "leg_id": leg,
         "t_start": df["t"].iloc[a], "t_end": df["t"].iloc[b],
@@ -404,6 +530,9 @@ def segment_row(df: pd.DataFrame, sid: int, kind: str, leg: int, a: int, b: int,
         "dist_end_m": df["cum_dist_gps"].iloc[b],
         "length_m": df["cum_dist_gps"].iloc[b] - df["cum_dist_gps"].iloc[a],
         "heading_mean_deg": heading_mean,
+        "segment_heading_deg": segment_heading,
+        "heading_source": heading_source,
+        "heading_quality": "canonical_fixed_segment_axis",
         "heading_change_deg": heading_change,
         "gps_speed_mean": df["gps_speed_xy"].iloc[a:b + 1].mean(),
         "notes": notes,
@@ -422,10 +551,37 @@ def segment_summaries(
         gps_dist = float(s["cum_dist_gps"].iloc[-1] - s["cum_dist_gps"].iloc[0])
         err0 = s[["err_E", "err_N"]].iloc[0].to_numpy()
         err1 = s[["err_E", "err_N"]].iloc[-1].to_numpy()
-        error_growth = float(np.linalg.norm(err1 - err0))
-        rows.append({
+        local_err_en = s[["err_E", "err_N"]].to_numpy(dtype=float) - err0
+        local_err_u = (
+            s["err_vertical"].to_numpy(dtype=float)
+            - float(s["err_vertical"].iloc[0])
+        )
+        heading_deg = float(seg.get("segment_heading_deg", seg.get("heading_mean_deg", np.nan)))
+        if math.isfinite(heading_deg):
+            theta = math.radians(heading_deg)
+            along_axis = np.array([math.cos(theta), math.sin(theta)])
+            cross_axis = np.array([-math.sin(theta), math.cos(theta)])
+            local_along = local_err_en @ along_axis
+            local_cross = local_err_en @ cross_axis
+        else:
+            # This fallback is only for malformed legacy segment indexes.  It
+            # preserves the local (start-subtracted) definition.
+            course = np.deg2rad(s["gps_course_deg"].to_numpy(dtype=float))
+            local_along = (
+                local_err_en[:, 0] * np.cos(course)
+                + local_err_en[:, 1] * np.sin(course)
+            )
+            local_cross = (
+                -local_err_en[:, 0] * np.sin(course)
+                + local_err_en[:, 1] * np.cos(course)
+            )
+        error_growth = float(np.linalg.norm(local_err_en[-1]))
+        row = {
             "method": method, "segment_id": int(seg["segment_id"]),
             "segment_type": seg["segment_type"], "leg_id": int(seg["leg_id"]),
+            "segment_heading_deg": heading_deg,
+            "heading_source": seg.get("heading_source", ""),
+            "heading_quality": seg.get("heading_quality", ""),
             "length_m": seg["length_m"], "duration_s": s["t"].iloc[-1] - s["t"].iloc[0],
             "gps_dist_m": gps_dist, "final_xy_error_m": s["err_XY"].iloc[-1],
             "start_xy_error_m": s["err_XY"].iloc[0],
@@ -435,9 +591,16 @@ def segment_summaries(
                 100.0 * error_growth / gps_dist
                 if gps_dist >= min_drift_distance_m else np.nan
             ),
-            "along_rmse_m": metric_stats(s["err_along"].to_numpy())["rmse"],
-            "cross_rmse_m": metric_stats(s["err_cross"].to_numpy())["rmse"],
-            "vertical_rmse_m": metric_stats(s["err_vertical"].to_numpy())["rmse"],
+            # Segment-local position metrics use the segment start as zero.
+            # The global accumulated along/cross metrics remain available in
+            # metric_statistics.csv and are never relabeled as local here.
+            "along_rmse_m": metric_stats(local_along)["rmse"],
+            "cross_rmse_m": metric_stats(local_cross)["rmse"],
+            "vertical_rmse_m": metric_stats(local_err_u)["rmse"],
+            "local_final_along_error_m": float(local_along[-1]),
+            "local_final_cross_error_m": float(local_cross[-1]),
+            "local_final_vertical_error_m": float(local_err_u[-1]),
+            "local_final_xy_error_m": error_growth,
             "speed_rmse_mps": metric_stats(s["err_speed_xy"].to_numpy())["rmse"],
             "vxy_vec_rmse_mps": metric_stats(s["err_vXY_vec"].to_numpy())["rmse"],
             "v_along_rmse_mps": metric_stats(s["err_v_along"].to_numpy())["rmse"],
@@ -446,8 +609,146 @@ def segment_summaries(
             "yaw/course_error_mean_deg": metric_stats(s["course_error_deg"].to_numpy())["signed_mean"],
             "yaw/course_error_final_deg": metric_stats(
                 s["course_error_deg"].to_numpy())["final"],
-        })
+        }
+        for key in ("lap_id", "side_id", "is_complete_lap", "label",
+                    "segmentation_source"):
+            if key in seg:
+                row[key] = seg[key]
+        rows.append(row)
     return pd.DataFrame(rows)
+
+
+def sustained_xy_divergence(
+    df: pd.DataFrame,
+    threshold_m: float,
+    backtrack_s: float = 180.0,
+    smooth_window_s: float = 5.0,
+    slope_window_s: float = 10.0,
+    max_stable_slope_mps: float = 1.0,
+    min_growth_m: float = 500.0,
+) -> dict[str, Any]:
+    """Locate the first XY-divergence threshold crossing and final bad tail.
+
+    The first crossing remains the reported failure time/location.  Main plots
+    backtrack to the last low-growth sample before the smoothed error begins its
+    sustained climb toward that crossing.  A separate final-sustained-tail
+    field preserves whether the trajectory later recovered before failing for
+    good, so these three events are not silently conflated.
+    """
+    err = df["err_XY"].to_numpy(dtype=float)
+    finite = np.isfinite(err)
+    result: dict[str, Any] = {
+        "divergence_detected": False,
+        "divergence_threshold_m": float(threshold_m),
+        "divergence_time_s": None,
+        "divergence_elapsed_s": None,
+        "divergence_gps_distance_km": None,
+        "divergence_gps_E_m": None,
+        "divergence_gps_N_m": None,
+        "divergence_gps_U_m": None,
+        "divergence_recovered_after_onset": False,
+        "final_sustained_divergence_time_s": None,
+        "pre_divergence_cut_time_s": float(df["t"].iloc[-1]),
+        "pre_divergence_cut_xy_error_m": float(err[-1]),
+        "divergence_growth_onset_time_s": None,
+        "pre_divergence_baseline_p95_m": None,
+        "pre_divergence_trigger_m": None,
+        "divergence_cut_method": "not needed; threshold not reached",
+        "last_stable_time_s": float(df["t"].iloc[-1]),
+        "last_stable_row": len(df) - 1,
+    }
+    finite_idx = np.flatnonzero(finite)
+    bad_idx = np.flatnonzero(finite & (err > threshold_m))
+    if not len(finite_idx) or not len(bad_idx):
+        return result
+    onset = int(bad_idx[0])
+    stable_before = np.flatnonzero(
+        (np.arange(len(df)) < onset) & finite & (err <= threshold_m))
+    pre_onset_stable = int(stable_before[-1]) if len(stable_before) else max(0, onset - 1)
+    stable_after = np.flatnonzero(
+        (np.arange(len(df)) > onset) & finite & (err <= threshold_m))
+    recovered = bool(len(stable_after))
+    final_sustained_onset = None
+    if err[finite_idx[-1]] > threshold_m:
+        final_stable = int(stable_after[-1]) if len(stable_after) else pre_onset_stable
+        tail_bad = np.flatnonzero(
+            (np.arange(len(df)) > final_stable) & finite & (err > threshold_m))
+        if len(tail_bad):
+            final_sustained_onset = float(df["t"].iloc[int(tail_bad[0])])
+
+    # Display/statistics cutoff: detect the last low-growth point before the
+    # smoothed curve makes a sustained climb of at least ``min_growth_m`` into
+    # the threshold.  This keeps the divergent ramp from flattening all useful
+    # pre-failure differences on the error plots.
+    t = df["t"].to_numpy(dtype=float)
+    finite_dt = np.diff(t)
+    finite_dt = finite_dt[np.isfinite(finite_dt) & (finite_dt > 0)]
+    median_dt = float(np.median(finite_dt)) if len(finite_dt) else 0.2
+    smooth_rows = max(3, int(round(smooth_window_s / median_dt)))
+    smooth = pd.Series(err).rolling(
+        smooth_rows, center=True, min_periods=1).median().to_numpy()
+    baseline_end_t = float(t[0] + 0.5 * (t[-1] - t[0]))
+    baseline = smooth[(t <= baseline_end_t) & np.isfinite(smooth)]
+    baseline_p95 = float(np.percentile(baseline, 95)) if len(baseline) else 0.0
+    display_trigger_m = float(min(
+        threshold_m, max(0.5 * threshold_m, 1.5 * baseline_p95)))
+    # Use the final trigger crossing that leads into the first 1000 m event.
+    # Earlier high-error excursions that recover are real estimator behaviour
+    # and must not be silently deleted merely to make the plot look cleaner.
+    below_trigger = np.flatnonzero(
+        (np.arange(len(df)) < onset)
+        & np.isfinite(smooth)
+        & (smooth <= display_trigger_m))
+    trigger_cross = (
+        min(onset, int(below_trigger[-1]) + 1)
+        if len(below_trigger) else onset
+    )
+    half_slope_rows = max(1, int(round(slope_window_s / median_dt)))
+    slope = np.full(len(df), np.nan)
+    k = half_slope_rows
+    if len(df) > 2 * k:
+        denom = t[2 * k:] - t[:-2 * k]
+        slope[k:-k] = (smooth[2 * k:] - smooth[:-2 * k]) / denom
+    search_start = int(np.searchsorted(
+        t, max(float(t[0]), float(t[trigger_cross] - backtrack_s)), side="left"))
+    cut_row = pre_onset_stable
+    required_growth_m = min_growth_m
+    for i in range(min(trigger_cross - k, pre_onset_stable), search_start - 1, -1):
+        if (np.isfinite(slope[i])
+                and slope[i] <= max_stable_slope_mps
+                and smooth[onset] - smooth[i] >= required_growth_m):
+            cut_row = i
+            break
+    growth_onset_row = min(cut_row + 1, len(df) - 1)
+    row = df.iloc[onset]
+    result.update({
+        "divergence_detected": True,
+        "divergence_time_s": float(row["t"]),
+        "divergence_elapsed_s": float(row["t"] - df["t"].iloc[0]),
+        "divergence_gps_distance_km": float(row["cum_dist_gps"] / 1000.0),
+        "divergence_gps_E_m": float(row["gps_E"]),
+        "divergence_gps_N_m": float(row["gps_N"]),
+        "divergence_gps_U_m": float(row["gps_U"]),
+        "divergence_recovered_after_onset": recovered,
+        "final_sustained_divergence_time_s": final_sustained_onset,
+        "pre_divergence_cut_time_s": float(df["t"].iloc[cut_row]),
+        "pre_divergence_cut_xy_error_m": float(err[cut_row]),
+        "divergence_growth_onset_time_s": float(df["t"].iloc[growth_onset_row]),
+        "pre_divergence_baseline_p95_m": baseline_p95,
+        "pre_divergence_trigger_m": display_trigger_m,
+        "divergence_cut_method": (
+            f"{smooth_window_s:g}s rolling-median XY error; backtrack up to "
+            f"{backtrack_s:g}s from final adaptive trigger crossing leading to "
+            f"the first threshold event; trigger "
+            f"{display_trigger_m:.1f}m (max of half-threshold and 1.5x first-half p95, "
+            f"capped at threshold); last centered-{2*slope_window_s:g}s slope <= "
+            f"{max_stable_slope_mps:g} m/s before >= {required_growth_m:.1f}m growth"
+        ),
+        "threshold_preceding_sample_time_s": float(df["t"].iloc[pre_onset_stable]),
+        "last_stable_time_s": float(df["t"].iloc[cut_row]),
+        "last_stable_row": cut_row,
+    })
+    return result
 
 
 def build_aligned(
@@ -785,7 +1086,7 @@ def write_figures(df: pd.DataFrame, seg: pd.DataFrame, out: Path, title: str) ->
     plt.figure(figsize=(10, 5))
     for leg, s in df[df["leg_id"] >= 0].groupby("leg_id"):
         d0 = s["cum_dist_gps"].iloc[0]
-        plt.plot((s["cum_dist_gps"] - d0) / 1000.0, s["err_XY"], label=f"直线航段 {leg}")
+        plt.plot(((s["cum_dist_gps"] - d0) / 1000.0).to_numpy(), s["err_XY"].to_numpy(), label=f"直线航段 {leg}")
     plt.xlabel("进入当前直线航段后的航程（千米）")
     plt.ylabel("水平位置误差（米）")
     plt.title("各长直线航段的水平误差剖面")
@@ -805,78 +1106,148 @@ def write_figures(df: pd.DataFrame, seg: pd.DataFrame, out: Path, title: str) ->
     plt.legend()
     save("height_layer_error_summary.png")
 
-    write_interactive_dashboard(df, out / "interactive_flight_analysis.html", title)
 
 
-def write_interactive_dashboard(df: pd.DataFrame, path: Path, title: str) -> None:
-    try:
-        import plotly.graph_objects as go
-        from plotly.subplots import make_subplots
-    except ImportError:
-        return
-    fig = make_subplots(
-        rows=4, cols=2,
-        subplot_titles=[
-            "XY平面轨迹", "XY水平位置误差",
-            "ENU位置：GPS与VIO", "ENU位置误差",
-            "ENU速度：GPS与VIO", "ENU速度误差",
-            "沿航向、横航向、垂直误差", "XY平面速度误差",
-        ],
-    )
-    plot_df = df.copy()
-    plot_df.loc[plot_df["gps_gap_before"], [
-        "gps_E", "gps_N", "gps_U", "vio_E", "vio_N", "vio_U",
-        "err_E", "err_N", "err_U", "err_XY", "err_along", "err_cross",
-        "err_vertical", "gps_vE", "gps_vN", "gps_vU", "vio_vE", "vio_vN",
-        "vio_vU", "err_vE", "err_vN", "err_vU", "err_speed_xy",
-        "err_vXY_vec",
-    ]] = np.nan
-    fig.add_trace(go.Scattergl(x=plot_df["gps_E"], y=plot_df["gps_N"], name="GPS参考轨迹"), 1, 1)
-    fig.add_trace(go.Scattergl(x=plot_df["vio_E"], y=plot_df["vio_N"], name="VIO估计轨迹"), 1, 1)
-    fig.add_trace(go.Scattergl(
-        x=plot_df["cum_dist_gps"] / 1000.0, y=plot_df["err_XY"],
-        name="水平位置误差"), 1, 2)
-    colors = {"E": "#1f77b4", "N": "#ff7f0e", "U": "#2ca02c"}
-    axis_cn = {"E": "东向", "N": "北向", "U": "天向"}
-    for axis in ["E", "N", "U"]:
-        fig.add_trace(go.Scattergl(
-            x=plot_df["t"], y=plot_df[f"gps_{axis}"], name=f"GPS{axis_cn[axis]}位置",
-            line={"color": colors[axis], "dash": "dot"}), 2, 1)
-        fig.add_trace(go.Scattergl(
-            x=plot_df["t"], y=plot_df[f"vio_{axis}"], name=f"VIO{axis_cn[axis]}位置",
-            line={"color": colors[axis]}), 2, 1)
-        fig.add_trace(go.Scattergl(
-            x=plot_df["t"], y=plot_df[f"err_{axis}"], name=f"{axis_cn[axis]}位置误差"), 2, 2)
-        fig.add_trace(go.Scattergl(
-            x=plot_df["t"], y=plot_df[f"gps_v{axis}"],
-            name=f"飞控GPS{axis_cn[axis]}原始速度",
-            line={"color": colors[axis], "dash": "dot"}), 3, 1)
-        fig.add_trace(go.Scattergl(
-            x=plot_df["t"], y=plot_df[f"vio_v{axis}"], name=f"VIO{axis_cn[axis]}速度",
-            line={"color": colors[axis]}), 3, 1)
-        fig.add_trace(go.Scattergl(
-            x=plot_df["t"], y=plot_df[f"err_v{axis}"], name=f"{axis_cn[axis]}速度误差"), 3, 2)
-    for c, label in {
-        "err_along": "沿航向位置误差",
-        "err_cross": "横航向位置误差",
-        "err_vertical": "垂直位置误差",
-    }.items():
-        fig.add_trace(go.Scattergl(
-            x=plot_df["cum_dist_gps"] / 1000.0, y=plot_df[c], name=label), 4, 1)
-    fig.add_trace(go.Scattergl(
-        x=plot_df["cum_dist_gps"] / 1000.0, y=plot_df["err_speed_xy"],
-        name="水平速度大小误差"), 4, 2)
-    fig.add_trace(go.Scattergl(
-        x=plot_df["cum_dist_gps"] / 1000.0, y=plot_df["err_vXY_vec"],
-        name="水平速度向量误差"), 4, 2)
-    fig.update_layout(
-        title=f"{title}：GPS更新时刻交互分析", height=1350, hovermode="x unified",
-        legend={"groupclick": "toggleitem"},
-    )
-    fig.update_xaxes(title_text="GPS累计航程（千米）", row=1, col=2)
-    fig.update_xaxes(title_text="GPS累计航程（千米）", row=4, col=1)
-    fig.update_xaxes(title_text="GPS累计航程（千米）", row=4, col=2)
-    fig.write_html(path, include_plotlyjs=True)
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, tuple):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _segment_local_endpoint_errors(df: pd.DataFrame, index: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for _, seg in index.iterrows():
+        s = df[df["segment_id"] == seg["segment_id"]]
+        if s.empty:
+            continue
+        delta = (
+            s[["err_E", "err_N", "err_vertical"]].iloc[-1].to_numpy(dtype=float)
+            - s[["err_E", "err_N", "err_vertical"]].iloc[0].to_numpy(dtype=float)
+        )
+        heading = float(seg.get("segment_heading_deg", seg.get("heading_mean_deg", np.nan)))
+        if math.isfinite(heading):
+            theta = math.radians(heading)
+            along_axis = np.array([math.cos(theta), math.sin(theta)])
+            cross_axis = np.array([-math.sin(theta), math.cos(theta)])
+            along = float(np.dot(delta[:2], along_axis))
+            cross = float(np.dot(delta[:2], cross_axis))
+        else:
+            along = float(s["err_along"].iloc[-1] - s["err_along"].iloc[0])
+            cross = float(s["err_cross"].iloc[-1] - s["err_cross"].iloc[0])
+        rows.append({
+            "segment_id": int(seg["segment_id"]),
+            "local_final_along_error_m": along,
+            "local_final_cross_error_m": cross,
+            "local_final_vertical_error_m": float(delta[2]),
+            "local_final_xy_error_m": float(np.linalg.norm(delta[:2])),
+        })
+    return pd.DataFrame(rows)
+
+
+def write_official_dashboard(
+    aligned: pd.DataFrame,
+    index: pd.DataFrame,
+    seg: pd.DataFrame,
+    summary: dict[str, Any],
+    quality_table: pd.DataFrame,
+    reports: Path,
+    args: argparse.Namespace,
+) -> Path:
+    dash_df = aligned.copy()
+    dash_df["cum_dist"] = dash_df["cum_dist_gps"]
+    dash_df["course_err_deg"] = dash_df["course_error_deg"]
+    dash_df["vio_delay_s"] = dash_df["vio_sample_delay_ms"] / 1000.0
+    dash_df["valid"] = True
+    dash_df["gap"] = dash_df["gps_gap_before"].astype(bool)
+
+    heading_by_segment = index.set_index("segment_id")["segment_heading_deg"]
+    dash_df["segment_heading_deg"] = dash_df["segment_id"].map(heading_by_segment)
+    source_by_segment = index.set_index("segment_id")["heading_source"]
+    quality_by_segment = index.set_index("segment_id")["heading_quality"]
+    dash_df["heading_source"] = dash_df["segment_id"].map(source_by_segment)
+    dash_df["heading_quality"] = dash_df["segment_id"].map(quality_by_segment)
+
+    index_dash = index.copy()
+    index_dash["dist_m"] = index_dash["length_m"]
+    if "label" not in index_dash:
+        index_dash["label"] = index_dash["segment_type"].astype(str)
+
+    seg_dash = seg.copy()
+    seg_dash["dist_m"] = seg_dash.get("gps_dist_m", seg_dash.get("length_m", np.nan))
+    seg_dash["local_drift_percent"] = seg_dash["xy_drift_percent"]
+    seg_dash["local_final_xy_error_m"] = seg_dash.get(
+        "xy_error_growth_m", seg_dash["final_xy_error_m"])
+    seg_dash["global_xy_rmse_m"] = float(summary["xy_rmse_m"])
+    seg_dash["global_final_xy_error_m"] = float(summary["final_xy_error_m"])
+    local_components = _segment_local_endpoint_errors(aligned, index)
+    if not local_components.empty:
+        # segment_summaries already emits these fields.  Recompute once here
+        # for compatibility with older summary tables, replacing rather than
+        # creating ambiguous _x/_y columns.
+        replace_cols = [
+            c for c in local_components.columns
+            if c != "segment_id" and c in seg_dash.columns
+        ]
+        seg_dash = seg_dash.drop(columns=replace_cols).merge(
+            local_components, on="segment_id", how="left", validate="one_to_one")
+
+    summary_dash = {
+        k: v for k, v in summary.items()
+        if k != "metrics" and "/" not in k
+    }
+    summary_dash["yaw_or_course_rmse_deg"] = summary.get("yaw/course_rmse_deg")
+    summary_dash["yaw_or_course_final_deg"] = summary.get("yaw/course_final_deg")
+    summary_dash["xy_mae_m"] = summary.get("metrics", {}).get("err_XY", {}).get("mae")
+    summary_dash["xy_p95_m"] = summary.get("metrics", {}).get("err_XY", {}).get("p95")
+    summary_dash["vxy_vec_rmse_mps"] = summary.get("vxy_vec_rmse_mps")
+
+    qrow = quality_table.iloc[0].to_dict() if len(quality_table) else {}
+    quality = dict(qrow)
+    quality.update({
+        "gps_sample_count": int(qrow.get("gps_update_rows", len(aligned))),
+        "valid_aligned_count": int(len(aligned)),
+        "gps_gap_count": int(qrow.get("gps_gap_rows", aligned["gps_gap_before"].sum())),
+        "invalid_delay_count": 0,
+        "p95_delay_s": float(qrow.get("vio_sample_delay_p95_ms", 0.0)) / 1000.0,
+        "velocity_source": qrow.get("gps_velocity_source", summary.get("gps_velocity_source")),
+    })
+
+    gap_rows = dash_df[dash_df["gap"]][["t", "cum_dist"]].head(500)
+    meta = {
+        "experiment_id": args.experiment_id or args.method_name,
+        "flight": args.flight_name,
+        "method": args.method_name,
+        "status": args.run_status or "not supplied",
+        "t0": summary.get("analysis_start_time_s"),
+        "t1": summary.get("analysis_end_time_s"),
+        "alignment": "start-heading",
+        "course_window_s": args.heading_window_s,
+        "velocity_source": summary.get("gps_velocity_source"),
+        "vio_velocity_source": "state_velocity" if args.vio_bias else "trajectory_derivative",
+        "out_folder": str(reports.parent),
+        "gaps": _json_safe(gap_rows.to_dict(orient="records")),
+        "lk": {
+            "available": False,
+            "reason": "No LK-only trajectory or pair diagnostics were supplied.",
+        },
+    }
+    payload = dashboard.build_payload(
+        dash_df, index_dash, seg_dash,
+        _json_safe(summary_dash), _json_safe(quality), _json_safe(meta))
+    dashboard_path = Path(dashboard.write_dashboard(payload, str(reports)))
+    if not dashboard_path.is_file() or dashboard_path.stat().st_size == 0:
+        raise RuntimeError("official interactive_dashboard.html was not generated")
+    return dashboard_path
 
 
 def write_report(
@@ -885,7 +1256,34 @@ def write_report(
 ) -> None:
     m = summary["metrics"]
     best_straight = seg[seg["segment_type"] == "straight"].sort_values("xy_rmse_m").head(8)
-    turns = seg[seg["segment_type"].isin(["turn", "transition"])].head(12)
+    turns = seg[seg["segment_type"].isin(["connector", "turn", "transition"])].head(12)
+    if summary.get("divergence_detected"):
+        divergence_text = (
+            f"- Status: **divergence threshold reached**\n"
+            f"- Threshold: XY error > {summary['divergence_threshold_m']:.1f} m\n"
+            f"- Pre-divergence plot cutoff: {summary['pre_divergence_cut_time_s']:.3f} s "
+            f"(XY error {summary['pre_divergence_cut_xy_error_m']:.3f} m)\n"
+            f"- Detected rapid-growth onset: {summary['divergence_growth_onset_time_s']:.3f} s\n"
+            f"- Divergence onset: {summary['divergence_time_s']:.3f} s "
+            f"(elapsed {summary['divergence_elapsed_s']:.3f} s)\n"
+            f"- GPS distance at onset: {summary['divergence_gps_distance_km']:.3f} km\n"
+            f"- GPS ENU position at onset: E={summary['divergence_gps_E_m']:.3f} m, "
+            f"N={summary['divergence_gps_N_m']:.3f} m, "
+            f"U={summary['divergence_gps_U_m']:.3f} m\n"
+            f"- Later recovered below threshold: "
+            f"{'yes' if summary['divergence_recovered_after_onset'] else 'no'}\n"
+            f"- Final sustained divergent-tail onset: "
+            f"{summary['final_sustained_divergence_time_s'] if summary['final_sustained_divergence_time_s'] is not None else 'not observed'} s\n"
+            f"- Cut method: {summary['divergence_cut_method']}\n"
+            "- Main metrics and plots stop immediately before detected rapid growth; "
+            "the threshold-crossing time/location above remains a separate failure metric."
+        )
+    else:
+        divergence_text = (
+            f"- Status: **no sustained XY divergence in the requested window**\n"
+            f"- Threshold: XY error > {summary['divergence_threshold_m']:.1f} m\n"
+            f"- Last evaluated stable sample: {summary['last_stable_time_s']:.3f} s"
+        )
     text = f"""# Full Flight Error Analysis
 
 ## 1. Input files and time window
@@ -980,10 +1378,17 @@ distance. Segment percentages use each segment's own GPS distance.
 
 ## 10. Segment decomposition method
 
-Straight candidates require speed, course-rate, heading-variation, and local
-line-fit tests. Geometric straight legs longer than the minimum are split by
-cumulative distance; their final short remainder remains straight. Every other
-sample is retained as turn, transition, short, or unknown.
+{("The GPS-defined shared lap table is used. Every complete lap has exactly four "
+  "meaningful route sides: outbound main side, far connector, return main side, "
+  "and near connector. Start/end remnants are explicit partial segments and are "
+  "excluded from complete-lap comparisons. No 500 m fine splitting is used."
+  if args.segment_index_csv else
+  "Straight candidates require speed, course-rate, heading-variation, and local "
+  "line-fit tests. Geometric straight legs longer than the minimum are split by "
+  "cumulative distance; their final short remainder remains straight. Every other "
+  "sample is retained as turn, transition, short, or unknown.")}
+
+Segment source: `{args.segment_index_csv or "automatic geometry"}`.
 
 ## 11. Segment error summary
 
@@ -993,18 +1398,22 @@ sample is retained as turn, transition, short, or unknown.
 
 {best_straight.to_markdown(index=False) if len(best_straight) else "No >=2 km straight leg was detected."}
 
-## 13. Turn / transition details
+## 13. Connector / turn / transition details
 
 {turns.to_markdown(index=False) if len(turns) else "No turn/transition segment was detected."}
 
-## 14. Figure list
+## 14. Per-trajectory divergence endpoint
+
+{divergence_text}
+
+## 15. Figure list
 
 `../plots/` contains mandatory position/velocity comparisons, component errors,
-XY errors, trajectory, along/cross/vertical errors, segment plots, and
-`interactive_flight_analysis.html`. Every static figure is written as PNG and
-SVG.
+XY errors, trajectory, along/cross/vertical errors, and segment plots. Every
+static figure is written as PNG and SVG. The official interactive dashboard is
+`interactive_dashboard.html` in this `reports/` directory.
 
-## 15. Warnings and missing inputs
+## 16. Warnings and missing inputs
 
 {chr(10).join("- " + w for w in warnings) if warnings else "- None."}
 """
@@ -1024,17 +1433,42 @@ def analyze_run(args: argparse.Namespace) -> dict[str, Any]:
     gps = load_gps(Path(args.gps))
     traj = load_traj(args.vio_traj)
     bias = load_bias_velocity(args.vio_bias) if args.vio_bias else None
-    aligned, yaw_align = build_aligned(
+    aligned_full, yaw_align = build_aligned(
         gps, traj, bias, args.t0, args.t1, args.heading_window_s,
         args.heading_stable_window_s, args.min_speed_mps,
         args.max_vio_sample_delay_s, args.gps_gap_threshold_s)
-    aligned, index = segment_flight(
-        aligned, args.min_speed_mps, args.max_course_rate_degps,
-        args.max_heading_std_deg, args.max_line_fit_rmse_m,
-        args.min_straight_len_m, args.straight_split_len_m)
+    divergence = sustained_xy_divergence(
+        aligned_full, args.divergence_xy_threshold_m,
+        backtrack_s=args.divergence_backtrack_s,
+        smooth_window_s=args.divergence_smooth_window_s,
+        slope_window_s=args.divergence_slope_window_s,
+        max_stable_slope_mps=args.divergence_max_stable_slope_mps,
+        min_growth_m=args.divergence_min_growth_m)
+    if args.crop_at_sustained_divergence and divergence["divergence_detected"]:
+        aligned = aligned_full.iloc[:int(divergence["last_stable_row"]) + 1].copy()
+        args.crop_reason = (
+            "per-trajectory sample immediately before detected rapid XY-error growth; "
+            f"{args.divergence_xy_threshold_m:.1f} m threshold crossing "
+            f"t={divergence['divergence_time_s']:.3f} s"
+        )
+    else:
+        aligned = aligned_full.copy()
+    if args.segment_index_csv:
+        aligned, index = segment_flight_from_macro_csv(
+            aligned, Path(args.segment_index_csv))
+    else:
+        aligned, index = segment_flight(
+            aligned, args.min_speed_mps, args.max_course_rate_degps,
+            args.max_heading_std_deg, args.max_line_fit_rmse_m,
+            args.min_straight_len_m, args.straight_split_len_m)
     seg = segment_summaries(
         aligned, args.method_name, index, args.min_segment_drift_distance_m)
     summary = global_summary(aligned, args.method_name, args.flight_name, args.notes, yaw_align)
+    summary.update({k: v for k, v in divergence.items() if k != "last_stable_row"})
+    summary["requested_analysis_end_time_s"] = (
+        float(args.t1) if args.t1 is not None else float(aligned_full["t"].iloc[-1]))
+    summary["metrics_cropped_before_divergence"] = bool(
+        args.crop_at_sustained_divergence and divergence["divergence_detected"])
     warnings = []
     if bias is None:
         warnings.append("VIO bias/velocity file missing; VIO velocity was derived from trajectory position.")
@@ -1042,7 +1476,12 @@ def analyze_run(args: argparse.Namespace) -> dict[str, Any]:
         warnings.append("LK inputs were declared but LK reconstruction is not implemented without a valid LK trajectory schema.")
     else:
         warnings.append("No LK-only trajectory or pair diagnostics were supplied; no LK metrics were invented.")
-    if args.t1 is not None:
+    if args.crop_at_sustained_divergence and divergence["divergence_detected"]:
+        warnings.append(
+            f"Main plots and statistics end at the per-trajectory pre-divergence "
+            f"cut t={divergence['last_stable_time_s']:.3f} s; XY divergence "
+            f"threshold is reached at t={divergence['divergence_time_s']:.3f} s.")
+    elif args.t1 is not None:
         warnings.append(
             f"Plots and all statistics were cropped at t1={args.t1:.3f} s: "
             f"{args.crop_reason or 'explicit experiment validity boundary'}.")
@@ -1063,16 +1502,16 @@ def analyze_run(args: argparse.Namespace) -> dict[str, Any]:
     pd.DataFrame(metric_rows).to_csv(tables / "metric_statistics.csv", index=False)
     pd.DataFrame([{k: v for k, v in summary.items() if k != "metrics"}]).to_csv(
         tables / "global_summary.csv", index=False)
-    sampling_quality_table(
-        aligned, args.t0, args.t1, args.crop_reason).to_csv(
-            tables / "gps_sampling_quality.csv", index=False)
+    sampling_quality = sampling_quality_table(
+        aligned, args.t0, args.t1, args.crop_reason)
+    sampling_quality.to_csv(tables / "gps_sampling_quality.csv", index=False)
     (metadata / "global_summary.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8")
     index.to_csv(tables / "segment_index.csv", index=False)
     seg.to_csv(tables / "segment_error_summary.csv", index=False)
     seg[seg["segment_type"] == "straight"].to_csv(
         tables / "straight_leg_summary.csv", index=False)
-    seg[seg["segment_type"].isin(["turn", "transition"])].to_csv(
+    seg[seg["segment_type"].isin(["connector", "turn", "transition"])].to_csv(
         tables / "turn_transition_summary.csv", index=False)
     if aligned["gps_U"].notna().any():
         layers = pd.cut(aligned["gps_U"], bins=6, duplicates="drop")
@@ -1096,6 +1535,15 @@ def analyze_run(args: argparse.Namespace) -> dict[str, Any]:
         "t0": args.t0,
         "t1": args.t1,
         "crop_reason": args.crop_reason,
+        "segment_index_csv": args.segment_index_csv,
+        "crop_at_sustained_divergence": args.crop_at_sustained_divergence,
+        "divergence_xy_threshold_m": args.divergence_xy_threshold_m,
+        "divergence_backtrack_s": args.divergence_backtrack_s,
+        "divergence_smooth_window_s": args.divergence_smooth_window_s,
+        "divergence_slope_window_s": args.divergence_slope_window_s,
+        "divergence_max_stable_slope_mps": args.divergence_max_stable_slope_mps,
+        "divergence_min_growth_m": args.divergence_min_growth_m,
+        "divergence": {k: v for k, v in divergence.items() if k != "last_stable_row"},
         "experiment_config": args.experiment_config,
         "run_status": args.run_status,
         "notes": args.notes,
@@ -1114,10 +1562,10 @@ def analyze_run(args: argparse.Namespace) -> dict[str, Any]:
 
 ## Directories
 
-- `plots/`: PNG, SVG, and interactive HTML plots.
+- `plots/`: PNG and SVG static plots.
 - `tables/`: summary and segment CSV tables.
 - `data/`: large GPS-time aligned sample data.
-- `reports/`: complete Markdown analysis report.
+- `reports/`: complete Markdown analysis report and `interactive_dashboard.html`.
 - `metadata/`: provenance, full JSON summary, and run status.
 """
     (out / "README.md").write_text(directory_index, encoding="utf-8")
@@ -1135,6 +1583,8 @@ def analyze_run(args: argparse.Namespace) -> dict[str, Any]:
     write_figures(
         aligned, seg, plots, f"飞行 {args.flight_name}，方法 {args.method_name}")
     write_report(args, summary, index, seg, reports, warnings)
+    dashboard_path = write_official_dashboard(
+        aligned, index, seg, summary, sampling_quality, reports, args)
     return {
         "summary": summary,
         "aligned": aligned,
@@ -1146,6 +1596,7 @@ def analyze_run(args: argparse.Namespace) -> dict[str, Any]:
         "data": data,
         "reports": reports,
         "metadata": metadata,
+        "dashboard": dashboard_path,
     }
 
 
@@ -1508,6 +1959,17 @@ def run_manifest(path: Path) -> None:
             "lk_flow_csv": run.get("lk_flow_csv"),
             "out_dir": str(root / "runs" / run["flight_name"] / run["method_name"]),
             "t0": run.get("t0"), "t1": run.get("t1"),
+            "segment_index_csv": run.get("segment_index_csv"),
+            "crop_at_sustained_divergence": run.get(
+                "crop_at_sustained_divergence", False),
+            "divergence_xy_threshold_m": run.get(
+                "divergence_xy_threshold_m", 1000.0),
+            "divergence_backtrack_s": run.get("divergence_backtrack_s", 180.0),
+            "divergence_smooth_window_s": run.get("divergence_smooth_window_s", 5.0),
+            "divergence_slope_window_s": run.get("divergence_slope_window_s", 10.0),
+            "divergence_max_stable_slope_mps": run.get(
+                "divergence_max_stable_slope_mps", 1.0),
+            "divergence_min_growth_m": run.get("divergence_min_growth_m", 500.0),
             "flight_name": run["flight_name"], "method_name": run["method_name"],
             "notes": run.get("notes", ""), "heading_window_s": spec.get("heading_window_s", 60.0),
             "heading_stable_window_s": spec.get("heading_stable_window_s", 5.0),
@@ -1597,6 +2059,16 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--t0", type=float)
     p.add_argument("--t1", type=float)
     p.add_argument("--crop-reason", default="")
+    p.add_argument("--segment-index-csv",
+                   help="shared GPS-defined four-side-per-lap CSV")
+    p.add_argument("--crop-at-sustained-divergence", action="store_true",
+                   help="crop main metrics at the last stable sample before the first XY divergence threshold crossing")
+    p.add_argument("--divergence-xy-threshold-m", type=float, default=1000.0)
+    p.add_argument("--divergence-backtrack-s", type=float, default=180.0)
+    p.add_argument("--divergence-smooth-window-s", type=float, default=5.0)
+    p.add_argument("--divergence-slope-window-s", type=float, default=10.0)
+    p.add_argument("--divergence-max-stable-slope-mps", type=float, default=1.0)
+    p.add_argument("--divergence-min-growth-m", type=float, default=500.0)
     p.add_argument("--flight-name", default="flight")
     p.add_argument("--method-name", default="vio")
     p.add_argument("--notes", default="")

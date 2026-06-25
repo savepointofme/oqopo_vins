@@ -55,11 +55,14 @@
 #include <atomic>
 #include <boost/filesystem.hpp>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <deque>
 #include <functional>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "FCInitLoader.h"
 #include "VioManagerOptions.h"
@@ -89,6 +92,7 @@ class UpdaterGroundPlaneRange;
 class UpdaterGroundPlaneFeature;
 class UpdaterGroundPlaneFeatureV1;
 class Propagator;
+class VisualResidualDiag;
 
 /**
  * @brief Core class that manages the entire system
@@ -118,6 +122,8 @@ public:
    *   - 没有在这里初始化 State, 真正的初值设在 try_to_initialize 成功时写入。
    */
   VioManager(VioManagerOptions &params_);
+
+  ~VioManager();
 
   /**
    * @brief Feed function for inertial data
@@ -231,6 +237,35 @@ public:
   /// Reject if bias correction norm (acc or gyro) exceeds this.
   void set_gps_alt_guard_dbias_max(double v) { gps_alt_guard_dbias_max_ = v; }
 
+  /// Configure the staged GPS-Z coupled-update experiment.
+  /// Modes: legacy_guarded (Test 0), full (Test 1), bounded (Test 2).
+  /// All bounds are disabled when <= 0. Attitude is in radians.
+  bool configure_gps_alt_coupled_update(const std::string &mode,
+                                         double residual_soft_limit,
+                                         double max_delta_xy,
+                                         double max_delta_z,
+                                         double max_delta_velocity,
+                                         double max_delta_attitude,
+                                         double max_delta_accel_bias,
+                                         double max_delta_gyro_bias,
+                                         double covariance_psd_check_interval);
+
+  /// Configure NASA/Lear measurement underweighting for NASA_LEAR coupled mode.
+  /// @param beta        Lear coefficient beta (>=0). 0 disables (reduces to standard).
+  /// @param q_threshold Orion-style trigger: underweight only when H'PH > q_threshold (m^2).
+  void set_gps_alt_nasa_underweight(double beta, double q_threshold) {
+    gps_alt_nasa_beta_ = std::max(0.0, beta);
+    gps_alt_nasa_q_threshold_ = std::max(0.0, q_threshold);
+  }
+
+  /// Detailed per-GPS-Z coupled-gain CSV, restricted by the mechanism window.
+  void set_gps_alt_coupled_diag_path(const std::string &path);
+
+  /// GPS XY is diagnostic reference only; it is never added to the EKF H/residual.
+  void set_gps_alt_xy_diagnostic_reference(double timestamp,
+                                            const Eigen::Vector2d &xy,
+                                            bool valid = true);
+
   /// Visual yaw update control. A disabled yaw update is implemented inside
   /// EKFUpdate by scaling Kalman-gain orientation rows, not by restoring yaw.
   void set_enable_vio_yaw_update(bool v);
@@ -244,6 +279,37 @@ public:
 
   /// Open/replace the visual observability diagnostic CSV.
   void set_visual_obs_diag_path(const std::string &path);
+
+  /// Mechanism-level local diagnostics. These only write rows inside [t0, t1].
+  void set_mechanism_diag_window(double t0, double t1);
+  void set_visual_flow_curl_diag_path(const std::string &path);
+  void set_yaw_update_mechanism_diag_path(const std::string &path);
+  void set_slam_feature_yaw_contrib_diag_path(const std::string &path);
+  void set_visual_residual_diag_paths(const std::string &feature_path,
+                                      const std::string &summary_path);
+  void configure_slam_yaw_contrib_cap(bool enabled, double t0, double t1,
+                                      double roll_deg, double yawrate_degps,
+                                      int topk, double ratio,
+                                      const std::string &mode);
+  void set_slam_yaw_contrib_cap_diag_path(const std::string &path);
+  void configure_slam_info_reduction(bool enabled, double low_ratio,
+                                     double high_ratio, double alpha_max);
+  void set_slam_info_reduction_diag_path(const std::string &path);
+  void set_slam_ekf_leverage_diag_path(const std::string &path);
+  void set_slam_stacked_ekf_diag_path(const std::string &path);
+  void set_slam_landmark_metadata_diag_path(const std::string &path);
+  void configure_slam_geometry_lifecycle_refresh(bool enabled,
+                                                 double min_depth_current,
+                                                 double min_age_since_added,
+                                                 double min_pose_landmark_cov_norm,
+                                                 int min_regular_features_after_refresh,
+                                                 bool require_anchor_change);
+  void set_slam_geometry_lifecycle_refresh_diag_path(const std::string &path);
+  void set_reference_course_yaw(double timestamp, double yaw_deg, bool valid);
+  void set_slam_update_freeze_window(double t0, double t1) {
+    slam_freeze_t0_ = t0;
+    slam_freeze_t1_ = t1;
+  }
 
   /// Open/replace the Schmidt yaw diagnostic CSV.
   void set_schmidt_yaw_diag_path(const std::string &path);
@@ -266,6 +332,13 @@ public:
     double dba_norm = 0.0;    ///< predicted accel bias correction norm
     double dbg_norm = 0.0;    ///< predicted gyro bias correction norm
     double chi2 = 0.0;
+    double innovation_variance = 0.0;   ///< S = H'PH + R (standard innovation variance)
+    double gain_scale = 1.0;            ///< BOUNDED-mode uniform gain scale alpha (1.0 otherwise)
+    double nasa_beta = 0.0;             ///< NASA_LEAR underweight coefficient actually applied
+    double r_effective = 0.0;           ///< measurement noise fed to Joseph (R_eff = R + beta*H'PH for NASA)
+    bool large_coupled_correction = false;
+    bool covariance_psd_checked = false;
+    bool covariance_psd = false;
     bool clipped = false;  ///< always false (rejection gate replaces clip)
     bool zonly = false; ///< Z-only mode was used for this update
     std::string decision = "NONE"; ///< APPLY / REJECT_BY_DXY / REJECT_BY_GAIN_RATIO / REJECT_BY_BIAS / ZONLY
@@ -282,10 +355,20 @@ public:
     double chi2_max_rej = 0.0;
     double chi2_sum_acc = 0.0;
     double chi2_max_acc = 0.0;
+    double chi2_threshold_sum_acc = 0.0;
+    double chi2_threshold_sum_rej = 0.0;
+    double chi2_threshold_max_acc = 0.0;
+    double chi2_threshold_max_rej = 0.0;
     int track_len_sum_acc = 0;
     int track_len_max_acc = 0;
     int track_len_sum_rej = 0;
     int track_len_max_rej = 0;
+    int uv_count_acc = 0;
+    int uv_count_rej = 0;
+    double uv_sum_u_acc = 0.0;
+    double uv_sum_v_acc = 0.0;
+    double uv_sum_u_rej = 0.0;
+    double uv_sum_v_rej = 0.0;
     // Triangulation rejection breakdown (flat copy from FeatureInitializer::TriBatchStats)
     int    tri_cond_bad = 0;
     int    tri_depth_near = 0;
@@ -302,6 +385,47 @@ public:
     double tri_ratio_sum = 0, tri_ratio_max = 0;
   };
   MsckfLastStats get_last_msckf_stats() const;
+
+  struct VisualUpdateCounters {
+    size_t msckf_update_count = 0;
+    size_t regular_slam_update_count = 0;
+    size_t delayed_slam_update_count = 0;
+    size_t tracker_call_count = 0;
+    size_t feature_database_insert_count = 0;
+    size_t visual_update_frame_count = 0;
+    size_t visual_update_eligible_count = 0;
+    size_t visual_update_skipped_count = 0;
+    size_t msckf_attempt_count = 0;
+    size_t msckf_accept_count = 0;
+    size_t msckf_features_attempted = 0;
+    size_t msckf_features_accepted = 0;
+    size_t regular_slam_attempt_count = 0;
+    size_t regular_slam_accept_count = 0;
+    size_t regular_slam_features_attempted = 0;
+    size_t regular_slam_features_accepted = 0;
+    size_t delayed_slam_attempt_count = 0;
+    size_t delayed_slam_accept_count = 0;
+    size_t delayed_slam_features_attempted = 0;
+    size_t delayed_slam_features_accepted = 0;
+    size_t tracks_retained_final = 0;
+    size_t tracks_retained_max = 0;
+    size_t tracks_consumed_count = 0;
+    size_t tracks_dropped_without_update = 0;
+    size_t visual_update_adaptive_enabled = 0;
+    size_t visual_update_adaptive_keyframe_count = 0;
+    size_t visual_update_adaptive_skip_count = 0;
+    size_t visual_update_adaptive_flow_trigger_count = 0;
+    size_t visual_update_adaptive_maxdt_trigger_count = 0;
+    size_t visual_update_adaptive_track_trigger_count = 0;
+    size_t visual_update_adaptive_first_trigger_count = 0;
+    size_t visual_update_adaptive_min_dt_block_count = 0;
+    size_t visual_update_adaptive_drop_current_observations_count = 0;
+    double visual_update_adaptive_last_dt_s = 0.0;
+    double visual_update_adaptive_last_frame_flow_px = 0.0;
+    double visual_update_adaptive_last_accum_flow_px = 0.0;
+    int visual_update_adaptive_last_track_count = -1;
+  };
+  const VisualUpdateCounters &get_visual_update_counters() const { return visual_update_counters_; }
 
   /// Reset GPS altitude bootstrap state (for all modes). Call between runs.
   void reset_gps_altitude_bootstrap() {
@@ -366,6 +490,9 @@ public:
 
   /// Accessor for current system parameters
   VioManagerOptions get_params() { return params; }
+
+  /// Read-only real-time IMU filter diagnostics.
+  const ImuFilterStats &get_imu_filter_stats() const { return imu_filter.stats(); }
 
   /// Accessor to get the current state
   std::shared_ptr<State> get_state() { return state; }
@@ -488,6 +615,39 @@ protected:
                            double yaw_delta_deg,
                            double chi2_before, double chi2_after);
 
+  struct VisualFlowSummary {
+    bool valid = false;
+    double timestamp = 0.0;
+    size_t cam_id = 0;
+    int image_width = 0;
+    int image_height = 0;
+    int num_tracks = 0;
+    int num_features_total = 0;
+    int num_klt_attempted = 0;
+    int num_klt_newly_detected = 0;
+    bool warp_active = false;
+    double mean_u = 0.0, mean_v = 0.0, std_u = 0.0, std_v = 0.0;
+    int count_left = 0, count_right = 0, count_top = 0, count_bottom = 0;
+    int count_q1 = 0, count_q2 = 0, count_q3 = 0, count_q4 = 0;
+    double mean_du = 0.0, mean_dv = 0.0, std_du = 0.0, std_dv = 0.0;
+    double mean_flow_mag = 0.0, p95_flow_mag = 0.0;
+    double flow_curl_proxy = 0.0, flow_radial_proxy = 0.0, flow_tangential_proxy = 0.0;
+    double left_right_flow_asymmetry = 0.0, top_bottom_flow_asymmetry = 0.0;
+    double mean_track_age = 0.0, median_track_age = 0.0;
+    int new_track_count = 0, lost_track_count = 0;
+  };
+
+  bool in_mechanism_diag_window(double timestamp) const;
+  bool in_slam_update_freeze_window(double timestamp) const;
+  void collect_visual_flow_curl_diag(const ov_core::CameraData &message);
+  VisualFlowSummary summarize_tracker_packet(const ov_core::TrackerWarpVizPacket &pkt);
+  void log_visual_flow_curl_diag(double timestamp);
+  void log_yaw_update_mechanism(double timestamp, const std::string &update_type,
+                                double state_yaw_before_deg, double state_yaw_after_deg,
+                                double vio_course_yaw_before_deg, double vio_course_yaw_after_deg,
+                                double delta_yaw_deg, int num_features, double chi2,
+                                int accepted, int rejected, int tracking_feature_count);
+
   /**
    * @brief This function will try to initialize the state.
    *
@@ -524,6 +684,9 @@ protected:
   /// Manager parameters
   /// [中文] 启动时整体加载的配置 (时间窗、最大克隆数、各种阈值等)
   VioManagerOptions params;
+
+  /// Single processing point shared by propagation, initialization, and ZUPT.
+  ImuFilter imu_filter;
 
   /// Our master state object :D
   /// [中文] 状态对象, 包含 IMU / 克隆位姿 / SLAM 特征 / 标定参数 + 形式完全协方差 P
@@ -582,8 +745,24 @@ protected:
   std::ofstream of_statistics;
   std::ofstream of_vio_yaw_update_diag;
   double vio_yaw_update_diag_cumsum_deg = 0.0;
+  VisualUpdateCounters visual_update_counters_;
   std::ofstream of_visual_obs_diag;
   double visual_obs_diag_cumsum_yaw_deg = 0.0;
+  std::ofstream of_visual_flow_curl_diag;
+  std::ofstream of_yaw_update_mechanism_diag;
+  std::ofstream of_gps_alt_coupled_diag;
+  std::shared_ptr<VisualResidualDiag> visual_residual_diag_;
+  double mechanism_diag_t0_ = -std::numeric_limits<double>::infinity();
+  double mechanism_diag_t1_ = std::numeric_limits<double>::infinity();
+  double reference_course_time_ = -1.0;
+  double reference_course_yaw_deg_ = 0.0;
+  double reference_course_yaw_rate_degps_ = std::numeric_limits<double>::quiet_NaN();
+  bool reference_course_valid_ = false;
+  double slam_freeze_t0_ = -1.0;
+  double slam_freeze_t1_ = -1.0;
+  std::unordered_map<size_t, VisualFlowSummary> latest_visual_flow_by_cam_;
+  std::unordered_map<size_t, std::unordered_map<size_t, int>> flow_track_age_by_cam_;
+  std::unordered_map<size_t, std::unordered_set<size_t>> flow_prev_ids_by_cam_;
 
   // Visual update guard: skip window, reject-file, guard log
   double visual_skip_t0_ = -1.0;   // --visual-update-skip-window start
@@ -596,10 +775,26 @@ protected:
 
 public:
   void set_visual_skip_window(double t0, double t1) { visual_skip_t0_ = t0; visual_skip_t1_ = t1; }
+  void set_visual_update_stride(int stride) { visual_update_stride_ = std::max(1, stride); }
+  int get_visual_update_stride() const { return visual_update_stride_; }
+  void configure_visual_update_adaptive(bool enabled,
+                                        double target_flow_px,
+                                        double min_dt,
+                                        double max_dt,
+                                        int min_tracks);
   void open_visual_guard_log(const std::string &path);
   void load_visual_reject_file(const std::string &path);
 
 private:
+  int visual_update_stride_ = 1;
+  bool visual_update_adaptive_enable_ = false;
+  double visual_update_adaptive_target_flow_px_ = 6.0;
+  double visual_update_adaptive_min_dt_ = 0.06;
+  double visual_update_adaptive_max_dt_ = 0.18;
+  int visual_update_adaptive_min_tracks_ = 240;
+  double visual_update_adaptive_last_update_time_ = -1.0;
+  double visual_update_adaptive_accum_flow_px_ = 0.0;
+
   boost::posix_time::ptime rT1, rT2, rT3, rT4, rT5, rT6, rT7;
 
   // Track how much distance we have traveled
@@ -642,6 +837,24 @@ private:
   // [Cross-covariance guard] Reject if bias correction norm > this. 0=off.
   double gps_alt_guard_dbias_max_ = 0.0;
 
+  enum class GpsAltCoupledMode { LEGACY_GUARDED, FULL, BOUNDED, NASA_LEAR };
+  GpsAltCoupledMode gps_alt_coupled_mode_ = GpsAltCoupledMode::LEGACY_GUARDED;
+  // NASA/Lear measurement underweighting (NASA_LEAR mode only).
+  double gps_alt_nasa_beta_ = 0.0;        // Lear coefficient beta (>=0; 0 disables)
+  double gps_alt_nasa_q_threshold_ = 0.0; // Orion-style trigger on H'PH (m^2)
+  double gps_alt_residual_soft_limit_ = 0.0;
+  double gps_alt_max_delta_xy_ = 0.0;
+  double gps_alt_max_delta_z_ = 0.0;
+  double gps_alt_max_delta_velocity_ = 0.0;
+  double gps_alt_max_delta_attitude_ = 0.0;
+  double gps_alt_max_delta_accel_bias_ = 0.0;
+  double gps_alt_max_delta_gyro_bias_ = 0.0;
+  double gps_alt_covariance_psd_check_interval_ = 1.0;
+  double gps_alt_last_covariance_psd_check_time_ = -1.0;
+  double gps_alt_diag_xy_time_ = -1.0;
+  Eigen::Vector2d gps_alt_diag_xy_ = Eigen::Vector2d::Zero();
+  bool gps_alt_diag_xy_valid_ = false;
+
   // [Architecture G] GPS-VIO altitude bias augmented state.
   // When true, h_offset Vec(1) is in H_order alongside p_z.
   // Standard (unmasked) EKF update applied. Mutually exclusive with ZONLY/JOSEPH.
@@ -665,7 +878,17 @@ public:
     size_t n_rejected_dxy = 0; // guard: XY correction too large
     size_t n_rejected_kxy = 0; // guard: K_xy/K_pz ratio too large
     size_t n_rejected_bias = 0;// guard: bias correction too large
+    size_t n_large_coupled = 0;// large correction observed (not necessarily rejected)
+    size_t n_bounded = 0;      // Test 2 update used gain scaling
+    size_t n_nasa_underweight = 0; // NASA/Lear underweighting was applied (beta>0 & q>thresh)
+    size_t n_rejected_numerical = 0; // transactional Joseph health failure
     size_t n_accepted = 0;     // EKF update applied
+    // --- GPS-Z fusion watchdog bookkeeping (interface for a future forced-aiding
+    //     / recovery stage; this round only records, it does not act). ---
+    double last_measurement_time = -1.0;        // last healthy GPS-Z call reached the update path
+    double last_successful_fusion_time = -1.0;  // last GPS-Z update actually applied
+    size_t consecutive_failures = 0;            // failed/rejected GPS-Z since last success
+    double longest_no_fusion_duration = 0.0;    // max gap between successful fusions (s)
     double sum_K_pz = 0.0;
     double sum_K_xy_norm = 0.0;
     double sum_dxy_norm = 0.0;

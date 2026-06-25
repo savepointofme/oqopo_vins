@@ -33,6 +33,7 @@
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <cctype>
 #include <cstdlib>
 #include <deque>
 #include <fstream>
@@ -59,6 +60,7 @@
 #include "utils/sensor_data.h"
 
 #include "ros_free/DatasetReaderEuroc.h"
+#include "ros_free/AdaptiveStrideController.h"
 #include "ros_free/DiagLogger.h"
 #include "ros_free/DiagMetrics.h"
 #include "ros_free/DiagPrinter.h"
@@ -101,6 +103,18 @@ struct Args {
   double gps_alt_guard_dxy = 0.0;        // [中文] 交叉协方差 guard: |dxy|_pred > 此值则拒 (0=禁用, 建议 0.5)
   double gps_alt_guard_kxy_ratio = 0.0;  // [中文] 交叉协方差 guard: |K_xy|/|K_pz| > 此值则拒 (0=禁用, 建议 0.3)
   double gps_alt_guard_dbias = 0.0;      // [中文] 交叉协方差 guard: |dbias|_pred > 此值则拒 (0=禁用)
+  std::string gps_alt_coupled_mode = "legacy_guarded"; // Test0/1/2
+  std::string gps_alt_coupled_diag_path;
+  double gps_alt_residual_soft_limit = 0.0;
+  double gps_alt_max_delta_xy = 0.0;
+  double gps_alt_max_delta_z = 0.0;
+  double gps_alt_max_delta_velocity = 0.0;
+  double gps_alt_max_delta_attitude_deg = 0.0;
+  double gps_alt_max_delta_accel_bias = 0.0;
+  double gps_alt_max_delta_gyro_bias = 0.0;
+  double gps_alt_cov_psd_check_interval = 1.0;
+  double gps_alt_nasa_beta = 0.0;         // NASA/Lear underweight coefficient beta (>=0; 0 disables)
+  double gps_alt_nasa_q_threshold = 0.0;  // NASA/Lear Orion trigger on H'PH (m^2)
   bool gps_alt_arch_g = false;           // Architecture G: h_offset Vec(1) augmented state
   bool gps_alt_zonly = false;            // legacy Z-only: full cov update, state p_z only
   bool gps_alt_joseph = false;           // PX4-style masked Joseph update (Gate 2)
@@ -137,7 +151,23 @@ struct Args {
   bool show = true;              // [中文] 显示窗口
   std::string dash_title = "OpenVINS ROS-free Dashboard";
   int dash_every = 1;            // [中文] 每 N 帧刷新仪表板
-  int cam_subsample = 1;         // --cam-subsample N: feed only 1 of every N camera frames to VIO
+  int cam_subsample = 1;         // --camera-frame-stride/--cam-subsample N: feed only 1 of every N camera frames to VIO
+  bool adaptive_stride_shadow = false; // calculate/log policy but preserve fixed input stride
+  bool adaptive_stride = false;        // actively apply the causal 1..5 policy
+  std::string adaptive_stride_log_path;
+  bool camera_frame_adaptive = false; // --camera-frame-adaptive: online geometry-gated input-frame sampler
+  double camera_frame_adaptive_target_ratio = 0.01656506713377612;
+  double camera_frame_adaptive_min_dt = 0.11;
+  double camera_frame_adaptive_max_dt = 0.18;
+  double camera_frame_adaptive_min_depth = 0.0;
+  int camera_frame_adaptive_min_tracks = 240;
+  int visual_update_stride = 1;  // --visual-update-stride N: track every fed frame, update visual EKF every Nth frame
+  bool visual_update_adaptive = false; // --visual-update-adaptive: full-rate KLT, adaptive visual keyframe observations
+  double visual_update_adaptive_target_flow_px = 6.0;
+  double visual_update_adaptive_min_dt = 0.06;
+  double visual_update_adaptive_max_dt = 0.18;
+  int visual_update_adaptive_min_tracks = 240;
+  std::string camera_stride_audit_path; // --camera-stride-audit: one-row CSV proving input stride
   bool use_ground_parallel_warp = false; // --use-ground-parallel-warp: warp prev image by gravity rotation
   bool viz_fast = false;         // [中文] 快速仪表板模式 (轨迹/曲线抽帧, 特征限 200)
   bool verbose_timing = false;
@@ -154,6 +184,42 @@ struct Args {
   double vio_yaw_switch_alpha = std::numeric_limits<double>::quiet_NaN(); // --vio-yaw-switch-alpha
   std::string vio_yaw_diag_path;           // per-visual-update yaw CSV
   std::string visual_obs_diag_path;        // VisualObservabilityPolicy per-update CSV
+  std::string visual_flow_curl_diag_path;  // mechanism-level tracker flow/curl CSV
+  std::string yaw_update_mechanism_diag_path; // reference-course yaw update mechanism CSV
+  std::string imu_propagation_yaw_diag_path;  // propagation yaw-rate CSV
+  std::string slam_feature_yaw_contrib_diag_path; // per-feature SLAM residual/yaw contribution CSV
+  std::string visual_feature_residual_diag_path; // per-feature MSCKF/SLAM residual gate CSV
+  std::string visual_residual_frame_summary_path; // per-update residual summary CSV
+  bool slam_yaw_contrib_cap_enable = false; // roll-gated frame-local top-k SLAM yaw contribution cap
+  double slam_yaw_contrib_cap_t0 = -std::numeric_limits<double>::infinity();
+  double slam_yaw_contrib_cap_t1 = std::numeric_limits<double>::infinity();
+  double slam_yaw_contrib_cap_roll_deg = 10.0;
+  double slam_yaw_contrib_cap_yawrate_degps = 3.0;
+  int slam_yaw_contrib_cap_topk = 5;
+  double slam_yaw_contrib_cap_ratio = 0.5;
+  std::string slam_yaw_contrib_cap_mode = "soft_scale";
+  std::string slam_yaw_contrib_cap_diag_path;
+  bool slam_info_reduction_enable = false;
+  double slam_info_reduction_low_ratio = 0.2;
+  double slam_info_reduction_high_ratio = 0.5;
+  double slam_info_reduction_alpha_max = 4.0;
+  std::string slam_info_reduction_diag_path;
+  std::string slam_ekf_leverage_diag_path;
+  std::string slam_stacked_ekf_diag_path;
+  std::string slam_landmark_metadata_diag_path;
+  bool slam_geometry_lifecycle_refresh_enable = false;
+  double slam_geometry_refresh_min_depth = 400.0;
+  double slam_geometry_refresh_min_age = 3.0;
+  double slam_geometry_refresh_min_pose_lm_cov = 0.0;
+  int slam_geometry_refresh_min_regular_features = 0;
+  bool slam_geometry_refresh_require_anchor_change = false;
+  std::string slam_geometry_refresh_diag_path;
+  std::string state_safety_diag_path;     // --state-safety-diag: read-only state/covariance health CSV
+  int state_safety_eig_every = 0;         // compute full covariance min eigen every N fed camera frames (0=off)
+  double mech_diag_t0 = -std::numeric_limits<double>::infinity();
+  double mech_diag_t1 = std::numeric_limits<double>::infinity();
+  double slam_freeze_t0 = -1.0;          // --slam-update-freeze-window start
+  double slam_freeze_t1 = -1.0;          // --slam-update-freeze-window end
   std::string schmidt_yaw_diag_path;       // Schmidt yaw update diagnostics CSV
   // Atomic experiment selection for explicit OC / FEJ combinations.
   std::string vio_consistency_mode;
@@ -199,6 +265,20 @@ void print_help() {
                "  --gps-alt-guard-dxy M Reject update if predicted |dXY| > M (0=off, try 0.5)\n"
                "  --gps-alt-guard-kxy R Reject if |K_xy|/|K_pz| > R (0=off, try 0.3)\n"
                "  --gps-alt-guard-dbias V Reject if predicted |dbias| > V (0=off)\n"
+               "  --height-mode MODE     High-level GPS-Z fusion mode: classic|nasa-lear|standard|bounded\n"
+               "                         classic = legacy_guarded GPS-Z guard path used by current baseline\n"
+               "  --gps-alt-coupled-mode MODE  Low-level alias: legacy_guarded, full|standard, bounded|scaled_joseph, nasa_lear\n"
+               "  --gps-alt-coupled-diag PATH  per-update full-gain/covariance diagnostic CSV\n"
+               "  --gps-alt-residual-soft-limit M  uniform residual-based gain bound (0=off)\n"
+               "  --gps-alt-max-delta-xy M      bounded-mode single-update XY norm limit\n"
+               "  --gps-alt-max-delta-z M       bounded-mode single-update |dz| limit\n"
+               "  --gps-alt-max-delta-velocity MPS  bounded-mode velocity increment norm limit\n"
+               "  --gps-alt-max-delta-attitude-deg DEG  bounded-mode attitude error norm limit\n"
+               "  --gps-alt-max-delta-accel-bias V  bounded-mode accel-bias increment norm limit\n"
+               "  --gps-alt-max-delta-gyro-bias V   bounded-mode gyro-bias increment norm limit\n"
+               "  --gps-alt-cov-psd-check-interval S full LDLT check interval; <=0 checks every update\n"
+               "  --gps-alt-nasa-beta B         NASA/Lear underweight coefficient (nasa_lear mode; 0=off)\n"
+               "  --gps-alt-nasa-q-threshold Q  NASA/Lear Orion trigger on H'PH in m^2 (nasa_lear mode)\n"
                "  --gps-alt-arch-g      Architecture G: augment state with h_offset Vec(1) bias.\n"
                "                            Measurement: GPS_z = p_z + h_offset. Standard EKF update.\n"
                "                            Requires --gps-alt-update. Mutually exclusive with --gps-alt-zonly.\n"
@@ -245,12 +325,32 @@ void print_help() {
                "  --no-display          Do not create a window (useful headless)\n"
                "  --dash-title TITLE    Window title (default: 'OpenVINS ROS-free Dashboard')\n"
                "  --dash-every N        Refresh dashboard every N camera frames (default 1)\n"
-               "  --cam-subsample N     Feed only 1 of every N camera frames to VIO (default 1 = all frames)\n"
+               "  --camera-frame-stride N  Feed only 1 of every N camera frames to VIO before tracker (default 1)\n"
+               "  --adaptive-stride-shadow  Compute/log the causal height+turn policy; keep fixed camera stride\n"
+               "  --adaptive-stride         Apply the same causal policy to camera input (requires fixed stride 1)\n"
+               "  --adaptive-stride-log PATH  Per-raw-frame policy CSV (default: OUTPUT.adaptive_stride.csv)\n"
+               "  --camera-frame-adaptive  Online geometry-gated input camera sampling (default off)\n"
+               "  --camera-frame-adaptive-target-ratio R  target translation/depth ratio (default 0.016565)\n"
+               "  --camera-frame-adaptive-min-dt S        full-rate dead-zone below desired dt (default 0.11)\n"
+               "  --camera-frame-adaptive-max-dt S        maximum accepted-frame spacing (default 0.18)\n"
+               "  --camera-frame-adaptive-min-depth M     full-rate dead-zone below median SLAM depth (default 0)\n"
+               "  --camera-frame-adaptive-min-tracks N    immediate feed if last tracks fall below N (default 240)\n"
+               "  --visual-update-stride N Track every fed frame, but run MSCKF/SLAM visual updates every Nth frame (default 1)\n"
+               "  --visual-update-adaptive Full-rate tracking with adaptive visual keyframe observations\n"
+               "  --visual-update-adaptive-target-flow PX  accumulated mean optical flow trigger (default 6)\n"
+               "  --visual-update-adaptive-min-dt S        minimum visual keyframe spacing (default 0.06)\n"
+               "  --visual-update-adaptive-max-dt S        maximum visual keyframe spacing (default 0.18)\n"
+               "  --visual-update-adaptive-min-tracks N    immediate update if tracks fall below N (default 240)\n"
+               "  --cam-subsample N     Legacy alias for --camera-frame-stride\n"
+               "  --camera-stride-audit PATH  Write one-row CSV proving camera stride counts/timestamps\n"
                "  --use-ground-parallel-warp  Warp previous image by gravity rotation before KLT (removes rotational component)\n"
                "  --viz-fast            Fast dashboard mode: decimate curves/trajectories,\n"
                "                        cap SLAM/MSCKF features at 200, skip expensive resize.\n"
                "                        Keeps all panels. Reduces render time ~5-10x.\n"
                "  --verbose             Print per-frame timing\n"
+               "  --yaw-mode MODE       High-level visual consistency mode: baseline|fej|oc|oc-fej|none\n"
+               "                         baseline = FEJ Jacobians + current-gauge OC, preserving current best recipe\n"
+               "                         oc-fej = FEJ Jacobians + FEJ-gauge OC projection\n"
                "  --no-vio-yaw-update   Alias for --vio-yaw-update-scale 0.0\n"
                "  --vio-yaw-update-mode M   original|per_block_scale|global_yaw_oc_projection|current_only_scale|hard_gyro_yaw|a_strict_yaw_dx0\n"
                "                            visual_yaw_schmidt_current_gauge|visual_yaw_schmidt_fej_gauge\n"
@@ -265,11 +365,48 @@ void print_help() {
                "  --vio-yaw-switch-alpha A  Alpha for the switched-to mode (e.g. 1.0 for global_yaw_oc_projection)\n"
                "  --vio-yaw-diag PATH   Write per-MSCKF/SLAM yaw update CSV\n"
                "  --visual-obs-diag PATH  Write VisualObservabilityPolicy diagnostics CSV\n"
-               "  --vio-consistency-mode M  Explicit consistency ablation mode:\n"
-               "    oc    use_fej=false, current-gauge global-yaw OC alpha=1\n"
-               "    fej   use_fej=true, original visual update (no OC)\n"
-               "    none  use_fej=false, original visual update (no OC)\n"
-               "    oc_fej use_fej=true, current-gauge global-yaw OC alpha=1\n"
+               "  --mech-diag-t0 T      Mechanism diagnostic window start time (camera seconds)\n"
+               "  --mech-diag-t1 T      Mechanism diagnostic window end time (camera seconds)\n"
+               "  --visual-flow-curl-diag PATH  Write per-frame feature spatial/flow/curl CSV\n"
+               "  --yaw-update-mechanism-diag PATH  Write yaw update vs reference-course CSV\n"
+               "  --imu-propagation-yaw-diag PATH   Write IMU propagation yaw CSV\n"
+               "  --slam-feature-yaw-contrib-diag PATH  Write per-feature SLAM residual/yaw contribution CSV\n"
+               "  --visual-feature-residual-diag PATH  Write per-feature MSCKF/SLAM residual chi2 CSV\n"
+               "  --visual-residual-frame-summary PATH Write per-update visual residual summary CSV\n"
+               "  --slam-yaw-contrib-cap-enable  Enable roll-gated frame-local top-k SLAM yaw contribution cap\n"
+               "  --slam-yaw-contrib-cap-t0 T    Cap window start time (camera seconds)\n"
+               "  --slam-yaw-contrib-cap-t1 T    Cap window end time (camera seconds)\n"
+               "  --slam-yaw-contrib-cap-roll-deg DEG  Apply only when |roll| <= DEG\n"
+               "  --slam-yaw-contrib-cap-yawrate-degps DEG_S  Apply only when |reference course yaw rate| <= DEG_S\n"
+               "  --slam-yaw-contrib-cap-topk N  Cap top-N same-sign per-feature yaw contributors\n"
+                "  --slam-yaw-contrib-cap-ratio R Soft cap information weight ratio (0<R<1)\n"
+                "  --slam-yaw-contrib-cap-mode M  Cap mode (default soft_scale)\n"
+                "  --slam-yaw-contrib-cap-diag PATH  Write per-SLAM-update cap diagnostic CSV\n"
+                "  --slam-info-reduction-enable  Enable SLAM-only accepted residual information reduction\n"
+                "  --slam-info-reduction-low-ratio R  chi2_ratio where alpha starts increasing (default 0.2)\n"
+                "  --slam-info-reduction-high-ratio R chi2_ratio where alpha reaches max (default 0.5)\n"
+                "  --slam-info-reduction-alpha-max A  Maximum covariance inflation alpha (default 4.0)\n"
+                "  --slam-info-reduction-diag PATH  Write per-feature SLAM information reduction CSV\n"
+                "  --slam-ekf-leverage-diag PATH  Write per-feature regular SLAM EKF leverage/anchor diagnostic CSV\n"
+                "  --slam-stacked-ekf-diag PATH  Write per-frame stacked SLAM EKF H/K/P/projection diagnostic CSV\n"
+                "  --slam-landmark-metadata-diag PATH  Write accepted SLAM landmark lifecycle/geometry diagnostic CSV\n"
+                "  --slam-geometry-lifecycle-refresh  Refresh old far-depth regular SLAM landmarks before update (causal test)\n"
+                "  --slam-geometry-refresh-min-depth D  Depth trigger in meters (default 400)\n"
+                "  --slam-geometry-refresh-min-age S    Lifetime trigger in seconds (default 3)\n"
+                "  --slam-geometry-refresh-min-pose-lm-cov C  Pose-landmark covariance trigger (default 0=off)\n"
+                "  --slam-geometry-refresh-min-regular-features N  Keep at least N regular SLAM features after refresh (default 0=off)\n"
+                "  --slam-geometry-refresh-require-anchor-change  Also require landmark has anchor-changed\n"
+                "  --slam-geometry-refresh-diag PATH   Write geometry lifecycle refresh decision CSV\n"
+                "  --state-safety-diag PATH  Write read-only per-frame state/covariance health CSV\n"
+                "  --state-safety-eig-every N  Also compute full covariance min eigen every N fed camera frames (0=off)\n"
+                "  --slam-update-freeze-window T0 T1 Skip only SLAM update/delayed init in [T0,T1]\n"
+               "  --vio-consistency-mode M  Low-level alias for --yaw-mode:\n"
+               "    baseline  use_fej=true, current-gauge global-yaw OC alpha=1 (current best recipe)\n"
+               "    oc        use_fej=false, current-gauge global-yaw OC alpha=1\n"
+               "    fej       use_fej=true, original visual update (no OC)\n"
+               "    none      use_fej=false, original visual update (no OC)\n"
+               "    oc-fej    use_fej=true, FEJ-gauge global-yaw OC alpha=1\n"
+               "    oc-current-fej  use_fej=true, current-gauge global-yaw OC alpha=1\n"
                "  --visual-update-skip-window T0 T1  Skip visual EKF updates in [T0,T1] seconds (ablation)\n"
                "  --visual-update-guard-log PATH      Write per-update guard decision CSV\n"
                "  --visual-update-reject-topn-file PATH  CSV of t or t0,t1 intervals to reject\n"
@@ -339,6 +476,19 @@ bool parse_args(int argc, char **argv, Args &a) {
     else if (s == "--gps-alt-guard-dxy") a.gps_alt_guard_dxy = std::atof(next("--gps-alt-guard-dxy").c_str());
     else if (s == "--gps-alt-guard-kxy") a.gps_alt_guard_kxy_ratio = std::atof(next("--gps-alt-guard-kxy").c_str());
     else if (s == "--gps-alt-guard-dbias") a.gps_alt_guard_dbias = std::atof(next("--gps-alt-guard-dbias").c_str());
+    else if (s == "--gps-alt-coupled-mode" || s == "--gps-alt-mode" || s == "--height-mode")
+      a.gps_alt_coupled_mode = next(s.c_str());
+    else if (s == "--gps-alt-coupled-diag") a.gps_alt_coupled_diag_path = next("--gps-alt-coupled-diag");
+    else if (s == "--gps-alt-residual-soft-limit") a.gps_alt_residual_soft_limit = std::atof(next("--gps-alt-residual-soft-limit").c_str());
+    else if (s == "--gps-alt-max-delta-xy") a.gps_alt_max_delta_xy = std::atof(next("--gps-alt-max-delta-xy").c_str());
+    else if (s == "--gps-alt-max-delta-z") a.gps_alt_max_delta_z = std::atof(next("--gps-alt-max-delta-z").c_str());
+    else if (s == "--gps-alt-max-delta-velocity") a.gps_alt_max_delta_velocity = std::atof(next("--gps-alt-max-delta-velocity").c_str());
+    else if (s == "--gps-alt-max-delta-attitude-deg") a.gps_alt_max_delta_attitude_deg = std::atof(next("--gps-alt-max-delta-attitude-deg").c_str());
+    else if (s == "--gps-alt-max-delta-accel-bias") a.gps_alt_max_delta_accel_bias = std::atof(next("--gps-alt-max-delta-accel-bias").c_str());
+    else if (s == "--gps-alt-max-delta-gyro-bias") a.gps_alt_max_delta_gyro_bias = std::atof(next("--gps-alt-max-delta-gyro-bias").c_str());
+    else if (s == "--gps-alt-cov-psd-check-interval") a.gps_alt_cov_psd_check_interval = std::atof(next("--gps-alt-cov-psd-check-interval").c_str());
+    else if (s == "--gps-alt-nasa-beta") a.gps_alt_nasa_beta = std::atof(next("--gps-alt-nasa-beta").c_str());
+    else if (s == "--gps-alt-nasa-q-threshold") a.gps_alt_nasa_q_threshold = std::atof(next("--gps-alt-nasa-q-threshold").c_str());
     else if (s == "--gps-alt-arch-g") a.gps_alt_arch_g = true;
     else if (s == "--gps-alt-zonly") a.gps_alt_zonly = true;
     else if (s == "--gps-alt-joseph-update") a.gps_alt_joseph = true;
@@ -370,7 +520,40 @@ bool parse_args(int argc, char **argv, Args &a) {
     else if (s == "--no-display") a.show = false;
     else if (s == "--dash-title") a.dash_title = next("--dash-title");
     else if (s == "--dash-every") a.dash_every = std::atoi(next("--dash-every").c_str());
-    else if (s == "--cam-subsample") a.cam_subsample = std::max(1, std::atoi(next("--cam-subsample").c_str()));
+    else if (s == "--cam-subsample" || s == "--camera-frame-stride")
+      a.cam_subsample = std::max(1, std::atoi(next(s.c_str()).c_str()));
+    else if (s == "--adaptive-stride-shadow")
+      a.adaptive_stride_shadow = true;
+    else if (s == "--adaptive-stride")
+      a.adaptive_stride = true;
+    else if (s == "--adaptive-stride-log")
+      a.adaptive_stride_log_path = next("--adaptive-stride-log");
+    else if (s == "--camera-frame-adaptive")
+      a.camera_frame_adaptive = true;
+    else if (s == "--camera-frame-adaptive-target-ratio")
+      a.camera_frame_adaptive_target_ratio = std::atof(next("--camera-frame-adaptive-target-ratio").c_str());
+    else if (s == "--camera-frame-adaptive-min-dt")
+      a.camera_frame_adaptive_min_dt = std::atof(next("--camera-frame-adaptive-min-dt").c_str());
+    else if (s == "--camera-frame-adaptive-max-dt")
+      a.camera_frame_adaptive_max_dt = std::atof(next("--camera-frame-adaptive-max-dt").c_str());
+    else if (s == "--camera-frame-adaptive-min-depth")
+      a.camera_frame_adaptive_min_depth = std::atof(next("--camera-frame-adaptive-min-depth").c_str());
+    else if (s == "--camera-frame-adaptive-min-tracks")
+      a.camera_frame_adaptive_min_tracks = std::atoi(next("--camera-frame-adaptive-min-tracks").c_str());
+    else if (s == "--visual-update-stride")
+      a.visual_update_stride = std::max(1, std::atoi(next("--visual-update-stride").c_str()));
+    else if (s == "--visual-update-adaptive")
+      a.visual_update_adaptive = true;
+    else if (s == "--visual-update-adaptive-target-flow")
+      a.visual_update_adaptive_target_flow_px = std::atof(next("--visual-update-adaptive-target-flow").c_str());
+    else if (s == "--visual-update-adaptive-min-dt")
+      a.visual_update_adaptive_min_dt = std::atof(next("--visual-update-adaptive-min-dt").c_str());
+    else if (s == "--visual-update-adaptive-max-dt")
+      a.visual_update_adaptive_max_dt = std::atof(next("--visual-update-adaptive-max-dt").c_str());
+    else if (s == "--visual-update-adaptive-min-tracks")
+      a.visual_update_adaptive_min_tracks = std::atoi(next("--visual-update-adaptive-min-tracks").c_str());
+    else if (s == "--camera-stride-audit" || s == "--stride-audit")
+      a.camera_stride_audit_path = next(s.c_str());
     else if (s == "--use-ground-parallel-warp") a.use_ground_parallel_warp = true;
     else if (s == "--viz-fast") a.viz_fast = true;
     else if (s == "--verbose") a.verbose_timing = true;
@@ -386,10 +569,48 @@ bool parse_args(int argc, char **argv, Args &a) {
     else if (s == "--vio-yaw-switch-mode") a.vio_yaw_switch_mode = next("--vio-yaw-switch-mode");
     else if (s == "--vio-yaw-switch-time") a.vio_yaw_switch_time = std::atof(next("--vio-yaw-switch-time").c_str());
     else if (s == "--vio-yaw-switch-alpha") a.vio_yaw_switch_alpha = std::atof(next("--vio-yaw-switch-alpha").c_str());
-    else if (s == "--vio-consistency-mode") a.vio_consistency_mode = next("--vio-consistency-mode");
+    else if (s == "--vio-consistency-mode" || s == "--yaw-mode") a.vio_consistency_mode = next(s.c_str());
     else if (s == "--vio-yaw-gauge-mode") a.vio_yaw_gauge_mode = next("--vio-yaw-gauge-mode");
     else if (s == "--vio-yaw-diag") a.vio_yaw_diag_path = next("--vio-yaw-diag");
     else if (s == "--visual-obs-diag") a.visual_obs_diag_path = next("--visual-obs-diag");
+    else if (s == "--mech-diag-t0") a.mech_diag_t0 = std::atof(next("--mech-diag-t0").c_str());
+    else if (s == "--mech-diag-t1") a.mech_diag_t1 = std::atof(next("--mech-diag-t1").c_str());
+    else if (s == "--visual-flow-curl-diag") a.visual_flow_curl_diag_path = next("--visual-flow-curl-diag");
+    else if (s == "--yaw-update-mechanism-diag") a.yaw_update_mechanism_diag_path = next("--yaw-update-mechanism-diag");
+    else if (s == "--imu-propagation-yaw-diag") a.imu_propagation_yaw_diag_path = next("--imu-propagation-yaw-diag");
+    else if (s == "--slam-feature-yaw-contrib-diag") a.slam_feature_yaw_contrib_diag_path = next("--slam-feature-yaw-contrib-diag");
+    else if (s == "--visual-feature-residual-diag") a.visual_feature_residual_diag_path = next("--visual-feature-residual-diag");
+    else if (s == "--visual-residual-frame-summary") a.visual_residual_frame_summary_path = next("--visual-residual-frame-summary");
+    else if (s == "--slam-yaw-contrib-cap-enable") a.slam_yaw_contrib_cap_enable = true;
+    else if (s == "--slam-yaw-contrib-cap-t0") a.slam_yaw_contrib_cap_t0 = std::atof(next("--slam-yaw-contrib-cap-t0").c_str());
+    else if (s == "--slam-yaw-contrib-cap-t1") a.slam_yaw_contrib_cap_t1 = std::atof(next("--slam-yaw-contrib-cap-t1").c_str());
+    else if (s == "--slam-yaw-contrib-cap-roll-deg") a.slam_yaw_contrib_cap_roll_deg = std::atof(next("--slam-yaw-contrib-cap-roll-deg").c_str());
+    else if (s == "--slam-yaw-contrib-cap-yawrate-degps") a.slam_yaw_contrib_cap_yawrate_degps = std::atof(next("--slam-yaw-contrib-cap-yawrate-degps").c_str());
+    else if (s == "--slam-yaw-contrib-cap-topk") a.slam_yaw_contrib_cap_topk = std::atoi(next("--slam-yaw-contrib-cap-topk").c_str());
+    else if (s == "--slam-yaw-contrib-cap-ratio") a.slam_yaw_contrib_cap_ratio = std::atof(next("--slam-yaw-contrib-cap-ratio").c_str());
+    else if (s == "--slam-yaw-contrib-cap-mode") a.slam_yaw_contrib_cap_mode = next("--slam-yaw-contrib-cap-mode");
+    else if (s == "--slam-yaw-contrib-cap-diag") a.slam_yaw_contrib_cap_diag_path = next("--slam-yaw-contrib-cap-diag");
+    else if (s == "--slam-info-reduction-enable") a.slam_info_reduction_enable = true;
+    else if (s == "--slam-info-reduction-low-ratio") a.slam_info_reduction_low_ratio = std::atof(next("--slam-info-reduction-low-ratio").c_str());
+    else if (s == "--slam-info-reduction-high-ratio") a.slam_info_reduction_high_ratio = std::atof(next("--slam-info-reduction-high-ratio").c_str());
+    else if (s == "--slam-info-reduction-alpha-max") a.slam_info_reduction_alpha_max = std::atof(next("--slam-info-reduction-alpha-max").c_str());
+    else if (s == "--slam-info-reduction-diag") a.slam_info_reduction_diag_path = next("--slam-info-reduction-diag");
+    else if (s == "--slam-ekf-leverage-diag") a.slam_ekf_leverage_diag_path = next("--slam-ekf-leverage-diag");
+    else if (s == "--slam-stacked-ekf-diag") a.slam_stacked_ekf_diag_path = next("--slam-stacked-ekf-diag");
+    else if (s == "--slam-landmark-metadata-diag") a.slam_landmark_metadata_diag_path = next("--slam-landmark-metadata-diag");
+    else if (s == "--slam-geometry-lifecycle-refresh") a.slam_geometry_lifecycle_refresh_enable = true;
+    else if (s == "--slam-geometry-refresh-min-depth") a.slam_geometry_refresh_min_depth = std::atof(next("--slam-geometry-refresh-min-depth").c_str());
+    else if (s == "--slam-geometry-refresh-min-age") a.slam_geometry_refresh_min_age = std::atof(next("--slam-geometry-refresh-min-age").c_str());
+    else if (s == "--slam-geometry-refresh-min-pose-lm-cov") a.slam_geometry_refresh_min_pose_lm_cov = std::atof(next("--slam-geometry-refresh-min-pose-lm-cov").c_str());
+    else if (s == "--slam-geometry-refresh-min-regular-features") a.slam_geometry_refresh_min_regular_features = std::atoi(next("--slam-geometry-refresh-min-regular-features").c_str());
+    else if (s == "--slam-geometry-refresh-require-anchor-change") a.slam_geometry_refresh_require_anchor_change = true;
+    else if (s == "--slam-geometry-refresh-diag") a.slam_geometry_refresh_diag_path = next("--slam-geometry-refresh-diag");
+    else if (s == "--state-safety-diag") a.state_safety_diag_path = next("--state-safety-diag");
+    else if (s == "--state-safety-eig-every") a.state_safety_eig_every = std::atoi(next("--state-safety-eig-every").c_str());
+    else if (s == "--slam-update-freeze-window") {
+      a.slam_freeze_t0 = std::atof(next("--slam-update-freeze-window T0").c_str());
+      a.slam_freeze_t1 = std::atof(next("--slam-update-freeze-window T1").c_str());
+    }
     else if (s == "--schmidt-yaw-diag") a.schmidt_yaw_diag_path = next("--schmidt-yaw-diag");
     else if (s == "--visual-update-skip-window") {
       a.visual_skip_t0 = std::atof(next("--visual-update-skip-window T0").c_str());
@@ -443,9 +664,21 @@ int main(int argc, char **argv) {
   Args args;
   if (!parse_args(argc, argv, args))
     return EXIT_FAILURE;
-  if (!args.init_from_fc_path.empty() && std::fabs(args.start_time - 930.0) > 1e-6) {
-    PRINT_WARNING(YELLOW "[ros-free] --init-from-fc with start_time=%.3f (not 930); proceeding anyway\n" RESET, args.start_time);
+  if (args.adaptive_stride && args.adaptive_stride_shadow) {
+    PRINT_ERROR(RED "[adaptive-stride] active and shadow modes are mutually exclusive\n" RESET);
+    return EXIT_FAILURE;
   }
+  if ((args.adaptive_stride || args.adaptive_stride_shadow) && args.camera_frame_adaptive) {
+    PRINT_ERROR(RED "[adaptive-stride] cannot be combined with --camera-frame-adaptive\n" RESET);
+    return EXIT_FAILURE;
+  }
+  if (args.adaptive_stride && args.cam_subsample != 1) {
+    PRINT_ERROR(RED "[adaptive-stride] active mode requires --camera-frame-stride 1; "
+                    "shadow mode is the fixed-stride comparator\n" RESET);
+    return EXIT_FAILURE;
+  }
+  if ((args.adaptive_stride || args.adaptive_stride_shadow) && args.adaptive_stride_log_path.empty())
+    args.adaptive_stride_log_path = args.output_path + ".adaptive_stride.csv";
 
   // -------------------- load config --------------------
   auto parser = std::make_shared<ov_core::YamlParser>(args.config_path);
@@ -455,6 +688,17 @@ int main(int argc, char **argv) {
 
   VioManagerOptions params;
   params.print_and_load(parser);
+  if ((args.adaptive_stride || args.adaptive_stride_shadow) &&
+      (params.state_options.do_calib_camera_pose ||
+       params.state_options.do_calib_camera_intrinsics ||
+       params.state_options.do_calib_camera_timeoffset)) {
+    PRINT_ERROR(RED "[adaptive-stride] formal validation requires locked camera extrinsics, "
+                    "intrinsics, and time offset (got ext=%d intr=%d toff=%d)\n" RESET,
+                params.state_options.do_calib_camera_pose ? 1 : 0,
+                params.state_options.do_calib_camera_intrinsics ? 1 : 0,
+                params.state_options.do_calib_camera_timeoffset ? 1 : 0);
+    return EXIT_FAILURE;
+  }
   // [中文] 离线回放: 禁用 VioManager 内部的异步队列, 我们自己严格按时间序喂
   params.use_multi_threading_subs = false;
 
@@ -479,6 +723,10 @@ int main(int argc, char **argv) {
   // YAML use_fej value untouched. This atomic mode makes OC-only, FEJ-only,
   // neither, and OC+FEJ explicit and rejects ambiguous legacy flag mixtures.
   if (!args.vio_consistency_mode.empty()) {
+    std::transform(args.vio_consistency_mode.begin(), args.vio_consistency_mode.end(),
+                   args.vio_consistency_mode.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    std::replace(args.vio_consistency_mode.begin(), args.vio_consistency_mode.end(), '_', '-');
     const bool has_conflicting_yaw_cli =
         !args.vio_yaw_gauge_mode.empty() ||
         !args.vio_yaw_update_mode.empty() ||
@@ -490,13 +738,18 @@ int main(int argc, char **argv) {
       return EXIT_FAILURE;
     }
 
-    if (args.vio_consistency_mode == "oc") {
+    if (args.vio_consistency_mode == "baseline" ||
+        args.vio_consistency_mode == "oc-current-fej") {
+      params.state_options.do_fej = true;
+      args.vio_yaw_update_mode = "global_yaw_oc_projection";
+      args.vio_global_yaw_oc_alpha = 1.0;
+    } else if (args.vio_consistency_mode == "oc") {
       params.state_options.do_fej = false;
       args.vio_yaw_update_mode = "global_yaw_oc_projection";
       args.vio_global_yaw_oc_alpha = 1.0;
-    } else if (args.vio_consistency_mode == "oc_fej") {
+    } else if (args.vio_consistency_mode == "oc-fej") {
       params.state_options.do_fej = true;
-      args.vio_yaw_update_mode = "global_yaw_oc_projection";
+      args.vio_yaw_update_mode = "global_yaw_oc_fej_projection";
       args.vio_global_yaw_oc_alpha = 1.0;
     } else if (args.vio_consistency_mode == "fej") {
       params.state_options.do_fej = true;
@@ -505,7 +758,7 @@ int main(int argc, char **argv) {
       params.state_options.do_fej = false;
       args.vio_yaw_update_mode = "original";
     } else {
-      PRINT_ERROR("[ros-free] invalid --vio-consistency-mode=%s; expected oc, fej, none, or oc_fej.\n",
+      PRINT_ERROR("[ros-free] invalid --vio-consistency-mode=%s; expected baseline, oc, fej, none, oc-fej, or oc-current-fej.\n",
                   args.vio_consistency_mode.c_str());
       return EXIT_FAILURE;
     }
@@ -693,6 +946,93 @@ int main(int argc, char **argv) {
                params.state_options.gps_h_offset_walk_sigma);
   }
   auto sys = std::make_shared<VioManager>(params);
+  if (!args.visual_flow_curl_diag_path.empty() ||
+      !args.yaw_update_mechanism_diag_path.empty() ||
+      !args.imu_propagation_yaw_diag_path.empty() ||
+      !args.slam_feature_yaw_contrib_diag_path.empty() ||
+      !args.visual_feature_residual_diag_path.empty() ||
+      !args.visual_residual_frame_summary_path.empty() ||
+      !args.slam_info_reduction_diag_path.empty() ||
+      !args.slam_ekf_leverage_diag_path.empty() ||
+      !args.slam_stacked_ekf_diag_path.empty() ||
+      !args.slam_landmark_metadata_diag_path.empty() ||
+      !args.slam_geometry_refresh_diag_path.empty() ||
+      !args.slam_yaw_contrib_cap_diag_path.empty()) {
+    sys->set_mechanism_diag_window(args.mech_diag_t0, args.mech_diag_t1);
+    sys->get_propagator()->set_yaw_diag_window(args.mech_diag_t0, args.mech_diag_t1);
+    PRINT_INFO(CYAN "[ros-free] mechanism diag window: [%.3f, %.3f] camera seconds\n" RESET,
+               args.mech_diag_t0, args.mech_diag_t1);
+  }
+  if (!args.visual_flow_curl_diag_path.empty())
+    sys->set_visual_flow_curl_diag_path(args.visual_flow_curl_diag_path);
+  if (!args.yaw_update_mechanism_diag_path.empty())
+    sys->set_yaw_update_mechanism_diag_path(args.yaw_update_mechanism_diag_path);
+  if (!args.imu_propagation_yaw_diag_path.empty())
+    sys->get_propagator()->set_yaw_diag_path(args.imu_propagation_yaw_diag_path);
+  if (!args.slam_feature_yaw_contrib_diag_path.empty())
+    sys->set_slam_feature_yaw_contrib_diag_path(args.slam_feature_yaw_contrib_diag_path);
+  if (!args.visual_feature_residual_diag_path.empty() ||
+      !args.visual_residual_frame_summary_path.empty()) {
+    sys->set_visual_residual_diag_paths(args.visual_feature_residual_diag_path,
+                                        args.visual_residual_frame_summary_path);
+  }
+  if (args.slam_yaw_contrib_cap_enable) {
+    sys->configure_slam_yaw_contrib_cap(
+        true, args.slam_yaw_contrib_cap_t0, args.slam_yaw_contrib_cap_t1,
+        args.slam_yaw_contrib_cap_roll_deg, args.slam_yaw_contrib_cap_yawrate_degps,
+        args.slam_yaw_contrib_cap_topk, args.slam_yaw_contrib_cap_ratio,
+        args.slam_yaw_contrib_cap_mode);
+    PRINT_INFO(CYAN "[ros-free] SLAM yaw contrib cap: window=[%.3f, %.3f] "
+               "roll<=%.2f yawrate<=%.2f topk=%d ratio=%.3f mode=%s\n" RESET,
+               args.slam_yaw_contrib_cap_t0, args.slam_yaw_contrib_cap_t1,
+               args.slam_yaw_contrib_cap_roll_deg,
+               args.slam_yaw_contrib_cap_yawrate_degps,
+               args.slam_yaw_contrib_cap_topk,
+               args.slam_yaw_contrib_cap_ratio,
+               args.slam_yaw_contrib_cap_mode.c_str());
+  }
+  if (!args.slam_yaw_contrib_cap_diag_path.empty())
+    sys->set_slam_yaw_contrib_cap_diag_path(args.slam_yaw_contrib_cap_diag_path);
+  if (args.slam_info_reduction_enable) {
+    sys->configure_slam_info_reduction(true, args.slam_info_reduction_low_ratio,
+                                       args.slam_info_reduction_high_ratio,
+                                       args.slam_info_reduction_alpha_max);
+    PRINT_INFO(CYAN "[ros-free] SLAM info reduction: low=%.3f high=%.3f alpha_max=%.3f\n" RESET,
+               args.slam_info_reduction_low_ratio,
+               args.slam_info_reduction_high_ratio,
+               args.slam_info_reduction_alpha_max);
+  }
+  if (!args.slam_info_reduction_diag_path.empty())
+    sys->set_slam_info_reduction_diag_path(args.slam_info_reduction_diag_path);
+  if (!args.slam_ekf_leverage_diag_path.empty())
+    sys->set_slam_ekf_leverage_diag_path(args.slam_ekf_leverage_diag_path);
+  if (!args.slam_stacked_ekf_diag_path.empty())
+    sys->set_slam_stacked_ekf_diag_path(args.slam_stacked_ekf_diag_path);
+  if (!args.slam_landmark_metadata_diag_path.empty())
+    sys->set_slam_landmark_metadata_diag_path(args.slam_landmark_metadata_diag_path);
+  if (args.slam_geometry_lifecycle_refresh_enable) {
+    sys->configure_slam_geometry_lifecycle_refresh(
+        true,
+        args.slam_geometry_refresh_min_depth,
+        args.slam_geometry_refresh_min_age,
+        args.slam_geometry_refresh_min_pose_lm_cov,
+        args.slam_geometry_refresh_min_regular_features,
+        args.slam_geometry_refresh_require_anchor_change);
+    PRINT_INFO(CYAN "[ros-free] SLAM geometry lifecycle refresh: depth>%.3fm age>%.3fs pose_lm_cov>%.6g min_regular_after=%d require_anchor_change=%d\n" RESET,
+               args.slam_geometry_refresh_min_depth,
+               args.slam_geometry_refresh_min_age,
+               args.slam_geometry_refresh_min_pose_lm_cov,
+               args.slam_geometry_refresh_min_regular_features,
+               args.slam_geometry_refresh_require_anchor_change ? 1 : 0);
+  }
+  if (!args.slam_geometry_refresh_diag_path.empty())
+    sys->set_slam_geometry_lifecycle_refresh_diag_path(args.slam_geometry_refresh_diag_path);
+  if (args.slam_freeze_t0 >= 0.0 && args.slam_freeze_t1 > args.slam_freeze_t0) {
+    sys->set_slam_update_freeze_window(args.slam_freeze_t0, args.slam_freeze_t1);
+    PRINT_INFO(CYAN "[ros-free] SLAM update freeze window: [%.3f, %.3f]s "
+               "(MSCKF/GPS-Z/yaw OC unchanged)\n" RESET,
+               args.slam_freeze_t0, args.slam_freeze_t1);
+  }
   bool delayed_vio_yaw_control_applied = !delayed_vio_yaw_control;
   bool timed_yaw_switch_applied = args.vio_yaw_switch_mode.empty() || args.vio_yaw_switch_time < 0.0;
   if (!timed_yaw_switch_applied) {
@@ -702,6 +1042,52 @@ int main(int argc, char **argv) {
   }
 
   // Visual update guard (--visual-update-skip-window / --visual-update-guard-log / --visual-update-reject-topn-file)
+  sys->set_visual_update_stride(args.visual_update_stride);
+  if (args.visual_update_stride > 1) {
+    PRINT_INFO(CYAN "[ros-free] Visual update stride: track every fed camera frame, "
+               "run MSCKF/SLAM visual updates every %d frames\n" RESET,
+               args.visual_update_stride);
+  }
+  sys->configure_visual_update_adaptive(
+      args.visual_update_adaptive,
+      args.visual_update_adaptive_target_flow_px,
+      args.visual_update_adaptive_min_dt,
+      args.visual_update_adaptive_max_dt,
+      args.visual_update_adaptive_min_tracks);
+  if (args.visual_update_adaptive) {
+    PRINT_INFO(CYAN "[ros-free] Visual update adaptive: full-rate tracking, "
+               "keyframe observations by accumulated flow>=%.3fpx, min_dt=%.3fs, "
+               "max_dt=%.3fs, min_tracks=%d. Skipped-frame observations are removed.\n" RESET,
+               args.visual_update_adaptive_target_flow_px,
+               args.visual_update_adaptive_min_dt,
+               args.visual_update_adaptive_max_dt,
+               args.visual_update_adaptive_min_tracks);
+  }
+  if (args.adaptive_stride || args.adaptive_stride_shadow) {
+    PRINT_INFO(CYAN "[adaptive-stride] mode=%s fixed_stride=%d log=%s; "
+               "causal inputs only (relative height, VIO speed/attitude, IMU gyro, active features)\n" RESET,
+               args.adaptive_stride ? "active" : "shadow", args.cam_subsample,
+               args.adaptive_stride_log_path.c_str());
+  }
+  if (args.camera_frame_adaptive) {
+    if (args.camera_frame_adaptive_max_dt > 0.0 &&
+        args.camera_frame_adaptive_max_dt < args.camera_frame_adaptive_min_dt) {
+      args.camera_frame_adaptive_max_dt = args.camera_frame_adaptive_min_dt;
+    }
+    args.camera_frame_adaptive_target_ratio = std::max(0.0, args.camera_frame_adaptive_target_ratio);
+    args.camera_frame_adaptive_min_dt = std::max(0.0, args.camera_frame_adaptive_min_dt);
+    args.camera_frame_adaptive_max_dt = std::max(0.0, args.camera_frame_adaptive_max_dt);
+    args.camera_frame_adaptive_min_depth = std::max(0.0, args.camera_frame_adaptive_min_depth);
+    args.camera_frame_adaptive_min_tracks = std::max(0, args.camera_frame_adaptive_min_tracks);
+    PRINT_INFO(CYAN "[ros-free] Camera frame adaptive input sampling: "
+               "target_ratio=%.6f min_dt=%.3fs max_dt=%.3fs min_depth=%.1fm min_tracks=%d. "
+               "Frames below the min_dt geometry dead-zone stay full-rate.\n" RESET,
+               args.camera_frame_adaptive_target_ratio,
+               args.camera_frame_adaptive_min_dt,
+               args.camera_frame_adaptive_max_dt,
+               args.camera_frame_adaptive_min_depth,
+               args.camera_frame_adaptive_min_tracks);
+  }
   if (args.visual_skip_t0 >= 0.0 && args.visual_skip_t1 > args.visual_skip_t0) {
     sys->set_visual_skip_window(args.visual_skip_t0, args.visual_skip_t1);
     PRINT_INFO(CYAN "[ros-free] Visual update skip window: [%.3f, %.3f]s\n" RESET,
@@ -794,6 +1180,37 @@ int main(int argc, char **argv) {
     sys->set_gps_alt_guard_dbias_max(args.gps_alt_guard_dbias);
     PRINT_INFO(CYAN "[ros-free] GPS alt guard |dbias| max = %.5f\n" RESET, args.gps_alt_guard_dbias);
   }
+  if (!sys->configure_gps_alt_coupled_update(
+          args.gps_alt_coupled_mode,
+          args.gps_alt_residual_soft_limit,
+          args.gps_alt_max_delta_xy,
+          args.gps_alt_max_delta_z,
+          args.gps_alt_max_delta_velocity,
+          args.gps_alt_max_delta_attitude_deg * M_PI / 180.0,
+          args.gps_alt_max_delta_accel_bias,
+          args.gps_alt_max_delta_gyro_bias,
+          args.gps_alt_cov_psd_check_interval)) {
+    return EXIT_FAILURE;
+  }
+  sys->set_gps_alt_nasa_underweight(args.gps_alt_nasa_beta, args.gps_alt_nasa_q_threshold);
+  if (args.gps_alt_nasa_beta > 0.0) {
+    PRINT_INFO(CYAN "[ros-free] GPS alt NASA/Lear underweight beta=%.4f q_threshold=%.4f m^2\n" RESET,
+               args.gps_alt_nasa_beta, args.gps_alt_nasa_q_threshold);
+  }
+  if (!args.gps_alt_coupled_diag_path.empty())
+    sys->set_gps_alt_coupled_diag_path(args.gps_alt_coupled_diag_path);
+  PRINT_INFO(CYAN "[ros-free] GPS alt coupled mode=%s residual_limit=%.3f "
+                  "dxy=%.3f dz=%.3f dv=%.3f dtheta=%.3fdeg "
+                  "dba=%.6f dbg=%.6f psd_interval=%.3fs\n" RESET,
+             args.gps_alt_coupled_mode.c_str(),
+             args.gps_alt_residual_soft_limit,
+             args.gps_alt_max_delta_xy,
+             args.gps_alt_max_delta_z,
+             args.gps_alt_max_delta_velocity,
+             args.gps_alt_max_delta_attitude_deg,
+             args.gps_alt_max_delta_accel_bias,
+             args.gps_alt_max_delta_gyro_bias,
+             args.gps_alt_cov_psd_check_interval);
   if (args.gps_alt_arch_g) {
     if (!params.state_options.use_gps_h_offset) {
       PRINT_ERROR(RED "[ros-free] --gps-alt-arch-g requires state_options.use_gps_h_offset=true "
@@ -965,6 +1382,48 @@ int main(int argc, char **argv) {
   debug_out << "# t_cam vx vy vz bg_x bg_y bg_z ba_x ba_y ba_z\n";
   debug_out << std::fixed << std::setprecision(6);
 
+  AdaptiveStrideController adaptive_stride_controller;
+  std::ofstream adaptive_stride_out;
+  if (args.adaptive_stride || args.adaptive_stride_shadow) {
+    fs::path p(args.adaptive_stride_log_path);
+    if (!p.parent_path().empty())
+      fs::create_directories(p.parent_path());
+    adaptive_stride_out.open(args.adaptive_stride_log_path,
+                             std::ofstream::out | std::ofstream::trunc);
+    if (!adaptive_stride_out.is_open()) {
+      PRINT_ERROR(RED "[adaptive-stride] cannot open policy CSV: %s\n" RESET,
+                  args.adaptive_stride_log_path.c_str());
+      return EXIT_FAILURE;
+    }
+    adaptive_stride_out
+        << "timestamp,current_fixed_stride,recommended_stride,relative_height,"
+        << "horizontal_speed,roll,pitch,gyro_norm,active_msckf_features,"
+        << "active_slam_features,reason_height,reason_turn,reason_feature_low,"
+        << "hysteresis_state,hold_timer,base_stride,filtered_height,filtered_speed,"
+        << "effective_height,filtered_gyro,severe_turn,severe_feature_low,changed,"
+        << "switch_reason,height_source,mode,applied_stride,frame_fed\n";
+    adaptive_stride_out << std::fixed << std::setprecision(9);
+  }
+
+  std::ofstream state_safety_out;
+  if (!args.state_safety_diag_path.empty()) {
+    fs::path p(args.state_safety_diag_path);
+    if (!p.parent_path().empty())
+      fs::create_directories(p.parent_path());
+    state_safety_out.open(args.state_safety_diag_path, std::ofstream::out | std::ofstream::trunc);
+    if (!state_safety_out.is_open()) {
+      PRINT_WARNING(YELLOW "[STATE-SAFETY] failed to open %s\n" RESET, args.state_safety_diag_path.c_str());
+    } else {
+      state_safety_out
+          << "time,frame_id,cov_dim,n_clones,n_slam,n_aruco,n_should_marg,n_invalid_landmark_id,"
+          << "cov_all_finite,cov_nan_count,cov_inf_count,cov_sym_fro,cov_sym_max_abs,"
+          << "cov_min_diag,cov_max_diag,cov_trace,cov_neg_diag_count,cov_min_eig,"
+          << "bgx,bgy,bgz,bax,bay,baz,vx,vy,vz,px,py,pz,qx,qy,qz,qw\n";
+      state_safety_out.flush();
+      PRINT_INFO(GREEN "[STATE-SAFETY] writing %s\n" RESET, args.state_safety_diag_path.c_str());
+    }
+  }
+
   // -------------------- timeline merge-sort --------------------
   // [中文] OpenVINS 滤波器完全由传感器时间戳驱动。我们把 IMU 样本和相机帧
   // 按时间戳合并排序后顺序喂入, 与 ROS 版本结果数值一致 (仅受初始化线程
@@ -981,6 +1440,38 @@ int main(int argc, char **argv) {
   std::deque<std::pair<double, Eigen::Vector3d>> vio_for_align;
   int frame_idx = 0;
   int align_fit_count = 0;
+  size_t total_image_input_count = 0;
+  size_t processed_image_count = 0;
+  size_t skipped_image_count = 0;
+  size_t imu_sample_count = 0;
+  std::vector<double> processed_image_timestamps;
+  size_t adaptive_raw_frames_since_feed = 0;
+  size_t adaptive_switch_count = 0;
+  size_t adaptive_down_switch_count = 0;
+  size_t adaptive_up_switch_count = 0;
+  bool adaptive_have_vio_height_origin = false;
+  double adaptive_vio_height_origin = 0.0;
+  AdaptiveStrideDecision adaptive_decision;
+  struct CameraFrameAdaptiveStats {
+    size_t enabled = 0;
+    size_t feed_count = 0;
+    size_t skip_count = 0;
+    size_t first_trigger_count = 0;
+    size_t target_dt_trigger_count = 0;
+    size_t max_dt_trigger_count = 0;
+    size_t track_safety_trigger_count = 0;
+    size_t no_geometry_feed_count = 0;
+    size_t depth_deadzone_feed_count = 0;
+    size_t fullrate_deadzone_feed_count = 0;
+    double last_feed_time = -1.0;
+    double last_dt_since_feed = 0.0;
+    double last_desired_dt = 0.0;
+    double last_depth_median = -1.0;
+    double last_speed = -1.0;
+    int last_track_count = -1;
+    std::string last_reason = "not_enabled";
+  } camera_adaptive_stats;
+  camera_adaptive_stats.enabled = args.camera_frame_adaptive ? 1 : 0;
 
   // ---- Diagnostic tracking state ----
   double prev_t_cam = -1.0;           // previous camera frame timestamp
@@ -993,6 +1484,9 @@ int main(int argc, char **argv) {
   // 后续 measurement = GPS_now - GPS_ref + VIO_ref, 对齐到 VIO 世界坐标系.
   double gps_alt_ref = std::numeric_limits<double>::quiet_NaN();
   double gps_alt_vio_ref = 0.0;
+  Eigen::Vector2d gps_xy_ref = Eigen::Vector2d::Constant(
+      std::numeric_limits<double>::quiet_NaN());
+  Eigen::Vector2d gps_xy_vio_ref = Eigen::Vector2d::Zero();
   size_t gps_alt_feeds = 0, gps_alt_rejects = 0;
 
   auto maybe_align = [&](double t) {
@@ -1016,6 +1510,37 @@ int main(int argc, char **argv) {
     }
   };
 
+  auto reference_course_yaw_at = [&](double t, double &yaw_deg) -> bool {
+    if (gps.size() < 2)
+      return false;
+    auto it = std::lower_bound(
+        gps.begin(), gps.end(), t,
+        [](const DatasetReaderEuroc::GpsSample &s, double tt) { return s.timestamp < tt; });
+    size_t i1 = 0;
+    if (it == gps.begin()) {
+      i1 = 1;
+    } else if (it == gps.end()) {
+      i1 = gps.size() - 1;
+    } else {
+      i1 = (size_t)std::distance(gps.begin(), it);
+    }
+    size_t i0 = i1 > 0 ? i1 - 1 : 0;
+    if (i0 == i1 || i1 >= gps.size())
+      return false;
+    double nearest_dt = std::min(std::fabs(gps[i0].timestamp - t), std::fabs(gps[i1].timestamp - t));
+    if (nearest_dt > 0.50)
+      return false;
+    double dt = gps[i1].timestamp - gps[i0].timestamp;
+    if (dt <= 1e-6)
+      return false;
+    Eigen::Vector3d d = gps[i1].xyz - gps[i0].xyz;
+    double speed_xy = std::hypot(d.x(), d.y()) / dt;
+    if (speed_xy < 0.5)
+      return false;
+    yaw_deg = std::atan2(d.y(), d.x()) * 180.0 / M_PI;
+    return std::isfinite(yaw_deg);
+  };
+
   while (!g_stop.load() && (imu_i < imu.size() || cam_i < cam0.size())) {
     double t_imu = imu_i < imu.size() ? imu[imu_i].timestamp : INF;
     double t_cam = cam_i < cam0.size() ? cam0[cam_i].timestamp : INF;
@@ -1027,17 +1552,20 @@ int main(int argc, char **argv) {
       m.wm = imu[imu_i].gyro;
       m.am = imu[imu_i].accel;
       sys->feed_measurement_imu(m);
+      imu_sample_count++;
       imu_i++;
       continue;
     }
 
     // ------ camera frame ------
+    total_image_input_count++;
     ov_core::CameraData msg;
     msg.timestamp = t_cam;
     cv::Mat img0 = cv::imread(cam0[cam_i].image_path, cv::IMREAD_GRAYSCALE);
     if (img0.empty()) {
       PRINT_WARNING(YELLOW "[ros-free] failed to read %s, skipping\n" RESET,
                     cam0[cam_i].image_path.c_str());
+      skipped_image_count++;
       cam_i++;
       continue;
     }
@@ -1073,14 +1601,233 @@ int main(int argc, char **argv) {
                                     args.init_ba_sigma,
                                     t_cam);
       fc_init_pending = false;
+      skipped_image_count++;
       cam_i++;
       continue;
     }
 
     double t0 = cv::getTickCount() / cv::getTickFrequency();
+    double ref_course_yaw = 0.0;
+    bool ref_course_valid = reference_course_yaw_at(t_cam, ref_course_yaw);
+    sys->set_reference_course_yaw(t_cam, ref_course_yaw, ref_course_valid);
+    AdaptiveStrideInput adaptive_input;
+    std::string adaptive_height_source = "unavailable";
+    int adaptive_prev_stride = adaptive_stride_controller.recommended_stride();
+    if (args.adaptive_stride || args.adaptive_stride_shadow) {
+      adaptive_input.timestamp = t_cam;
+      adaptive_input.initialized = sys->initialized();
+      adaptive_input.configured_feature_count = params.num_pts;
+      if (imu_i > 0 && imu_i <= imu.size())
+        adaptive_input.gyro_norm_radps = imu[imu_i - 1].gyro.norm();
+
+      // Causal relative height: the latest GPS sample at or before t_cam.
+      // DatasetReaderEuroc anchors ENU-U at the first (ground) GPS sample.  No
+      // future sample, course, reference error, or flight identity is read.
+      if (!gps.empty()) {
+        auto it = std::upper_bound(
+            gps.begin(), gps.end(), t_cam,
+            [](double tt, const DatasetReaderEuroc::GpsSample &s) { return tt < s.timestamp; });
+        if (it != gps.begin()) {
+          --it;
+          if (t_cam - it->timestamp <= 2.0) {
+            adaptive_input.relative_height_m = it->xyz.z();
+            adaptive_height_source = "gps_past_enu_u";
+          }
+        }
+      }
+
+      if (sys->initialized()) {
+        auto state_pre = sys->get_state();
+        const Eigen::Vector3d p_wi_pre = state_pre->_imu->pos();
+        const Eigen::Vector3d v_wi_pre = state_pre->_imu->vel();
+        adaptive_input.horizontal_speed_mps = v_wi_pre.head<2>().norm();
+        Eigen::Matrix3d R_wi_pre = state_pre->_imu->Rot().transpose();
+        Eigen::Quaterniond q_pre(R_wi_pre);
+        const double qw = q_pre.w(), qx = q_pre.x(), qy = q_pre.y(), qz = q_pre.z();
+        adaptive_input.roll_deg = std::atan2(2.0 * (qw * qx + qy * qz),
+                                             1.0 - 2.0 * (qx * qx + qy * qy)) * 180.0 / M_PI;
+        adaptive_input.pitch_deg = std::asin(std::max(-1.0, std::min(1.0,
+                                              2.0 * (qw * qy - qz * qx)))) * 180.0 / M_PI;
+        adaptive_input.active_slam_features = (int)sys->get_features_SLAM().size();
+        ov_core::TrackerWarpVizPacket pkt_stride;
+        if (sys->get_warp_viz_packet(0, pkt_stride))
+          adaptive_input.active_msckf_features = (int)pkt_stride.curr_pts_raw.size();
+
+        if (!adaptive_have_vio_height_origin) {
+          adaptive_vio_height_origin = p_wi_pre.z();
+          adaptive_have_vio_height_origin = true;
+        }
+        if (!std::isfinite(adaptive_input.relative_height_m)) {
+          adaptive_input.relative_height_m = std::max(0.0, p_wi_pre.z() - adaptive_vio_height_origin);
+          adaptive_height_source = "vio_relative_fallback";
+        }
+      }
+      adaptive_decision = adaptive_stride_controller.update(adaptive_input);
+      if (adaptive_decision.changed) {
+        adaptive_switch_count++;
+        if (adaptive_decision.recommended_stride > adaptive_prev_stride)
+          adaptive_up_switch_count++;
+        else
+          adaptive_down_switch_count++;
+        PRINT_INFO(CYAN "[adaptive-stride] t=%.3f %d->%d base=%d reason=%s "
+                   "h=%.1f roll=%.1f gyro=%.3f feats=%d+%d\n" RESET,
+                   t_cam, adaptive_prev_stride, adaptive_decision.recommended_stride,
+                   adaptive_decision.base_stride, adaptive_decision.switch_reason.c_str(),
+                   adaptive_input.relative_height_m, adaptive_input.roll_deg,
+                   adaptive_input.gyro_norm_radps, adaptive_input.active_msckf_features,
+                   adaptive_input.active_slam_features);
+      }
+    }
     bool do_cam_feed = (args.cam_subsample <= 1) || (frame_idx % args.cam_subsample == 0);
-    if (do_cam_feed)
+    if (args.adaptive_stride) {
+      adaptive_raw_frames_since_feed++;
+      do_cam_feed = processed_image_count == 0 ||
+                    adaptive_raw_frames_since_feed >=
+                        (size_t)std::max(1, adaptive_decision.recommended_stride);
+    }
+    if (args.camera_frame_adaptive) {
+      do_cam_feed = true;
+      camera_adaptive_stats.last_reason = "not_initialized";
+      camera_adaptive_stats.last_dt_since_feed =
+          (camera_adaptive_stats.last_feed_time > 0.0)
+              ? std::max(0.0, t_cam - camera_adaptive_stats.last_feed_time)
+              : 0.0;
+      camera_adaptive_stats.last_desired_dt = 0.0;
+      camera_adaptive_stats.last_depth_median = -1.0;
+      camera_adaptive_stats.last_speed = -1.0;
+      camera_adaptive_stats.last_track_count = -1;
+
+      if (sys->initialized()) {
+        auto state_pre = sys->get_state();
+        const Eigen::Vector3d p_wi_pre = state_pre->_imu->pos();
+        const double speed_pre = state_pre->_imu->vel().norm();
+        camera_adaptive_stats.last_speed = speed_pre;
+
+        std::vector<Eigen::Vector3d> slam_pts_pre = sys->get_features_SLAM();
+        if (!slam_pts_pre.empty()) {
+          std::vector<double> depths;
+          depths.reserve(slam_pts_pre.size());
+          for (const auto &fp : slam_pts_pre) {
+            const double depth = (fp - p_wi_pre).norm();
+            if (std::isfinite(depth) && depth > 0.0)
+              depths.push_back(depth);
+          }
+          if (!depths.empty()) {
+            std::sort(depths.begin(), depths.end());
+            camera_adaptive_stats.last_depth_median = depths[depths.size() / 2];
+          }
+        }
+
+        ov_core::TrackerWarpVizPacket pkt_adapt;
+        if (sys->get_warp_viz_packet(0, pkt_adapt))
+          camera_adaptive_stats.last_track_count = (int)pkt_adapt.curr_pts_raw.size();
+
+        const bool first_feed = camera_adaptive_stats.last_feed_time < 0.0;
+        const bool track_safety =
+            !first_feed &&
+            args.camera_frame_adaptive_min_tracks > 0 &&
+            camera_adaptive_stats.last_track_count >= 0 &&
+            camera_adaptive_stats.last_track_count < args.camera_frame_adaptive_min_tracks;
+        const bool have_geometry =
+            std::isfinite(camera_adaptive_stats.last_depth_median) &&
+            camera_adaptive_stats.last_depth_median > 1.0 &&
+            std::isfinite(speed_pre) && speed_pre > 1.0 &&
+            args.camera_frame_adaptive_target_ratio > 0.0;
+
+        if (first_feed) {
+          do_cam_feed = true;
+          camera_adaptive_stats.first_trigger_count++;
+          camera_adaptive_stats.last_reason = "adaptive_first";
+        } else if (track_safety) {
+          do_cam_feed = true;
+          camera_adaptive_stats.track_safety_trigger_count++;
+          camera_adaptive_stats.last_reason = "adaptive_track_safety";
+        } else if (!have_geometry) {
+          do_cam_feed = true;
+          camera_adaptive_stats.no_geometry_feed_count++;
+          camera_adaptive_stats.last_reason = "adaptive_no_geometry";
+        } else if (args.camera_frame_adaptive_min_depth > 0.0 &&
+                   camera_adaptive_stats.last_depth_median < args.camera_frame_adaptive_min_depth) {
+          do_cam_feed = true;
+          camera_adaptive_stats.depth_deadzone_feed_count++;
+          camera_adaptive_stats.last_reason = "adaptive_depth_deadzone";
+        } else {
+          const double raw_desired_dt =
+              args.camera_frame_adaptive_target_ratio *
+              camera_adaptive_stats.last_depth_median / speed_pre;
+          double desired_dt = raw_desired_dt;
+          if (args.camera_frame_adaptive_max_dt > 0.0)
+            desired_dt = std::min(desired_dt, args.camera_frame_adaptive_max_dt);
+          camera_adaptive_stats.last_desired_dt = desired_dt;
+
+          if (raw_desired_dt < args.camera_frame_adaptive_min_dt) {
+            do_cam_feed = true;
+            camera_adaptive_stats.fullrate_deadzone_feed_count++;
+            camera_adaptive_stats.last_reason = "adaptive_fullrate_deadzone";
+          } else if (camera_adaptive_stats.last_dt_since_feed + 1e-9 >= desired_dt) {
+            do_cam_feed = true;
+            if (std::fabs(desired_dt - args.camera_frame_adaptive_max_dt) < 1e-9 &&
+                raw_desired_dt > desired_dt) {
+              camera_adaptive_stats.max_dt_trigger_count++;
+              camera_adaptive_stats.last_reason = "adaptive_max_dt";
+            } else {
+              camera_adaptive_stats.target_dt_trigger_count++;
+              camera_adaptive_stats.last_reason = "adaptive_target_ratio";
+            }
+          } else {
+            do_cam_feed = false;
+            camera_adaptive_stats.last_reason = "adaptive_wait";
+          }
+        }
+      } else {
+        camera_adaptive_stats.no_geometry_feed_count++;
+      }
+
+      if (do_cam_feed)
+        camera_adaptive_stats.feed_count++;
+      else
+        camera_adaptive_stats.skip_count++;
+    }
+    if (adaptive_stride_out.is_open()) {
+      adaptive_stride_out
+          << t_cam << "," << args.cam_subsample << ","
+          << adaptive_decision.recommended_stride << ","
+          << adaptive_input.relative_height_m << ","
+          << adaptive_input.horizontal_speed_mps << ","
+          << adaptive_input.roll_deg << "," << adaptive_input.pitch_deg << ","
+          << adaptive_input.gyro_norm_radps << ","
+          << adaptive_input.active_msckf_features << ","
+          << adaptive_input.active_slam_features << ","
+          << (adaptive_decision.reason_height_valid ? 1 : 0) << ","
+          << (adaptive_decision.reason_turn ? 1 : 0) << ","
+          << (adaptive_decision.reason_feature_low ? 1 : 0) << ","
+          << adaptive_decision.hysteresis_state << ","
+          << adaptive_decision.hold_timer_s << ","
+          << adaptive_decision.base_stride << ","
+          << adaptive_decision.filtered_height_m << ","
+          << adaptive_decision.filtered_speed_mps << ","
+          << adaptive_decision.effective_height_m << ","
+          << adaptive_decision.filtered_gyro_radps << ","
+          << (adaptive_decision.severe_turn ? 1 : 0) << ","
+          << (adaptive_decision.severe_feature_low ? 1 : 0) << ","
+          << (adaptive_decision.changed ? 1 : 0) << ","
+          << adaptive_decision.switch_reason << ","
+          << adaptive_height_source << ","
+          << (args.adaptive_stride ? "active" : "shadow") << ","
+          << (args.adaptive_stride ? adaptive_decision.recommended_stride : args.cam_subsample) << ","
+          << (do_cam_feed ? 1 : 0) << "\n";
+    }
+    if (do_cam_feed) {
       sys->feed_measurement_camera(msg);
+      processed_image_count++;
+      processed_image_timestamps.push_back(t_cam);
+      if (args.adaptive_stride)
+        adaptive_raw_frames_since_feed = 0;
+      if (args.camera_frame_adaptive)
+        camera_adaptive_stats.last_feed_time = t_cam;
+    } else {
+      skipped_image_count++;
+    }
     double dt_ms = 1000.0 * (cv::getTickCount() / cv::getTickFrequency() - t0);
 
     // ------ query latest state ------
@@ -1149,6 +1896,15 @@ int main(int argc, char **argv) {
         bool gps_sample_is_new = (static_cast<long long>(gps_i) != last_fed_gps_i);
         if (!cutoff_reached && feed_this_sample && gps_sample_is_new) {
           last_fed_gps_i = static_cast<long long>(gps_i);
+          // XY remains evaluation-only. Align its origin to the VIO position at
+          // the first fused GPS-Z sample, then expose it only to coupled-update
+          // diagnostics (it is never inserted into H or the residual).
+          if (!gps_xy_ref.allFinite()) {
+            gps_xy_ref = xyz_raw.head<2>();
+            gps_xy_vio_ref = sys->get_state()->_imu->pos().head<2>();
+          }
+          sys->set_gps_alt_xy_diagnostic_reference(
+              t_gps, xyz_raw.head<2>() - gps_xy_ref + gps_xy_vio_ref, true);
           if (args.gps_alt_ground_plane) {
             // Ground-plane pseudo-rangefinder mode.  zonly is controlled by
             // --gps-alt-zonly (default false: full-state update).
@@ -1222,6 +1978,83 @@ int main(int argc, char **argv) {
       int slam_count = (int)sys->get_features_SLAM().size();
       int slam_dropped = std::max(0, prev_slam_count - slam_count);
       prev_slam_count = slam_count;
+      if (state_safety_out.is_open() && do_cam_feed) {
+        Eigen::MatrixXd P = StateHelper::get_full_covariance(state);
+        const int cov_dim = (int)P.rows();
+        int cov_nan_count = 0;
+        int cov_inf_count = 0;
+        int cov_neg_diag_count = 0;
+        double cov_min_diag = std::numeric_limits<double>::quiet_NaN();
+        double cov_max_diag = std::numeric_limits<double>::quiet_NaN();
+        double cov_trace = std::numeric_limits<double>::quiet_NaN();
+        double cov_sym_fro = std::numeric_limits<double>::quiet_NaN();
+        double cov_sym_max_abs = std::numeric_limits<double>::quiet_NaN();
+        double cov_min_eig = std::numeric_limits<double>::quiet_NaN();
+        if (cov_dim > 0) {
+          cov_min_diag = std::numeric_limits<double>::infinity();
+          cov_max_diag = -std::numeric_limits<double>::infinity();
+          cov_trace = 0.0;
+          for (int r = 0; r < P.rows(); r++) {
+            const double d = P(r, r);
+            if (std::isfinite(d)) {
+              cov_min_diag = std::min(cov_min_diag, d);
+              cov_max_diag = std::max(cov_max_diag, d);
+              cov_trace += d;
+              if (d < 0.0)
+                cov_neg_diag_count++;
+            } else if (std::isnan(d)) {
+              cov_nan_count++;
+            } else {
+              cov_inf_count++;
+            }
+            for (int c = 0; c < P.cols(); c++) {
+              const double v = P(r, c);
+              if (std::isnan(v)) cov_nan_count++;
+              else if (!std::isfinite(v)) cov_inf_count++;
+            }
+          }
+          Eigen::MatrixXd Psym = P - P.transpose();
+          cov_sym_fro = Psym.norm();
+          cov_sym_max_abs = Psym.cwiseAbs().maxCoeff();
+          if (args.state_safety_eig_every > 0 &&
+              ((frame_idx + 1) % args.state_safety_eig_every) == 0 &&
+              P.allFinite()) {
+            Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(
+                0.5 * (P + P.transpose()), Eigen::EigenvaluesOnly);
+            if (es.info() == Eigen::Success && es.eigenvalues().rows() > 0)
+              cov_min_eig = es.eigenvalues().minCoeff();
+          }
+        }
+        int n_aruco = 0;
+        int n_should_marg = 0;
+        int n_invalid_landmark_id = 0;
+        for (const auto &kv : state->_features_SLAM) {
+          const auto &lm = kv.second;
+          if ((int)kv.first <= 4 * state->_options.max_aruco_features)
+            n_aruco++;
+          if (lm && lm->should_marg)
+            n_should_marg++;
+          if (!lm || lm->_featid != kv.first || lm->id() < 0 ||
+              lm->id() + lm->size() > cov_dim)
+            n_invalid_landmark_id++;
+        }
+        state_safety_out << std::fixed << std::setprecision(9)
+            << t_cam << "," << (frame_idx + 1) << ","
+            << cov_dim << "," << state->_clones_IMU.size() << ","
+            << state->_features_SLAM.size() << "," << n_aruco << ","
+            << n_should_marg << "," << n_invalid_landmark_id << ","
+            << (P.allFinite() ? 1 : 0) << "," << cov_nan_count << "," << cov_inf_count << ","
+            << cov_sym_fro << "," << cov_sym_max_abs << ","
+            << cov_min_diag << "," << cov_max_diag << "," << cov_trace << ","
+            << cov_neg_diag_count << "," << cov_min_eig << ","
+            << std::scientific << std::setprecision(9)
+            << bg.x() << "," << bg.y() << "," << bg.z() << ","
+            << ba.x() << "," << ba.y() << "," << ba.z() << ","
+            << v_wi.x() << "," << v_wi.y() << "," << v_wi.z() << ","
+            << p_wi.x() << "," << p_wi.y() << "," << p_wi.z() << ","
+            << q.x() << "," << q.y() << "," << q.z() << "," << q.w()
+            << std::defaultfloat << "\n";
+      }
       {
 
         // Trigger on first frame with enough chi2 rejections.
@@ -1625,6 +2458,175 @@ int main(int argc, char **argv) {
   }
 
   out.close();
+  if (!args.camera_stride_audit_path.empty()) {
+    std::vector<double> processed_dt;
+    for (size_t i = 1; i < processed_image_timestamps.size(); ++i)
+      processed_dt.push_back(processed_image_timestamps[i] - processed_image_timestamps[i - 1]);
+    auto percentile = [](std::vector<double> values, double q) -> double {
+      if (values.empty())
+        return std::numeric_limits<double>::quiet_NaN();
+      std::sort(values.begin(), values.end());
+      const double pos = q * (double)(values.size() - 1);
+      const size_t lo = (size_t)std::floor(pos);
+      const size_t hi = std::min(values.size() - 1, lo + 1);
+      const double a = pos - (double)lo;
+      return (1.0 - a) * values[lo] + a * values[hi];
+    };
+    const double dt_median = percentile(processed_dt, 0.50);
+    const double dt_p95 = percentile(processed_dt, 0.95);
+    const double processed_ratio = total_image_input_count > 0
+        ? (double)processed_image_count / (double)total_image_input_count
+        : 0.0;
+    const auto &visual_counts = sys->get_visual_update_counters();
+    const auto &gps_stats = sys->get_gps_alt_stats();
+
+    fs::path audit_path(args.camera_stride_audit_path);
+    if (audit_path.has_parent_path())
+      fs::create_directories(audit_path.parent_path());
+    std::ofstream audit(args.camera_stride_audit_path, std::ofstream::out | std::ofstream::trunc);
+    if (!audit.is_open()) {
+      PRINT_WARNING(YELLOW "[ros-free] failed to open camera stride audit: %s\n" RESET,
+                    args.camera_stride_audit_path.c_str());
+    } else {
+      audit << "configured_stride,total_image_input_count,processed_image_count,"
+            << "skipped_image_count,effective_processed_ratio,processed_image_dt_median,"
+            << "processed_image_dt_p95,total_imu_sample_count,tracker_invocation_count,"
+            << "msckf_update_count,regular_slam_update_count,delayed_slam_update_count,"
+            << "gps_z_update_count,gps_z_accepted_count,gps_z_rejected_count,"
+            << "visual_update_stride,visual_update_frame_count,visual_update_eligible_count,"
+            << "visual_update_skipped_count,feature_database_insert_count,"
+            << "visual_tracker_call_count,msckf_attempted,msckf_accepted,"
+            << "msckf_features_attempted,msckf_features_accepted,"
+            << "regular_slam_attempted,regular_slam_accepted,"
+            << "regular_slam_features_attempted,regular_slam_features_accepted,"
+            << "delayed_slam_attempted,delayed_slam_accepted,"
+            << "delayed_slam_features_attempted,delayed_slam_features_accepted,"
+            << "tracks_retained_final,tracks_retained_max,tracks_consumed_count,"
+            << "tracks_dropped_without_update,"
+            << "visual_update_adaptive_enabled,visual_update_adaptive_target_flow_px,"
+            << "visual_update_adaptive_min_dt,visual_update_adaptive_max_dt,"
+            << "visual_update_adaptive_min_tracks,visual_update_adaptive_keyframe_count,"
+            << "visual_update_adaptive_skip_count,visual_update_adaptive_flow_trigger_count,"
+            << "visual_update_adaptive_maxdt_trigger_count,visual_update_adaptive_track_trigger_count,"
+            << "visual_update_adaptive_first_trigger_count,visual_update_adaptive_min_dt_block_count,"
+            << "visual_update_adaptive_drop_current_observations_count,"
+            << "visual_update_adaptive_last_dt_s,visual_update_adaptive_last_frame_flow_px,"
+            << "visual_update_adaptive_last_accum_flow_px,visual_update_adaptive_last_track_count,"
+            << "camera_frame_adaptive_enabled,camera_frame_adaptive_target_ratio,"
+            << "camera_frame_adaptive_min_dt,camera_frame_adaptive_max_dt,"
+            << "camera_frame_adaptive_min_depth,camera_frame_adaptive_min_tracks,"
+            << "camera_frame_adaptive_feed_count,"
+            << "camera_frame_adaptive_skip_count,camera_frame_adaptive_first_trigger_count,"
+            << "camera_frame_adaptive_target_dt_trigger_count,camera_frame_adaptive_maxdt_trigger_count,"
+            << "camera_frame_adaptive_track_safety_trigger_count,camera_frame_adaptive_no_geometry_feed_count,"
+            << "camera_frame_adaptive_depth_deadzone_feed_count,"
+            << "camera_frame_adaptive_fullrate_deadzone_feed_count,"
+            << "camera_frame_adaptive_last_dt_since_feed,camera_frame_adaptive_last_desired_dt,"
+            << "camera_frame_adaptive_last_depth_median,camera_frame_adaptive_last_speed,"
+            << "camera_frame_adaptive_last_track_count,camera_frame_adaptive_last_reason,"
+            << "processed_image_timestamps\n";
+      audit << args.cam_subsample << ","
+            << total_image_input_count << ","
+            << processed_image_count << ","
+            << skipped_image_count << ","
+            << std::fixed << std::setprecision(9)
+            << processed_ratio << ","
+            << dt_median << ","
+            << dt_p95 << ","
+            << imu_sample_count << ","
+            << processed_image_count << ","
+            << visual_counts.msckf_update_count << ","
+            << visual_counts.regular_slam_update_count << ","
+            << visual_counts.delayed_slam_update_count << ","
+            << gps_alt_feeds << ","
+            << gps_stats.n_accepted << ","
+            << gps_stats.n_rejected << ","
+            << args.visual_update_stride << ","
+            << visual_counts.visual_update_frame_count << ","
+            << visual_counts.visual_update_eligible_count << ","
+            << visual_counts.visual_update_skipped_count << ","
+            << visual_counts.feature_database_insert_count << ","
+            << visual_counts.tracker_call_count << ","
+            << visual_counts.msckf_attempt_count << ","
+            << visual_counts.msckf_accept_count << ","
+            << visual_counts.msckf_features_attempted << ","
+            << visual_counts.msckf_features_accepted << ","
+            << visual_counts.regular_slam_attempt_count << ","
+            << visual_counts.regular_slam_accept_count << ","
+            << visual_counts.regular_slam_features_attempted << ","
+            << visual_counts.regular_slam_features_accepted << ","
+            << visual_counts.delayed_slam_attempt_count << ","
+            << visual_counts.delayed_slam_accept_count << ","
+            << visual_counts.delayed_slam_features_attempted << ","
+            << visual_counts.delayed_slam_features_accepted << ","
+            << visual_counts.tracks_retained_final << ","
+            << visual_counts.tracks_retained_max << ","
+            << visual_counts.tracks_consumed_count << ","
+            << visual_counts.tracks_dropped_without_update << ","
+            << visual_counts.visual_update_adaptive_enabled << ","
+            << args.visual_update_adaptive_target_flow_px << ","
+            << args.visual_update_adaptive_min_dt << ","
+            << args.visual_update_adaptive_max_dt << ","
+            << args.visual_update_adaptive_min_tracks << ","
+            << visual_counts.visual_update_adaptive_keyframe_count << ","
+            << visual_counts.visual_update_adaptive_skip_count << ","
+            << visual_counts.visual_update_adaptive_flow_trigger_count << ","
+            << visual_counts.visual_update_adaptive_maxdt_trigger_count << ","
+            << visual_counts.visual_update_adaptive_track_trigger_count << ","
+            << visual_counts.visual_update_adaptive_first_trigger_count << ","
+            << visual_counts.visual_update_adaptive_min_dt_block_count << ","
+            << visual_counts.visual_update_adaptive_drop_current_observations_count << ","
+            << visual_counts.visual_update_adaptive_last_dt_s << ","
+            << visual_counts.visual_update_adaptive_last_frame_flow_px << ","
+            << visual_counts.visual_update_adaptive_last_accum_flow_px << ","
+            << visual_counts.visual_update_adaptive_last_track_count << ","
+            << camera_adaptive_stats.enabled << ","
+            << args.camera_frame_adaptive_target_ratio << ","
+            << args.camera_frame_adaptive_min_dt << ","
+            << args.camera_frame_adaptive_max_dt << ","
+            << args.camera_frame_adaptive_min_depth << ","
+            << args.camera_frame_adaptive_min_tracks << ","
+            << camera_adaptive_stats.feed_count << ","
+            << camera_adaptive_stats.skip_count << ","
+            << camera_adaptive_stats.first_trigger_count << ","
+            << camera_adaptive_stats.target_dt_trigger_count << ","
+            << camera_adaptive_stats.max_dt_trigger_count << ","
+            << camera_adaptive_stats.track_safety_trigger_count << ","
+            << camera_adaptive_stats.no_geometry_feed_count << ","
+            << camera_adaptive_stats.depth_deadzone_feed_count << ","
+            << camera_adaptive_stats.fullrate_deadzone_feed_count << ","
+            << camera_adaptive_stats.last_dt_since_feed << ","
+            << camera_adaptive_stats.last_desired_dt << ","
+            << camera_adaptive_stats.last_depth_median << ","
+            << camera_adaptive_stats.last_speed << ","
+            << camera_adaptive_stats.last_track_count << ","
+            << camera_adaptive_stats.last_reason << ",\"";
+      for (size_t i = 0; i < processed_image_timestamps.size(); ++i) {
+        if (i > 0)
+          audit << ';';
+        audit << std::fixed << std::setprecision(9) << processed_image_timestamps[i];
+      }
+      audit << "\"\n";
+      PRINT_INFO(GREEN "[ros-free] camera stride audit written to %s "
+                 "(stride=%d total=%zu processed=%zu skipped=%zu ratio=%.3f)\n" RESET,
+                 args.camera_stride_audit_path.c_str(), args.cam_subsample,
+                 total_image_input_count, processed_image_count, skipped_image_count,
+                 processed_ratio);
+    }
+  }
+  if (adaptive_stride_out.is_open()) {
+    adaptive_stride_out.flush();
+    if (!adaptive_stride_out.good()) {
+      PRINT_ERROR(RED "[adaptive-stride] policy CSV write failed: %s\n" RESET,
+                  args.adaptive_stride_log_path.c_str());
+      return EXIT_FAILURE;
+    }
+    adaptive_stride_out.close();
+    PRINT_INFO(GREEN "[adaptive-stride] log=%s switches=%zu up=%zu down=%zu final=%d\n" RESET,
+               args.adaptive_stride_log_path.c_str(), adaptive_switch_count,
+               adaptive_up_switch_count, adaptive_down_switch_count,
+               adaptive_stride_controller.recommended_stride());
+  }
   if (cam_writer.isOpened())
     cam_writer.release();
   PRINT_INFO(GREEN "[ros-free] done. trajectory written to %s (frames=%d, aligned_pairs=%d)\n" RESET,

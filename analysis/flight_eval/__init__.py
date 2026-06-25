@@ -5,6 +5,7 @@
 
 模块职责（每个指标只在一处定义，避免漂移）:
   io            路径解析（含 zip://archive::member）、TUM / .bias / CSV 读取
+  fc_gps        从飞控原始日志（CSV/ULog/.bin）构建标准 GPS CSV（含 Ve/Vn/Vu）
   run_spec      schema 校验 + resolve + 落盘
   trajectory    ENU 转换、start-heading 对齐（位置+速度同旋转）、里程
   gps_sampling  以 GPS 更新时间为采样网格（不上采样）
@@ -12,7 +13,7 @@
   segmentation  直线检测 + 长直线精细切分 + 转弯归类 + 局部/全局段漂移
   time_alignment FC/IMU/camera 角运动相似性时间偏移搜索
   lk_only       纯视觉诊断轨迹构建与评估
-  plotting      PNG + SVG + Plotly HTML（中文）
+  plotting      SVG 静态图（中文）
   dashboard     离线 interactive_dashboard.html 组装
   reports       中文 markdown 报告
   provenance    run_spec_resolved / analysis_config / status / command
@@ -23,6 +24,7 @@ METRIC_DEFINITIONS_VERSION = "1.0.0"
 
 __all__ = [
     "io",
+    "fc_gps",
     "run_spec",
     "trajectory",
     "gps_sampling",

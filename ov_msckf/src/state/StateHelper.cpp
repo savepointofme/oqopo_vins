@@ -30,8 +30,10 @@
 #include <algorithm>
 #include <boost/filesystem.hpp>
 #include <boost/math/distributions/chi_squared.hpp>
+#include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <set>
 
 using namespace ov_core;
@@ -842,6 +844,275 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
       state->_cam_intrinsics_cameras.at(calib.first)->set_value(calib.second->value());
     }
   }
+}
+
+StateHelper::UpdateDiagnostics StateHelper::compute_update_diagnostics(
+    std::shared_ptr<State> state,
+    const std::vector<std::shared_ptr<Type>> &H_order,
+    const Eigen::MatrixXd &H,
+    const Eigen::VectorXd &res,
+    const Eigen::MatrixXd &R,
+    VisualYawUpdateMode visual_yaw_update_mode,
+    double visual_yaw_update_scale,
+    double visual_global_yaw_oc_alpha,
+    double visual_bgz_update_scale) {
+
+  UpdateDiagnostics out;
+  out.rows = (int)H.rows();
+  out.cols = (int)H.cols();
+  if (state == nullptr || res.rows() != R.rows() || H.rows() != res.rows())
+    return out;
+
+  int current_it = 0;
+  std::vector<int> H_id;
+  for (const auto &meas_var : H_order) {
+    H_id.push_back(current_it);
+    current_it += meas_var ? meas_var->size() : 0;
+  }
+
+  Eigen::MatrixXd H_eff = H;
+  if (visual_yaw_update_mode == VisualYawUpdateMode::GLOBAL_YAW_OC_PROJECTION) {
+    H_eff = project_global_yaw_from_H(state, H_order, H_id, H, visual_global_yaw_oc_alpha, false);
+  } else if (visual_yaw_update_mode == VisualYawUpdateMode::GLOBAL_YAW_OC_FEJ_PROJECTION) {
+    H_eff = project_global_yaw_from_H(state, H_order, H_id, H, visual_global_yaw_oc_alpha, true);
+  } else if (visual_yaw_update_mode == VisualYawUpdateMode::HARD_GYRO_YAW) {
+    H_eff = project_global_yaw_from_H(state, H_order, H_id, H, 1.0, false);
+  } else if (visual_yaw_update_mode == VisualYawUpdateMode::A_STRICT_YAW_DX0) {
+    H_eff = project_per_block_yaw_from_H(state, H_order, H_id, H, 0.0, false);
+  } else if (visual_yaw_update_mode == VisualYawUpdateMode::PER_BLOCK_SCALE ||
+             visual_yaw_update_mode == VisualYawUpdateMode::CURRENT_ONLY_SCALE) {
+    H_eff = project_per_block_yaw_from_H(state, H_order, H_id, H, visual_yaw_update_scale,
+                                         visual_yaw_update_mode == VisualYawUpdateMode::CURRENT_ONLY_SCALE);
+  }
+
+  out.valid = true;
+  out.residual_norm = res.norm();
+  out.H_norm = H_eff.norm();
+  double H_white_sq = 0.0;
+  for (int r = 0; r < R.rows() && r < H_eff.rows(); r++) {
+    const double var = R(r, r);
+    if (std::isfinite(var) && var > 1e-18)
+      H_white_sq += H_eff.row(r).squaredNorm() / var;
+  }
+  out.whitened_H_norm = std::sqrt(std::max(0.0, H_white_sq));
+
+  double H_yaw_sq = 0.0;
+  double H_bgz_sq = 0.0;
+  double H_pos_sq = 0.0;
+  double H_landmark_sq = 0.0;
+  double H_other_sq = 0.0;
+  for (size_t i = 0; i < H_order.size(); i++) {
+    const auto &var = H_order[i];
+    if (!var)
+      continue;
+    const int col = H_id[i];
+    const int sz = var->size();
+    if (col < 0 || col + sz > H_eff.cols())
+      continue;
+    const bool is_landmark = (std::dynamic_pointer_cast<Landmark>(var) != nullptr);
+    const bool is_bg = (state->_imu != nullptr && state->_imu->bg() != nullptr && var == state->_imu->bg());
+    if (is_landmark) {
+      H_landmark_sq += H_eff.block(0, col, H_eff.rows(), sz).squaredNorm();
+    } else if (is_bg && sz >= 3) {
+      H_bgz_sq += H_eff.col(col + 2).squaredNorm();
+      H_other_sq += H_eff.block(0, col, H_eff.rows(), sz).squaredNorm();
+    } else if (sz >= 6) {
+      H_yaw_sq += H_eff.col(col + 2).squaredNorm();
+      H_pos_sq += H_eff.block(0, col + 3, H_eff.rows(), 3).squaredNorm();
+    } else {
+      H_other_sq += H_eff.block(0, col, H_eff.rows(), sz).squaredNorm();
+    }
+  }
+  out.H_yaw_col_norm = std::sqrt(std::max(0.0, H_yaw_sq));
+  out.H_bgz_col_norm = std::sqrt(std::max(0.0, H_bgz_sq));
+  out.H_pos_col_norm = std::sqrt(std::max(0.0, H_pos_sq));
+  out.H_landmark_norm = std::sqrt(std::max(0.0, H_landmark_sq));
+  out.H_other_norm = std::sqrt(std::max(0.0, H_other_sq));
+
+  Eigen::MatrixXd M_a = Eigen::MatrixXd::Zero(state->_Cov.rows(), res.rows());
+  for (const auto &var : state->_variables) {
+    Eigen::MatrixXd M_i = Eigen::MatrixXd::Zero(var->size(), res.rows());
+    for (size_t i = 0; i < H_order.size(); i++) {
+      std::shared_ptr<Type> meas_var = H_order[i];
+      M_i.noalias() += state->_Cov.block(var->id(), meas_var->id(), var->size(), meas_var->size()) *
+                       H_eff.block(0, H_id[i], H_eff.rows(), meas_var->size()).transpose();
+    }
+    M_a.block(var->id(), 0, var->size(), res.rows()) = M_i;
+  }
+
+  Eigen::MatrixXd P_small = StateHelper::get_marginal_covariance(state, H_order);
+  Eigen::MatrixXd HPH(R.rows(), R.rows());
+  HPH.triangularView<Eigen::Upper>() = H_eff * P_small * H_eff.transpose();
+  Eigen::MatrixXd S = HPH.selfadjointView<Eigen::Upper>();
+  S += R;
+  out.HPH_trace = HPH.diagonal().sum();
+  out.R_trace = R.trace();
+  out.HPH_over_R = (std::fabs(out.R_trace) > 1e-18) ? out.HPH_trace / out.R_trace
+                                                    : std::numeric_limits<double>::quiet_NaN();
+
+  Eigen::MatrixXd S_full = S.selfadjointView<Eigen::Upper>();
+  Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(S_full);
+  if (es.info() == Eigen::Success && es.eigenvalues().rows() > 0) {
+    out.S_min_eig = es.eigenvalues().minCoeff();
+    out.S_max_eig = es.eigenvalues().maxCoeff();
+    out.S_cond = (out.S_min_eig > 1e-18) ? out.S_max_eig / out.S_min_eig
+                                         : std::numeric_limits<double>::infinity();
+  }
+
+  Eigen::MatrixXd Sinv = Eigen::MatrixXd::Identity(R.rows(), R.rows());
+  S_full.llt().solveInPlace(Sinv);
+  Eigen::MatrixXd K = M_a * Sinv.selfadjointView<Eigen::Upper>();
+  if (visual_bgz_update_scale < 1.0 - 1e-12 &&
+      state->_imu != nullptr && state->_imu->bg() != nullptr) {
+    const int bgz_row = state->_imu->bg()->id() + 2;
+    if (bgz_row >= 0 && bgz_row < (int)K.rows())
+      K.row(bgz_row) *= visual_bgz_update_scale;
+  }
+
+  Eigen::VectorXd dx = K * res;
+  if (visual_yaw_update_mode == VisualYawUpdateMode::HARD_GYRO_YAW) {
+    zero_visual_yaw_dx(state, dx, true);
+  } else if (visual_yaw_update_mode == VisualYawUpdateMode::A_STRICT_YAW_DX0) {
+    zero_visual_yaw_dx(state, dx, false);
+  }
+
+  out.dx_norm = dx.norm();
+  out.dx_yaw_deg = yaw_dx_component_deg(state, dx);
+
+  const auto &q_var = (state->_imu != nullptr) ? state->_imu->q() : nullptr;
+  const auto &p_var = (state->_imu != nullptr) ? state->_imu->p() : nullptr;
+  const auto &bg_var = (state->_imu != nullptr) ? state->_imu->bg() : nullptr;
+  constexpr double rad_to_deg = 180.0 / 3.14159265358979323846;
+  Eigen::Vector3d g_local = Eigen::Vector3d::UnitZ();
+  if (state->_imu != nullptr) {
+    g_local = state->_imu->Rot() * Eigen::Vector3d::UnitZ();
+    const double gn = g_local.norm();
+    if (gn > 1e-12)
+      g_local /= gn;
+  }
+
+  if (q_var != nullptr && q_var->id() >= 0 && q_var->id() + 3 <= K.rows()) {
+    Eigen::RowVectorXd K_yaw = g_local.transpose() * K.block(q_var->id(), 0, 3, K.cols());
+    out.K_yaw_row_norm = K_yaw.norm() * rad_to_deg;
+    Eigen::Matrix3d Pqq = state->_Cov.block(q_var->id(), q_var->id(), 3, 3);
+    out.P_yaw_var = g_local.dot(Pqq * g_local);
+  }
+  if (bg_var != nullptr && bg_var->id() >= 0 && bg_var->id() + 3 <= K.rows()) {
+    const int bgz = bg_var->id() + 2;
+    out.dx_bgz = dx(bgz);
+    out.K_bgz_row_norm = K.row(bgz).norm();
+    out.P_bgz_var = state->_Cov(bgz, bgz);
+    if (q_var != nullptr && q_var->id() >= 0 && q_var->id() + 3 <= state->_Cov.rows()) {
+      const double cov = (g_local.transpose() * state->_Cov.block(q_var->id(), bgz, 3, 1))(0, 0);
+      const double den = std::sqrt(std::max(0.0, out.P_yaw_var * out.P_bgz_var));
+      out.corr_yaw_bgz = den > 1e-18 ? cov / den : std::numeric_limits<double>::quiet_NaN();
+    }
+  }
+  if (p_var != nullptr && p_var->id() >= 0 && p_var->id() + 3 <= K.rows()) {
+    out.dx_pos_norm = dx.segment(p_var->id(), 3).norm();
+    out.K_pos_row_norm = K.block(p_var->id(), 0, 3, K.cols()).norm();
+    out.P_pos_trace = state->_Cov.block(p_var->id(), p_var->id(), 3, 3).trace();
+    if (q_var != nullptr && q_var->id() >= 0 && q_var->id() + 3 <= state->_Cov.rows()) {
+      const double den_x = std::sqrt(std::max(0.0, out.P_yaw_var * state->_Cov(p_var->id() + 0, p_var->id() + 0)));
+      const double den_y = std::sqrt(std::max(0.0, out.P_yaw_var * state->_Cov(p_var->id() + 1, p_var->id() + 1)));
+      const double cov_x = (g_local.transpose() * state->_Cov.block(q_var->id(), p_var->id() + 0, 3, 1))(0, 0);
+      const double cov_y = (g_local.transpose() * state->_Cov.block(q_var->id(), p_var->id() + 1, 3, 1))(0, 0);
+      out.corr_yaw_px = den_x > 1e-18 ? cov_x / den_x : std::numeric_limits<double>::quiet_NaN();
+      out.corr_yaw_py = den_y > 1e-18 ? cov_y / den_y : std::numeric_limits<double>::quiet_NaN();
+    }
+  }
+
+  double lm_dx_sq = 0.0;
+  double lm_K_sq = 0.0;
+  double pose_lm_cov_sq = 0.0;
+  for (const auto &var : H_order) {
+    auto lm = std::dynamic_pointer_cast<Landmark>(var);
+    if (!lm || lm->id() < 0 || lm->id() + lm->size() > K.rows())
+      continue;
+    lm_dx_sq += dx.segment(lm->id(), lm->size()).squaredNorm();
+    lm_K_sq += K.block(lm->id(), 0, lm->size(), K.cols()).squaredNorm();
+    if (q_var != nullptr && q_var->id() >= 0 && q_var->id() + 3 <= state->_Cov.rows())
+      pose_lm_cov_sq += state->_Cov.block(q_var->id(), lm->id(), 3, lm->size()).squaredNorm();
+    if (p_var != nullptr && p_var->id() >= 0 && p_var->id() + 3 <= state->_Cov.rows())
+      pose_lm_cov_sq += state->_Cov.block(p_var->id(), lm->id(), 3, lm->size()).squaredNorm();
+  }
+  out.dx_landmark_norm = std::sqrt(std::max(0.0, lm_dx_sq));
+  out.K_landmark_row_norm = std::sqrt(std::max(0.0, lm_K_sq));
+  out.pose_landmark_cov_norm = std::sqrt(std::max(0.0, pose_lm_cov_sq));
+  return out;
+}
+
+Eigen::VectorXd StateHelper::compute_update_dx(std::shared_ptr<State> state,
+                                               const std::vector<std::shared_ptr<Type>> &H_order,
+                                               const Eigen::MatrixXd &H,
+                                               const Eigen::VectorXd &res,
+                                               const Eigen::MatrixXd &R,
+                                               VisualYawUpdateMode visual_yaw_update_mode,
+                                               double visual_yaw_update_scale,
+                                               double visual_global_yaw_oc_alpha,
+                                               double visual_bgz_update_scale) {
+  assert(res.rows() == R.rows());
+  assert(H.rows() == res.rows());
+
+  Eigen::MatrixXd M_a = Eigen::MatrixXd::Zero(state->_Cov.rows(), res.rows());
+  int current_it = 0;
+  std::vector<int> H_id;
+  for (const auto &meas_var : H_order) {
+    H_id.push_back(current_it);
+    current_it += meas_var->size();
+  }
+
+  Eigen::MatrixXd H_eff = H;
+  if (visual_yaw_update_mode == VisualYawUpdateMode::GLOBAL_YAW_OC_PROJECTION) {
+    H_eff = project_global_yaw_from_H(state, H_order, H_id, H, visual_global_yaw_oc_alpha, false);
+  } else if (visual_yaw_update_mode == VisualYawUpdateMode::GLOBAL_YAW_OC_FEJ_PROJECTION) {
+    H_eff = project_global_yaw_from_H(state, H_order, H_id, H, visual_global_yaw_oc_alpha, true);
+  } else if (visual_yaw_update_mode == VisualYawUpdateMode::HARD_GYRO_YAW) {
+    H_eff = project_global_yaw_from_H(state, H_order, H_id, H, 1.0, false);
+  } else if (visual_yaw_update_mode == VisualYawUpdateMode::A_STRICT_YAW_DX0) {
+    H_eff = project_per_block_yaw_from_H(state, H_order, H_id, H, 0.0, false);
+  } else if (visual_yaw_update_mode == VisualYawUpdateMode::PER_BLOCK_SCALE ||
+             visual_yaw_update_mode == VisualYawUpdateMode::CURRENT_ONLY_SCALE) {
+    H_eff = project_per_block_yaw_from_H(state, H_order, H_id, H, visual_yaw_update_scale,
+                                         visual_yaw_update_mode == VisualYawUpdateMode::CURRENT_ONLY_SCALE);
+  }
+
+  for (const auto &var : state->_variables) {
+    Eigen::MatrixXd M_i = Eigen::MatrixXd::Zero(var->size(), res.rows());
+    for (size_t i = 0; i < H_order.size(); i++) {
+      std::shared_ptr<Type> meas_var = H_order[i];
+      M_i.noalias() += state->_Cov.block(var->id(), meas_var->id(), var->size(), meas_var->size()) *
+                       H_eff.block(0, H_id[i], H_eff.rows(), meas_var->size()).transpose();
+    }
+    M_a.block(var->id(), 0, var->size(), res.rows()) = M_i;
+  }
+
+  Eigen::MatrixXd P_small = StateHelper::get_marginal_covariance(state, H_order);
+  Eigen::MatrixXd S(R.rows(), R.rows());
+  S.triangularView<Eigen::Upper>() = H_eff * P_small * H_eff.transpose();
+  S.triangularView<Eigen::Upper>() += R;
+  Eigen::MatrixXd Sinv = Eigen::MatrixXd::Identity(R.rows(), R.rows());
+  S.selfadjointView<Eigen::Upper>().llt().solveInPlace(Sinv);
+  Eigen::MatrixXd K = M_a * Sinv.selfadjointView<Eigen::Upper>();
+
+  if (visual_bgz_update_scale < 1.0 - 1e-12 &&
+      state->_imu != nullptr && state->_imu->bg() != nullptr) {
+    int bgz_row = state->_imu->bg()->id() + 2;
+    if (bgz_row >= 0 && bgz_row < (int)K.rows())
+      K.row(bgz_row) *= visual_bgz_update_scale;
+  }
+
+  Eigen::VectorXd dx = K * res;
+  if (visual_yaw_update_mode == VisualYawUpdateMode::HARD_GYRO_YAW) {
+    zero_visual_yaw_dx(state, dx, true);
+  } else if (visual_yaw_update_mode == VisualYawUpdateMode::A_STRICT_YAW_DX0) {
+    zero_visual_yaw_dx(state, dx, false);
+  }
+  return dx;
+}
+
+double StateHelper::yaw_delta_from_full_dx_deg(std::shared_ptr<State> state, const Eigen::VectorXd &dx) {
+  return yaw_dx_component_deg(state, dx);
 }
 
 void StateHelper::EKFUpdateSchmidt(std::shared_ptr<State> state,
@@ -1655,22 +1926,127 @@ void StateHelper::EKFUpdateJoseph(std::shared_ptr<State> state,
                                    const Eigen::VectorXd &K_full,
                                    const Eigen::VectorXd &H_full,
                                    double R, double res) {
+  JosephUpdateHealth health;
+  if (!EKFUpdateJosephChecked(state, K_full, H_full, R, res, false, &health)) {
+    PRINT_ERROR(RED "StateHelper::EKFUpdateJoseph() - rejected numerically invalid Joseph update "
+                    "(finite=%d sym=%.3e min_diag=%.3e)\n" RESET,
+                health.finite ? 1 : 0, health.symmetry_error, health.min_diagonal);
+  }
+}
+
+bool StateHelper::EKFUpdateJosephChecked(std::shared_ptr<State> state,
+                                          const Eigen::VectorXd &K_full,
+                                          const Eigen::VectorXd &H_full,
+                                          double R, double res,
+                                          bool check_psd,
+                                          JosephUpdateHealth *health) {
   const int N = (int)state->_Cov.rows();
   assert((int)K_full.rows() == N);
   assert((int)H_full.rows() == N);
 
+  JosephUpdateHealth out;
+  out.psd_checked = check_psd;
+  if (!std::isfinite(R) || R <= 0.0 || !std::isfinite(res) ||
+      !K_full.allFinite() || !H_full.allFinite() || !state->_Cov.allFinite()) {
+    if (health) *health = out;
+    return false;
+  }
+
+  // Form the candidate transactionally: a failed health check leaves both P
+  // and the nominal state untouched.
+  Eigen::MatrixXd P_candidate = state->_Cov;
+  josephCovUpdate(P_candidate, K_full, H_full, R);
+  P_candidate = 0.5 * (P_candidate + P_candidate.transpose());
+
+  out.finite = P_candidate.allFinite();
+  out.symmetry_error = out.finite
+                           ? (P_candidate - P_candidate.transpose()).norm()
+                           : std::numeric_limits<double>::infinity();
+  out.symmetric = out.finite && out.symmetry_error <= 1e-10;
+  out.min_diagonal = out.finite ? P_candidate.diagonal().minCoeff()
+                                : -std::numeric_limits<double>::infinity();
+  const double diag_scale = out.finite
+                                ? std::max(1.0, P_candidate.diagonal().cwiseAbs().maxCoeff())
+                                : 1.0;
+  const double diag_tol = 1e-12 * diag_scale;
+  out.nonnegative_diagonal = out.finite && out.min_diagonal >= -diag_tol;
+
+  // Eliminate only roundoff-sized negative diagonals. Material negative values
+  // reject the complete update below.
+  if (out.nonnegative_diagonal) {
+    for (int i = 0; i < N; i++) {
+      if (P_candidate(i, i) < 0.0) P_candidate(i, i) = 0.0;
+    }
+    out.min_diagonal = P_candidate.diagonal().minCoeff();
+  }
+
+  out.psd = !check_psd;
+  if (out.finite && out.symmetric && out.nonnegative_diagonal && check_psd) {
+    const double psd_tol = 1e-10 * diag_scale;
+    Eigen::LDLT<Eigen::MatrixXd> ldlt(P_candidate);
+    if (ldlt.info() == Eigen::Success && ldlt.vectorD().allFinite()) {
+      out.min_ldlt_diagonal = ldlt.vectorD().minCoeff();
+      out.psd = out.min_ldlt_diagonal >= -psd_tol;
+    } else {
+      // LDLT (no definiteness pivoting) returns a non-finite D on a *singular*
+      // but valid PSD covariance — routine in VIO (rank-deficient / near-
+      // unobservable directions, freshly initialized landmarks). A Joseph
+      // update of a PSD prior is provably PSD, so falling through to "not PSD"
+      // here false-rejects healthy GPS-Z updates. Fall back to the true minimum
+      // eigenvalue (always well defined for a symmetric matrix) instead.
+      Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(P_candidate, Eigen::EigenvaluesOnly);
+      if (es.info() == Eigen::Success && es.eigenvalues().allFinite()) {
+        out.min_ldlt_diagonal = es.eigenvalues().minCoeff();
+        out.psd = out.min_ldlt_diagonal >= -psd_tol;
+      } else {
+        out.psd = false;  // genuinely unfactorable / non-symmetric-spectrum -> reject
+      }
+    }
+  }
+
+  const Eigen::VectorXd dx = K_full * res;
+  const bool valid = out.finite && out.symmetric && out.nonnegative_diagonal &&
+                     out.psd && dx.allFinite();
+  if (!valid) {
+    if (health) *health = out;
+    return false;
+  }
+
+  state->_Cov = std::move(P_candidate);
+
   // Covariance update — Joseph form (K_full may have zeroed entries for masking)
-  josephCovUpdate(state->_Cov, K_full, H_full, R);
+  // Covariance candidate was committed above after all requested checks.
 
   // State correction: dx = K_full * res
   // Variables with all-zero K block are skipped (masked out).
-  const Eigen::VectorXd dx = K_full * res;
   for (const auto &var : state->_variables) {
     const int id = var->id(), sz = var->size();
     if (id < 0 || id + sz > N) continue;
     if (dx.segment(id, sz).norm() < 1e-18) continue;
     var->update(dx.segment(id, sz));
   }
+  if (health) *health = out;
+  return true;
+}
+
+// =============================================================================
+// computeLearUnderweightGain — NASA/Lear scalar measurement underweighting
+// Navigation Filter Best Practices, NTRS 20180003657 Eq. 4.36/4.38;
+// NTRS 20250002787 Eq. 5.36.  See StateHelper.h for the derivation.
+// =============================================================================
+Eigen::VectorXd StateHelper::computeLearUnderweightGain(
+    const Eigen::VectorXd &gain_numerator, double hph, double R, double beta,
+    double &R_eff_out, double &W_U_out) {
+  const double b = std::max(0.0, beta);
+  const double q = std::max(0.0, hph);
+  // Eq. 4.38 effective innovation variance and Eq. 4.36 additive residual noise.
+  W_U_out = (1.0 + b) * q + R;
+  R_eff_out = R + b * q;
+  if (!std::isfinite(W_U_out) || W_U_out <= 1e-18) {
+    // Degenerate prior — return a zero gain so the caller applies no update.
+    return Eigen::VectorXd::Zero(gain_numerator.size());
+  }
+  return gain_numerator / W_U_out;
 }
 
 // =============================================================================

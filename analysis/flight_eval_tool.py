@@ -36,6 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from flight_eval import (  # noqa: E402
     dashboard, gps_sampling, io, metrics, plotting, provenance,
     reports, run_spec, segmentation, time_alignment, trajectory, lk_only,
+    validate_segments,
 )
 
 
@@ -226,8 +227,7 @@ def cmd_single(args):
                           velocity_source=ref_src, lk_available=lk.available)
         if lk.diagnostic is not None:
             plotting.plot_lk_yaw_diagnostic(lk.diagnostic, dirs["plots"])
-        plotting.plot_plotly_html(df, dirs["plots"])
-        st.ok("plots", "static + plotly")
+        st.ok("plots", "static svg")
     except Exception as e:  # noqa: BLE001
         st.warn(f"绘图部分失败（不阻断）: {e}")
 
@@ -330,6 +330,30 @@ def cmd_build_fc_gps(args):
 
 
 # --------------------------------------------------------------------------- #
+# lk-flow （LK 光流前端 → lk_flow_csv，供 lk_only 构建诊断轨迹）
+# --------------------------------------------------------------------------- #
+def cmd_lk_flow(args):
+    import lk_flow_frontend as lkf
+    if lkf.cv2 is None:
+        raise SystemExit("需要 OpenCV：pip install opencv-python")
+    if args.dataset:
+        it = lkf.frames_from_dataset(args.dataset, args.stride, args.max_frames)
+    elif args.video and args.timestamps:
+        it = lkf.frames_from_video(args.video, args.timestamps, args.stride, args.max_frames)
+    else:
+        raise SystemExit("需 --dataset，或 --video + --timestamps")
+    if args.calib:
+        import cv2
+        K, D = lkf.load_calib(args.calib)
+        if K is not None:
+            def _undist(gen):
+                for t, img in gen:
+                    yield t, cv2.undistort(img, K, D)
+            it = _undist(it)
+    lkf.run(it, args.out)
+
+
+# --------------------------------------------------------------------------- #
 # inspect-run
 # --------------------------------------------------------------------------- #
 def cmd_inspect_run(args):
@@ -389,6 +413,17 @@ def cmd_dashboard(args):
 
 
 # --------------------------------------------------------------------------- #
+# validate-segments
+# --------------------------------------------------------------------------- #
+def cmd_validate_segments(args):
+    code = validate_segments.print_report(
+        args.analysis_dir,
+        heading_tol_deg=args.heading_tol_deg,
+    )
+    sys.exit(code)
+
+
+# --------------------------------------------------------------------------- #
 def main():
     ap = argparse.ArgumentParser(description="OpenVINS 飞行试验评价工具")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -418,6 +453,16 @@ def main():
     p.add_argument("--out", required=True)
     p.set_defaults(func=cmd_build_fc_gps)
 
+    p = sub.add_parser("lk-flow", help="LK 光流前端：帧序列 → lk_flow_csv")
+    p.add_argument("--dataset", help="数据集目录（含 cam0/data.csv）")
+    p.add_argument("--video", help="视频文件")
+    p.add_argument("--timestamps", help="视频帧时间戳 CSV")
+    p.add_argument("--calib", help="标定 yaml（去畸变，可选）")
+    p.add_argument("--stride", type=int, default=1)
+    p.add_argument("--max-frames", type=int, default=0)
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=cmd_lk_flow)
+
     p = sub.add_parser("inspect-run", help="检查实验是否具备分析条件")
     p.add_argument("--run-spec", required=True)
     p.set_defaults(func=cmd_inspect_run)
@@ -425,6 +470,11 @@ def main():
     p = sub.add_parser("dashboard", help="仅重建离线交互页")
     p.add_argument("--analysis-dir", required=True)
     p.set_defaults(func=cmd_dashboard)
+
+    p = sub.add_parser("validate-segments", help="校验 refined segment 边界和 along/cross 指标")
+    p.add_argument("--analysis-dir", required=True)
+    p.add_argument("--heading-tol-deg", type=float, default=4.0)
+    p.set_defaults(func=cmd_validate_segments)
 
     args = ap.parse_args()
     args.func(args)

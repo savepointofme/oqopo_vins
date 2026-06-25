@@ -1,0 +1,20 @@
+%YAML:1.0
+
+# fly2 converged calib but with SAFE init toff (+0.36ms native) to avoid the
+# Propagator.cpp:110 dt assert that locking toff at -5.67ms + FC-init triggers.
+# Use with calib_cam_intrinsics/extrinsics=false (lock converged 389) and
+# calib_cam_timeoffset=true (let toff drift online to ~-5.67ms from safe init).
+cam0:
+  T_cam_imu:
+    - [0.99995797, -0.00282896,  0.00872137, -0.059]
+    - [-0.00277724, -0.99997852, -0.00593747,  0.019]
+    - [0.00873798,  0.00591300, -0.99994434,  0.022]
+    - [0.0,         0.0,         0.0,          1.0]
+  cam_overlaps: []
+  camera_model: pinhole
+  distortion_coeffs: [-0.044, 0.037, -0.001, 0.002]
+  distortion_model: radtan
+  intrinsics: [389.184, 390.123, 331.238, 239.428]
+  resolution: [640, 480]
+  rostopic: /camera/color/image_raw
+  timeshift_cam_imu: 0.00036100228856970673

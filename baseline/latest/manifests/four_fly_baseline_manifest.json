@@ -1,0 +1,54 @@
+{
+  "baseline": "latest_locked_20260625",
+  "repo_root": "/mnt/d/vscode_dir/open_vins",
+  "runner": "/mnt/d/vscode_dir/open_vins/build_ov_msckf/run_serial_msckf_ros_free",
+  "config": "/mnt/d/vscode_dir/open_vins/baseline/latest/config/estimator_config.yaml",
+  "default_stride": 12,
+  "control_stride": 1,
+  "common_stride_sweep": [1, 2, 4, 8, 12, 16, 20, 30],
+  "runtime_flags": {
+    "yaw_mode": "baseline",
+    "height_mode": "classic",
+    "gps_alt_update": true,
+    "gps_alt_sigma": 2.0,
+    "gps_alt_min_pzz": 0.01,
+    "gps_alt_min_t_after_init": 10.0,
+    "gps_alt_max_res": 80.0,
+    "gps_alt_guard_dxy": 0.5,
+    "gps_alt_guard_kxy": 5.0
+  },
+  "flights": {
+    "fly1": {
+      "dataset": "/mnt/c/Users/baloney/Desktop/20260517_gsmq_d455_fly1/d455_20260517_174810",
+      "gps": "/mnt/d/vscode_dir/open_vins/config/d455_fly1/fc_gps_cam_time.csv",
+      "fc_init": "/mnt/d/vscode_dir/open_vins/config/d455_fly1/fc_init_state_930.csv",
+      "start_time": 930.0,
+      "analysis_t0": 934.2,
+      "analysis_t1": 1644.8
+    },
+    "fly2": {
+      "dataset": "/mnt/c/Users/baloney/Desktop/20260518_gsmq_d455_fly2/d455_20260517_184722",
+      "gps": "/mnt/c/Users/baloney/Desktop/20260518_gsmq_d455_fly2/result/fc_rebuild_20260525/gps_from_mems_offset447p5_cam_time.csv",
+      "fc_init": "/mnt/c/Users/baloney/Desktop/20260518_gsmq_d455_fly2/result/fc_rebuild_20260525/canonical_offset447p5_start700/fc_init_state_700_offset447p5.csv",
+      "start_time": 700.0,
+      "analysis_t0": 704.2,
+      "analysis_t1": 846.8
+    },
+    "fly3": {
+      "dataset": "/mnt/c/Users/baloney/Desktop/20260527_gsmq_d455_fly3/d455_20260526_174946",
+      "gps": "/mnt/c/Users/baloney/Desktop/20260527_gsmq_d455_fly3/result/fc_rebuild_20260527/gps_from_mems_offset438p0_cam_time.csv",
+      "fc_init": "/mnt/c/Users/baloney/Desktop/20260527_gsmq_d455_fly3/result/fc_rebuild_20260527/canonical_offset438p0_start618/fc_init_state_618_offset438p0.csv",
+      "start_time": 618.0,
+      "analysis_t0": 622.2,
+      "analysis_t1": 1406.2
+    },
+    "fly4": {
+      "dataset": "/mnt/c/Users/baloney/Desktop/20260528_gsmq_d455_fly4/d455_20260527_090549",
+      "gps": "/mnt/c/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/fc_rebuild_20260528/gps_from_mems_offsetm202p2_cam_time.csv",
+      "fc_init": "/mnt/c/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/fc_rebuild_20260528/canonical_offsetm202p2_start904p4/fc_init_state_904p4_offsetm202p2.csv",
+      "start_time": 924.4,
+      "analysis_t0": 928.6,
+      "analysis_t1": 2436.2
+    }
+  }
+}

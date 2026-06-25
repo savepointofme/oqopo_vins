@@ -7,7 +7,7 @@
  *   - 所有误差线图叠加航段背景色带，gap 缺口有标注图例
  *   - 去掉全局 errMode/velMode 控制按钮（移入各图表标题栏）
  *   - 航段浏览器：新增沿/横/垂局部误差列，选中段自动滚动到可见区域
- *   - 航段明细：新增局部系沿/横/垂终点误差，使用段净位移航向
+ *   - 航段明细：新增局部系沿/横/垂终点误差，使用后端 segment_heading_deg
  *   - GPS 采样质量移入可折叠诊断面板，gap 标注有图例
  *   - LK 不可用时清晰显示原因
  */
@@ -41,7 +41,7 @@
   function segBgFill(stype) { if (stype === 'straight') return 'rgba(37,99,201,0.07)'; if (stype === 'connector' || stype === 'turn') return 'rgba(224,123,26,0.09)'; return 'rgba(154,163,173,0.09)'; }
   function segFgColor(stype) { if (stype === 'straight') return C.vio; if (stype === 'connector' || stype === 'turn') return C.lk; return C.muted; }
 
-  // Along/cross velocity projection (frontend, uses GPS course for both)
+  // Along/cross velocity projection helper for raw velocity traces.
   function vAlong(p, gps) { var c = p.gps_course_deg * Math.PI / 180, ve = gps ? p.gps_vE : p.vio_vE, vn = gps ? p.gps_vN : p.vio_vN; if (ve == null || vn == null) return null; return ve * Math.cos(c) + vn * Math.sin(c); }
   function vCross(p, gps) { var c = p.gps_course_deg * Math.PI / 180, ve = gps ? p.gps_vE : p.vio_vE, vn = gps ? p.gps_vN : p.vio_vN; if (ve == null || vn == null) return null; return -ve * Math.sin(c) + vn * Math.cos(c); }
 
@@ -203,59 +203,84 @@
     return { el: host, play: play, stop: stop, render: render };
   }
 
-  // ── segment start-aligned chart (uses GPS net-displacement heading) ────────
-  function segAlignChart(pts) {
-    var host = el('div'); var W = 720, H = 220, m = { l: 52, r: 16, t: 14, b: 30 }, iw = W - m.l - m.r, ih = H - m.t - m.b;
-    var svg = sv('svg', { viewBox: '0 0 ' + W + ' ' + H, style: 'width:100%;display:block;font-family:ui-monospace,monospace' }); host.appendChild(svg);
+  // ── segment start-aligned chart (equal scale + box zoom) ──────────────────
+  function segAlignChart(pts, seg) {
+    var host = el('div'); var W = 720, H = 250, m = { l: 54, r: 16, t: 18, b: 34 }, iw = W - m.l - m.r, ih = H - m.t - m.b;
     if (!pts || pts.length < 2) { host.appendChild(el('div', null, '<div style="padding:20px;color:var(--muted)">样本不足</div>')); return host; }
-    // GPS 净位移方向作为局部 along 轴（与 Python segment_errors 保持一致）
+    var tools = el('div'); tools.style.cssText = 'display:flex;justify-content:flex-end;align-items:center;gap:8px;padding:0 8px 4px;font-size:10.5px;color:var(--muted)';
+    tools.appendChild(el('span', null, '拖拽框选放大 · 双击还原 · 默认等比例 1:1'));
+    var reset = el('button', 'playbtn', '还原'); tools.appendChild(reset); host.appendChild(tools);
+    var svg = sv('svg', { viewBox: '0 0 ' + W + ' ' + H, style: 'width:100%;display:block;font-family:ui-monospace,monospace;user-select:none' }); host.appendChild(svg);
+
     var gE0 = pts[0].gps_E, gN0 = pts[0].gps_N, gEz = pts[pts.length - 1].gps_E, gNz = pts[pts.length - 1].gps_N;
-    var dE = gEz - gE0, dN = gNz - gN0, span = Math.hypot(dE, dN);
-    var ea, ec;
-    if (span >= 10) {
+    var dE = gEz - gE0, dN = gNz - gN0, span = Math.hypot(dE, dN), ea;
+    if (seg && seg.segment_heading_deg != null) {
+      var th = seg.segment_heading_deg * Math.PI / 180; ea = [Math.cos(th), Math.sin(th)];
+    } else if (span >= 10) {
       ea = [dE / span, dN / span];
     } else {
-      var cr = pts.map(function (p) { return p.gps_course_deg * Math.PI / 180; });
-      var cm = Math.cos(cr.reduce(function (a, b) { return a + b; }) / cr.length);
-      var sm = Math.sin(cr.reduce(function (a, b) { return a + b; }) / cr.length);
-      var nm = Math.hypot(cm, sm); ea = nm > 0.05 ? [cm / nm, sm / nm] : [1, 0];
+      var mc = 0, ms = 0; pts.forEach(function (p) { var cr = p.gps_course_deg * Math.PI / 180; mc += Math.cos(cr); ms += Math.sin(cr); });
+      var nm = Math.hypot(mc, ms); ea = nm > 0.05 ? [mc / nm, ms / nm] : [1, 0];
     }
-    ec = [-ea[1], ea[0]];
-    function pjG(p) { var dE = p.gps_E - gE0, dN = p.gps_N - gN0; return { a: dE * ea[0] + dN * ea[1], c: dE * ec[0] + dN * ec[1] }; }
-    var vE0 = pts[0].vio_E, vN0 = pts[0].vio_N;
-    function pjV(p) { var dE = p.vio_E - vE0, dN = p.vio_N - vN0; return { a: dE * ea[0] + dN * ea[1], c: dE * ec[0] + dN * ec[1] }; }
-    var g = pts.map(pjG), v = pts.map(pjV);
-    var aAll = g.concat(v).map(function (p) { return p.a; }), cAll = g.concat(v).map(function (p) { return p.c; });
-    var aMin = Math.min.apply(0, aAll), aMax = Math.max.apply(0, aAll), cMin = Math.min.apply(0, cAll), cMax = Math.max.apply(0, cAll);
-    var cpad = (cMax - cMin) * .30 || .5; cMin -= cpad; cMax += cpad;
-    function XA(a) { return m.l + (a - aMin) / ((aMax - aMin) || 1) * iw; }
-    function YC(cc) { return m.t + (1 - (cc - cMin) / ((cMax - cMin) || 1)) * ih; }
-    var exag = ((aMax - aMin) / iw) / (((cMax - cMin) / ih) || 1);
-    svg.appendChild(sv('line', { x1: m.l, x2: m.l + iw, y1: YC(0), y2: YC(0), stroke: '#bcc3cc', 'stroke-dasharray': '3 3' }));
-    ticks(cMin, cMax, 4).forEach(function (cc) { var t = sv('text', { x: m.l - 6, y: YC(cc) + 3, 'text-anchor': 'end', fill: C.muted, 'font-size': 9.5 }); t.textContent = cc.toFixed(1); svg.appendChild(t); });
-    function poly(arr, color, w) { var d = ''; arr.forEach(function (p, i) { d += (i ? 'L' : 'M') + XA(p.a).toFixed(1) + ' ' + YC(p.c).toFixed(1) + ' '; }); svg.appendChild(sv('path', { d: d, fill: 'none', stroke: color, 'stroke-width': w, 'stroke-linejoin': 'round' })); }
-    poly(g, C.gps, 2.2); poly(v, C.vio, 2);
-    svg.appendChild(sv('circle', { cx: XA(0), cy: YC(0), r: 5, fill: '#fff', stroke: C.ink, 'stroke-width': 2 }));
+    var ec = [-ea[1], ea[0]], vE0 = pts[0].vio_E, vN0 = pts[0].vio_N;
+    function pj(p, key, e0, n0) { var de = p[key + '_E'] - e0, dn = p[key + '_N'] - n0; return { a: de * ea[0] + dn * ea[1], c: de * ec[0] + dn * ec[1] }; }
+    var g = pts.map(function (p) { return pj(p, 'gps', gE0, gN0); });
+    var v = pts.map(function (p) { return pj(p, 'vio', vE0, vN0); });
     var ge = g[g.length - 1], ve = v[v.length - 1];
-    svg.appendChild(sv('rect', { x: XA(ge.a) - 4, y: YC(ge.c) - 4, width: 8, height: 8, fill: C.gps }));
-    svg.appendChild(sv('rect', { x: XA(ve.a) - 4, y: YC(ve.c) - 4, width: 8, height: 8, fill: C.vio }));
-    // along error arrow
-    svg.appendChild(sv('line', { x1: XA(ge.a), x2: XA(ve.a), y1: YC(0) - 6, y2: YC(0) - 6, stroke: C.along, 'stroke-width': 1.4, 'stroke-dasharray': '3 2' }));
-    var at = sv('text', { x: (XA(ge.a) + XA(ve.a)) / 2, y: YC(0) - 10, 'text-anchor': 'middle', fill: C.along, 'font-size': 9.5 }); at.textContent = '沿 ' + ve.a.toFixed(2) + 'm'; svg.appendChild(at);
-    // cross error arrow
-    svg.appendChild(sv('line', { x1: XA(ve.a), x2: XA(ve.a), y1: YC(0), y2: YC(ve.c), stroke: C.cross, 'stroke-width': 1.4, 'stroke-dasharray': '3 2' }));
-    var ct = sv('text', { x: XA(ve.a) + 6, y: (YC(0) + YC(ve.c)) / 2 + 3, fill: C.cross, 'font-size': 9.5 }); ct.textContent = '横 ' + ve.c.toFixed(2) + 'm'; svg.appendChild(ct);
-    var xl = sv('text', { x: m.l + iw, y: H - 3, 'text-anchor': 'end', fill: C.ink, 'font-size': 10, 'font-family': 'sans-serif' }); xl.textContent = '沿航向 along / m（GPS 起止点净位移方向）'; svg.appendChild(xl);
-    var yl = sv('text', { x: 4, y: 10, fill: C.ink, 'font-size': 10, 'font-family': 'sans-serif' }); yl.textContent = '横 / m (放大 ×' + exag.toFixed(0) + ')'; svg.appendChild(yl);
-    return host;
+    var finalAlong = seg && seg.local_final_along_error_m != null ? +seg.local_final_along_error_m : (ve.a - ge.a);
+    var finalCross = seg && seg.local_final_cross_error_m != null ? +seg.local_final_cross_error_m : (ve.c - ge.c);
+    var errEnd = { a: ge.a + finalAlong, c: ge.c + finalCross };
+
+    function equalView(raw) {
+      var ac = (raw[0] + raw[1]) / 2, cc = (raw[2] + raw[3]) / 2;
+      var as = Math.max(raw[1] - raw[0], .5), cs = Math.max(raw[3] - raw[2], .5), ratio = iw / ih;
+      if (as / cs > ratio) cs = as / ratio; else as = cs * ratio;
+      return [ac - as / 2, ac + as / 2, cc - cs / 2, cc + cs / 2];
+    }
+    var all = g.concat(v).concat([errEnd]), aa = all.map(function (p) { return p.a; }), ca = all.map(function (p) { return p.c; });
+    var raw = [Math.min.apply(0, aa), Math.max.apply(0, aa), Math.min.apply(0, ca), Math.max.apply(0, ca)];
+    var ap = Math.max((raw[1] - raw[0]) * .06, .5), cp = Math.max((raw[3] - raw[2]) * .10, .5);
+    var base = equalView([raw[0] - ap, raw[1] + ap, raw[2] - cp, raw[3] + cp]), view = base.slice();
+    var clipId = 'segclip-' + (seg ? seg.segment_id : 'x');
+    var defs = sv('defs', {}), clip = sv('clipPath', { id: clipId }); clip.appendChild(sv('rect', { x: m.l, y: m.t, width: iw, height: ih })); defs.appendChild(clip); svg.appendChild(defs);
+    var gAxes = sv('g', {}), gData = sv('g', { 'clip-path': 'url(#' + clipId + ')' }), gSelect = sv('g', {}); svg.appendChild(gAxes); svg.appendChild(gData); svg.appendChild(gSelect);
+    function XA(a) { return m.l + (a - view[0]) / (view[1] - view[0] || 1) * iw; }
+    function YC(c) { return m.t + (1 - (c - view[2]) / (view[3] - view[2] || 1)) * ih; }
+    function poly(arr, color, width) { var d = ''; arr.forEach(function (p, i) { d += (i ? 'L' : 'M') + XA(p.a).toFixed(1) + ' ' + YC(p.c).toFixed(1) + ' '; }); gData.appendChild(sv('path', { d: d, fill: 'none', stroke: color, 'stroke-width': width, 'stroke-linejoin': 'round' })); }
+    function render() {
+      gAxes.textContent = ''; gData.textContent = '';
+      ticks(view[0], view[1], 5).forEach(function (a) { gAxes.appendChild(sv('line', { x1: XA(a), x2: XA(a), y1: m.t, y2: m.t + ih, stroke: C.line2 })); var tx = sv('text', { x: XA(a), y: H - 17, 'text-anchor': 'middle', fill: C.muted, 'font-size': 9.5 }); tx.textContent = Math.abs(a) >= 100 ? a.toFixed(0) : a.toFixed(1); gAxes.appendChild(tx); });
+      ticks(view[2], view[3], 4).forEach(function (c) { gAxes.appendChild(sv('line', { x1: m.l, x2: m.l + iw, y1: YC(c), y2: YC(c), stroke: C.line2 })); var ty = sv('text', { x: m.l - 6, y: YC(c) + 3, 'text-anchor': 'end', fill: C.muted, 'font-size': 9.5 }); ty.textContent = Math.abs(c) >= 100 ? c.toFixed(0) : c.toFixed(1); gAxes.appendChild(ty); });
+      if (view[2] <= 0 && view[3] >= 0) gAxes.appendChild(sv('line', { x1: m.l, x2: m.l + iw, y1: YC(0), y2: YC(0), stroke: '#bcc3cc', 'stroke-dasharray': '3 3' }));
+      poly(g, C.gps, 2.2); poly(v, C.vio, 2);
+      gData.appendChild(sv('circle', { cx: XA(0), cy: YC(0), r: 5, fill: '#fff', stroke: C.ink, 'stroke-width': 2 }));
+      gData.appendChild(sv('rect', { x: XA(ge.a) - 4, y: YC(ge.c) - 4, width: 8, height: 8, fill: C.gps }));
+      gData.appendChild(sv('rect', { x: XA(ve.a) - 4, y: YC(ve.c) - 4, width: 8, height: 8, fill: C.vio }));
+      gData.appendChild(sv('line', { x1: XA(ge.a), x2: XA(ge.a + finalAlong), y1: YC(ge.c) - 6, y2: YC(ge.c) - 6, stroke: C.along, 'stroke-width': 1.6, 'stroke-dasharray': '3 2' }));
+      var at = sv('text', { x: (XA(ge.a) + XA(ge.a + finalAlong)) / 2, y: YC(ge.c) - 10, 'text-anchor': 'middle', fill: C.along, 'font-size': 9.5 }); at.textContent = '沿 ' + finalAlong.toFixed(2) + 'm'; gData.appendChild(at);
+      gData.appendChild(sv('line', { x1: XA(ge.a + finalAlong), x2: XA(ge.a + finalAlong), y1: YC(ge.c), y2: YC(ge.c + finalCross), stroke: C.cross, 'stroke-width': 1.6, 'stroke-dasharray': '3 2' }));
+      var ct = sv('text', { x: XA(ge.a + finalAlong) + 6, y: (YC(ge.c) + YC(ge.c + finalCross)) / 2 + 3, fill: C.cross, 'font-size': 9.5 }); ct.textContent = '横 ' + finalCross.toFixed(2) + 'm'; gData.appendChild(ct);
+      var xl = sv('text', { x: m.l + iw, y: H - 3, 'text-anchor': 'end', fill: C.ink, 'font-size': 10, 'font-family': 'sans-serif' }); xl.textContent = '段固定沿轴 / m（轴角 ' + f(seg && seg.segment_heading_deg, 1) + '°）'; gAxes.appendChild(xl);
+      var yl = sv('text', { x: 4, y: 11, fill: C.ink, 'font-size': 10, 'font-family': 'sans-serif' }); yl.textContent = '段固定横轴 / m（等比例）'; gAxes.appendChild(yl);
+    }
+    var drag = null, box = sv('rect', { fill: 'rgba(37,99,201,.10)', stroke: C.vio, 'stroke-width': 1, 'stroke-dasharray': '4 3', opacity: 0 }); gSelect.appendChild(box);
+    var hit = sv('rect', { x: m.l, y: m.t, width: iw, height: ih, fill: 'transparent', cursor: 'crosshair' }); gSelect.appendChild(hit);
+    function point(e) { var r = svg.getBoundingClientRect(); return [Math.max(m.l, Math.min(m.l + iw, (e.clientX - r.left) / r.width * W)), Math.max(m.t, Math.min(m.t + ih, (e.clientY - r.top) / r.height * H))]; }
+    hit.addEventListener('mousedown', function (e) { drag = point(e); box.setAttribute('x', drag[0]); box.setAttribute('y', drag[1]); box.setAttribute('width', 0); box.setAttribute('height', 0); box.setAttribute('opacity', 1); e.preventDefault(); });
+    hit.addEventListener('mousemove', function (e) { if (!drag) return; var p = point(e); box.setAttribute('x', Math.min(drag[0], p[0])); box.setAttribute('y', Math.min(drag[1], p[1])); box.setAttribute('width', Math.abs(p[0] - drag[0])); box.setAttribute('height', Math.abs(p[1] - drag[1])); });
+    function finish(e) { if (!drag) return; var p = point(e), x0 = Math.min(drag[0], p[0]), x1 = Math.max(drag[0], p[0]), y0 = Math.min(drag[1], p[1]), y1 = Math.max(drag[1], p[1]); drag = null; box.setAttribute('opacity', 0); if (x1 - x0 < 8 || y1 - y0 < 8) return; var a0 = view[0] + (x0 - m.l) / iw * (view[1] - view[0]), a1 = view[0] + (x1 - m.l) / iw * (view[1] - view[0]), c1 = view[3] - (y0 - m.t) / ih * (view[3] - view[2]), c0 = view[3] - (y1 - m.t) / ih * (view[3] - view[2]); view = equalView([a0, a1, c0, c1]); render(); }
+    hit.addEventListener('mouseup', finish); hit.addEventListener('mouseleave', function (e) { if (drag) finish(e); });
+    function restore() { view = base.slice(); box.setAttribute('opacity', 0); drag = null; render(); }
+    hit.addEventListener('dblclick', restore); reset.onclick = restore;
+    render(); return host;
   }
 
   // ── bar chart (drift) ─────────────────────────────────────────────────────
   function barChart(metric) {
     var host = el('div');
     var items = SEG.filter(function (s) { return st.segFilter === 'all' || (st.segFilter === 'straight' && s.segment_type === 'straight') || (st.segFilter === 'turn' && (s.segment_type === 'turn' || s.segment_type === 'connector')); })
-      .map(function (s) { return { id: s.segment_id, label: '#' + s.segment_id + ' ' + (s.segment_type === 'straight' ? '直' : (s.segment_type === 'turn' || s.segment_type === 'connector') ? '转' : '·'), value: metric === 'speed' ? s.speed_rmse_mps : s.local_drift_percent, color: segFgColor(s.segment_type) }; });
-    var W = 720, bh = 17, gap = 5, padL = 74, padR = 62, Hh = Math.max(60, items.length * (bh + gap) + 10);
+      .map(function (s) { return { id: s.segment_id, label: '#' + s.segment_id + ' ' + (s.segment_type === 'straight' ? '直' : (s.segment_type === 'turn' || s.segment_type === 'connector') ? '转' : '·'), value: metric === 'speed' ? s.speed_rmse_mps : s.local_drift_percent, driftM: s.local_final_xy_error_m, color: segFgColor(s.segment_type) }; });
+    var W = 720, bh = 17, gap = 5, padL = 74, padR = metric === 'speed' ? 82 : 132, Hh = Math.max(60, items.length * (bh + gap) + 10);
     var svg = sv('svg', { viewBox: '0 0 ' + W + ' ' + Hh, style: 'width:100%;display:block;font-family:ui-monospace,monospace' }); host.appendChild(svg);
     var max = Math.max.apply(0, items.map(function (d) { return d.value || 0; })) * 1.12 || 1;
     function X(v) { return padL + (v / max) * (W - padL - padR); }
@@ -264,7 +289,8 @@
       var gg = sv('g', { cursor: 'pointer' }); gg.appendChild(sv('rect', { x: 0, y: y - 2, width: W, height: bh + 4, fill: seld ? 'rgba(139,92,246,.10)' : 'transparent' }));
       var l = sv('text', { x: padL - 6, y: y + bh / 2 + 3, 'text-anchor': 'end', fill: C.muted, 'font-size': 9 }); l.textContent = d.label; gg.appendChild(l);
       gg.appendChild(sv('rect', { x: padL, y: y, width: Math.max(1, X(d.value || 0) - padL), height: bh, rx: 2, fill: seld ? C.sel : d.color, opacity: d.value == null ? .25 : 1 }));
-      var vt = sv('text', { x: X(d.value || 0) + 6, y: y + bh / 2 + 3, fill: C.muted, 'font-size': 9 }); vt.textContent = d.value == null ? 'n/a' : f(d.value, metric === 'speed' ? 3 : 2) + (metric === 'speed' ? ' m/s' : '%'); gg.appendChild(vt);
+      var vt = sv('text', { x: X(d.value || 0) + 6, y: y + bh / 2 + 3, fill: C.muted, 'font-size': 9 });
+      vt.textContent = d.value == null ? 'n/a' : (metric === 'speed' ? f(d.value, 3) + ' m/s' : f(d.value, 2) + '% / ' + f(d.driftM, 1) + ' m'); gg.appendChild(vt);
       gg.addEventListener('click', function () { selectSeg(d.id); }); svg.appendChild(gg);
     });
     return { el: host };
@@ -333,7 +359,7 @@
     var series = acv ? seriesACV : seriesENU;
     var c = lineChart({ data: scoped(), height: 210, zero: true, unit: ' m', yLabel: '位置误差/m', segBands: true, series: series });
     var modeBadge = modeBar('posMode', [['acv', '航迹系 along/cross'], ['enu', 'ENU']]);
-    var note = acv ? '沿/横/垂 = 全局投影至瞬时 GPS 航向（非段局部系）；段详情中可查段局部坐标系误差。' : 'ENU 三分量误差 + XY 模值参考线。背景色带标注航段类型（直线=蓝 转弯=橙 残段=灰）。';
+    var note = acv ? '全局沿/横分量按每个 GPS 时刻的瞬时航迹角在 XY 平面正交投影；高度 U/Z 单列。' : 'ENU 三分量误差 + XY 模值参考线。背景色带标注航段类型（直线=蓝 转弯=橙 残段=灰）。';
     return panel('位置误差（主面板）', 'm', note, c.el, { legend: legend(series, c), badge: modeBadge });
   }
 
@@ -391,7 +417,7 @@
   }
 
   // ── course error chart ─────────────────────────────────────────────────────
-  function chCourse() { var series = [{ key: 'c', label: 'VIO course − GPS course', color: C.err, f: function (p) { return p.course_err_deg; }, dp: 2 }]; var c = lineChart({ data: scoped(), height: 196, zero: true, unit: '°', yLabel: '航向误差/°', segBands: true, series: series }); return panel('航向误差', '°', '问题：是否存在持续增长的航向漂移（可解释横航向误差）？', c.el); }
+  function chCourse() { var series = [{ key: 'c', label: 'VIO course − GPS course', color: C.err, f: function (p) { return p.course_err_deg; }, dp: 2 }]; var c = lineChart({ data: scoped(), height: 196, zero: true, unit: '°', yLabel: '航迹角误差/°', segBands: true, series: series }); return panel('航迹角误差（速度方向）', '°', '这是水平速度方向 course 的差，不是姿态 yaw。RMSE 使用全程有效样本；终点误差另列。', c.el); }
 
   // ── diagnostics panel (collapsible, contains sampling chart) ─────────────
   function diagnosticsPanel() {
@@ -456,17 +482,17 @@
     var zh = s.segment_type === 'straight' ? '直线' : (s.segment_type === 'turn' || s.segment_type === 'connector') ? '转弯' : s.segment_type;
     box.appendChild(el('div', 'sdh', '<span class="stype ' + ((s.segment_type === 'turn' || s.segment_type === 'connector') ? 'turn' : 'straight') + '">' + zh + '</span><b>#' + s.segment_id + ' ' + (s.label || '') + '</b>'));
     function grid(title, color, rows) { box.appendChild(el('div', 'gh', title)).style.color = color; var g = el('div', 'g3'); rows.forEach(function (kv) { g.appendChild(el('div', null, '<div class="gk">' + kv[0] + '</div><div class="gv">' + kv[1] + '</div>')); }); box.appendChild(g); }
-    grid('段局部坐标系（主判据）— 段 GPS 净位移方向为沿航向', C.sel, [
+    grid('段局部固定轴（GPS 起终点连线）', C.sel, [
       ['里程', f(s.dist_m, 0) + ' m'],
       ['局部漂移率', s.local_drift_percent == null ? 'n/a' : f(s.local_drift_percent, 2) + '%'],
-      ['终点 XY 误差', f(s.local_final_xy_error_m, 2) + ' m'],
-      ['终点沿航向', f(s.local_final_along_error_m, 2) + ' m'],
-      ['终点横航向', f(s.local_final_cross_error_m, 2) + ' m'],
-      ['终点垂直', f(s.local_final_vertical_error_m, 2) + ' m'],
+      ['段内终点 XY 漂移', f(s.local_final_xy_error_m, 2) + ' m'],
+      ['段内终点沿轴', f(s.local_final_along_error_m, 2) + ' m'],
+      ['段内终点横轴', f(s.local_final_cross_error_m, 2) + ' m'],
+      ['段内终点垂直', f(s.local_final_vertical_error_m, 2) + ' m'],
     ]);
-    grid('段局部 RMSE（主判据）', C.ink, [
-      ['沿航向 RMSE', f(s.along_rmse_m, 2) + ' m'],
-      ['横航向 RMSE', f(s.cross_rmse_m, 2) + ' m'],
+    grid('段内起点对齐 RMSE（段固定轴）', C.ink, [
+      ['沿轴 RMSE', f(s.along_rmse_m, 2) + ' m'],
+      ['横轴 RMSE', f(s.cross_rmse_m, 2) + ' m'],
       ['垂直 RMSE', f(s.vertical_rmse_m, 2) + ' m'],
     ]);
     grid('全局累计误差（参考）', C.muted, [
@@ -476,8 +502,8 @@
     ]);
     box.appendChild(el('div', 'gh', '段内起点对齐轨迹（VIO 段起点平移到 GPS 段起点）')).style.color = C.gps;
     var pts = S.filter(function (p) { return p.t >= s.t_start && p.t <= s.t_end; });
-    box.appendChild(segAlignChart(pts));
-    box.appendChild(el('div', 'q', '以 GPS 净位移方向为沿轴（与上表 RMSE 一致），纵轴放大显示横向偏移。紫色箭头=沿航向误差，红色箭头=横航向误差。'));
+    box.appendChild(segAlignChart(pts, s));
+    box.appendChild(el('div', 'q', '段起点误差已归零；横纵轴默认同尺度，不再自动夸大横向偏移。紫=段固定沿轴误差，红=段固定横轴误差。拖拽可框选放大，双击或点击“还原”恢复全段。'));
     return box;
   }
 
@@ -507,8 +533,20 @@
   // ── cards ──────────────────────────────────────────────────────────────────
   function cards() {
     var wrap = el('div', 'cards');
-    var defs = [['总里程', SUM.gps_distance_km, 'km', 'okc'], ['飞行时长', SUM.duration_s, 's', ''], ['终点 XY 误差', SUM.final_xy_error_m, 'm', 'accent'], ['终点 XY 漂移', SUM.final_xy_drift_percent, '%', 'accent'], ['XY RMSE', SUM.xy_rmse_m, 'm', ''], ['速度 RMSE', SUM.speed_rmse_mps, 'm/s', ''], ['航向 RMSE', SUM.yaw_or_course_rmse_deg, '°', ''], ['有效样本', (Q.valid_aligned_count != null ? Q.valid_aligned_count : '—'), '/' + (Q.gps_sample_count || '—'), ''], ['VIO延迟 p95', Q.p95_delay_s, 's', Q.invalid_delay_count ? 'warnc' : '']];
-    defs.forEach(function (d) { var c = el('div', 'card ' + d[3]); c.innerHTML = '<div class="k">' + d[0] + '</div><div class="v">' + (d[1] == null ? '—' : d[1]) + ' <span class="u">' + d[2] + '</span></div>'; wrap.appendChild(c); });
+    var defs = [
+      ['总里程', SUM.gps_distance_km, 3, 'km', 'okc', 'GPS 水平累计里程'],
+      ['飞行时长', SUM.duration_s, 1, 's', '', '有效统计窗口时长'],
+      ['终点 XY 误差', SUM.final_xy_error_m, 2, 'm', 'accent', '最后一个有效样本的水平位置误差模值'],
+      ['终点 XY 漂移率', SUM.final_xy_drift_percent, 3, '%', 'accent', '终点 XY 误差 / GPS 水平总里程'],
+      ['XY 位置 RMSE', SUM.xy_rmse_m, 2, 'm', '', 'sqrt(mean((VIO_E-GPS_E)^2 + (VIO_N-GPS_N)^2))'],
+      ['水平速率差 RMSE', SUM.speed_rmse_mps, 3, 'm/s', '', 'sqrt(mean((|v_VIO,XY|-|v_GPS,XY|)^2))；不是速度向量 RMSE'],
+      ['水平速度向量 RMSE', SUM.vxy_vec_rmse_mps, 3, 'm/s', '', 'sqrt(mean((dvE)^2 + (dvN)^2))'],
+      ['航迹角 RMSE', SUM.yaw_or_course_rmse_deg, 2, '°', '', 'VIO 水平速度方向 − GPS 水平速度方向；不是姿态 yaw'],
+      ['终点航迹角误差', SUM.yaw_or_course_final_deg, 2, '°', '', '最后一个有效样本的 course 误差'],
+      ['有效样本', (Q.valid_aligned_count != null ? Q.valid_aligned_count : null), 0, '/' + (Q.gps_sample_count || '—'), '', '用于统计的 GPS 时间网格样本数'],
+      ['VIO延迟 p95', Q.p95_delay_s, 3, 's', Q.invalid_delay_count ? 'warnc' : '', 'GPS 时刻到首个后更新 VIO 状态的延迟 p95'],
+    ];
+    defs.forEach(function (d) { var c = el('div', 'card ' + d[4]); c.title = d[5]; c.innerHTML = '<div class="k">' + d[0] + '</div><div class="v">' + (d[1] == null || isNaN(d[1]) ? '—' : f(d[1], d[2])) + ' <span class="u">' + d[3] + '</span></div>'; wrap.appendChild(c); });
     return wrap;
   }
   function rowGrid(cols, items) { var g = el('div', 'rowgrid'); g.style.gridTemplateColumns = cols; items.forEach(function (i) { g.appendChild(i); }); return g; }
@@ -519,7 +557,7 @@
     bus = [];
     var body = el('div', 'dashbody');
     body.appendChild(controls());
-    var syn = el('div', 'syn2', '<b>OFFLINE</b><span>前端不重算指标，数值来自本次分析输出。位置误差面板：航迹系=全局投影至瞬时 GPS 航向，段局部系详见段明细。' + (fcFallback ? ' ⚠ 参考速度=位置差分 fallback。' : '') + '</span>');
+    var syn = el('div', 'syn2', '<b>OFFLINE</b><span>前端不重算全局指标。RMSE 均统计全部有效 GPS 时刻，不是终点值；全局沿/横=瞬时 GPS 航迹角投影，航段明细=段起点对齐后的固定轴诊断。' + (fcFallback ? ' ⚠ 参考速度=位置差分 fallback。' : '') + '</span>');
     body.appendChild(syn);
     body.appendChild(cards());
     // Row 1: trajectory + merged position error panel
@@ -535,9 +573,10 @@
     // Row 2: velocity (3-comp) + course error
     body.appendChild(rowGrid('1fr 1fr', [velPanel(), chCourse()]));
     // Row 3: velocity error (3-comp) + drift bars
-    body.appendChild(rowGrid('1fr 1.2fr', [velErrPanel(), panel('各段局部漂移率', '% (local, 段局部坐标系)', '段漂移率 = 局部终点 XY误差 / 里程 × 100。段局部系：GPS 净位移方向为沿轴，VIO 起点对齐 GPS 起点。', barChart('drift').el)]));
+    body.appendChild(rowGrid('1fr 1.2fr', [velErrPanel(), panel('各段局部漂移率', '% / m（段起点对齐）', '标签格式=漂移率 / 局部终点 XY 漂移，例如 1.00% / 10.0 m；漂移率 = 段内误差增量模值 / 段里程。', barChart('drift').el)]));
     // Row 4: diagnostics + GPS sampling
-    body.appendChild(rowGrid('1fr 1fr', [diagnosticsPanel(), panel('各段漂移 vs 段长诊断', 'm', '漂移条形（参考）。蓝=直线 橙=转弯 灰=残段。', barChart('speed').el, { badge: badge((Q.invalid_delay_count || 0) + ' 延迟 · ' + (Q.gps_gap_count || 0) + ' 缺口', 'warn') })]));
+    var qualityBad = (Q.invalid_delay_count || 0) + (Q.gps_gap_count || 0);
+    body.appendChild(rowGrid('1fr 1fr', [diagnosticsPanel(), panel('各段水平速率误差 RMSE', 'm/s', '每段 sqrt(mean((|v_VIO,XY|−|v_GPS,XY|)²))。这是速率标量误差，不是位置漂移。蓝=直线 橙=转弯 灰=残段。', barChart('speed').el, { badge: badge((Q.invalid_delay_count || 0) + ' 延迟 · ' + (Q.gps_gap_count || 0) + ' 缺口', qualityBad ? 'warn' : 'ok') })]));
     // Row 5: segment browser + detail
     body.appendChild(rowGrid('1fr 1.2fr', [segBrowser(), segDetail()]));
     // Row 6: provenance

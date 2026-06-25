@@ -50,6 +50,7 @@
 
 #include "UpdaterOptions.h"
 #include "VisualObservabilityPolicy.h"
+#include "VisualResidualDiag.h"
 #include "state/StateHelper.h"
 
 namespace ov_core {
@@ -108,6 +109,10 @@ public:
     vop_ = policy;
   }
 
+  void set_visual_residual_diag(std::shared_ptr<VisualResidualDiag> diag) {
+    visual_residual_diag_ = diag;
+  }
+
   // Aggregated OC diagnostics for the last update() call (over all features).
   struct OcBatchDiag {
     int n_features = 0;
@@ -136,6 +141,16 @@ public:
     int track_len_max_acc = 0;
     int track_len_sum_rej = 0;
     int track_len_max_rej = 0;
+    double chi2_threshold_sum_acc = 0.0;
+    double chi2_threshold_sum_rej = 0.0;
+    double chi2_threshold_max_acc = 0.0;
+    double chi2_threshold_max_rej = 0.0;
+    int uv_count_acc = 0;
+    int uv_count_rej = 0;
+    double uv_sum_u_acc = 0.0;
+    double uv_sum_v_acc = 0.0;
+    double uv_sum_u_rej = 0.0;
+    double uv_sum_v_rej = 0.0;
     // Triangulation rejection breakdown (from FeatureInitializer)
     ov_core::FeatureInitializer::TriBatchStats tri;
   };
@@ -160,6 +175,7 @@ protected:
   double visual_bgz_update_scale_ = 1.0;
 
   std::shared_ptr<VisualObservabilityPolicy> vop_;
+  std::shared_ptr<VisualResidualDiag> visual_residual_diag_;
 };
 
 } // namespace ov_msckf

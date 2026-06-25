@@ -77,9 +77,9 @@ def full_flight_report(spec, summary: dict, quality: dict, seg_err,
     ])
     if seg_err is not None and len(seg_err):
         lines.extend([
-            "| 圈/边 | 分段说明 | 长度m | 局部XY漂移率 | "
+            "| 圈/边 | 分段说明 | 长度m | 局部XY漂移率 | 沿航向尺度比例 | "
             "全局XY RMSE m | 垂直航线RMSE m |",
-            "|---|---|---:|---:|---:|---:|",
+            "|---|---|---:|---:|---:|---:|---:|",
         ])
         complete = seg_err[(seg_err["lap_id"] > 0) & (seg_err["side_id"] > 0)]
         for _, row in complete.iterrows():
@@ -87,6 +87,7 @@ def full_flight_report(spec, summary: dict, quality: dict, seg_err,
                 f"| 第{int(row['lap_id'])}圈/边{int(row['side_id'])} | "
                 f"{row['label']} | {row['dist_m']} | "
                 f"{_fmt(row['local_drift_percent'])} | "
+                f"{_fmt(row.get('scale_ratio_mean'))} | "
                 f"{row['global_xy_rmse_m']} | {row['cross_rmse_m']} |"
             )
 

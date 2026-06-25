@@ -24,7 +24,9 @@
 
 #include <Eigen/Eigen>
 #include <functional>
+#include <limits>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace ov_type {
@@ -227,6 +229,63 @@ public:
                         double visual_yaw_update_scale = 1.0,
                         double visual_global_yaw_oc_alpha = 0.0,
                         double visual_bgz_update_scale = 1.0);
+
+  struct UpdateDiagnostics {
+    bool valid = false;
+    int rows = 0;
+    int cols = 0;
+    double residual_norm = std::numeric_limits<double>::quiet_NaN();
+    double H_norm = std::numeric_limits<double>::quiet_NaN();
+    double whitened_H_norm = std::numeric_limits<double>::quiet_NaN();
+    double H_yaw_col_norm = std::numeric_limits<double>::quiet_NaN();
+    double H_bgz_col_norm = std::numeric_limits<double>::quiet_NaN();
+    double H_pos_col_norm = std::numeric_limits<double>::quiet_NaN();
+    double H_landmark_norm = std::numeric_limits<double>::quiet_NaN();
+    double H_other_norm = std::numeric_limits<double>::quiet_NaN();
+    double S_cond = std::numeric_limits<double>::quiet_NaN();
+    double S_min_eig = std::numeric_limits<double>::quiet_NaN();
+    double S_max_eig = std::numeric_limits<double>::quiet_NaN();
+    double HPH_trace = std::numeric_limits<double>::quiet_NaN();
+    double R_trace = std::numeric_limits<double>::quiet_NaN();
+    double HPH_over_R = std::numeric_limits<double>::quiet_NaN();
+    double dx_norm = std::numeric_limits<double>::quiet_NaN();
+    double dx_yaw_deg = std::numeric_limits<double>::quiet_NaN();
+    double dx_bgz = std::numeric_limits<double>::quiet_NaN();
+    double dx_pos_norm = std::numeric_limits<double>::quiet_NaN();
+    double dx_landmark_norm = std::numeric_limits<double>::quiet_NaN();
+    double K_yaw_row_norm = std::numeric_limits<double>::quiet_NaN();
+    double K_bgz_row_norm = std::numeric_limits<double>::quiet_NaN();
+    double K_pos_row_norm = std::numeric_limits<double>::quiet_NaN();
+    double K_landmark_row_norm = std::numeric_limits<double>::quiet_NaN();
+    double P_yaw_var = std::numeric_limits<double>::quiet_NaN();
+    double P_bgz_var = std::numeric_limits<double>::quiet_NaN();
+    double P_pos_trace = std::numeric_limits<double>::quiet_NaN();
+    double corr_yaw_bgz = std::numeric_limits<double>::quiet_NaN();
+    double corr_yaw_px = std::numeric_limits<double>::quiet_NaN();
+    double corr_yaw_py = std::numeric_limits<double>::quiet_NaN();
+    double pose_landmark_cov_norm = std::numeric_limits<double>::quiet_NaN();
+  };
+
+  static UpdateDiagnostics compute_update_diagnostics(
+      std::shared_ptr<State> state,
+      const std::vector<std::shared_ptr<ov_type::Type>> &H_order,
+      const Eigen::MatrixXd &H, const Eigen::VectorXd &res,
+      const Eigen::MatrixXd &R,
+      VisualYawUpdateMode visual_yaw_update_mode = VisualYawUpdateMode::ORIGINAL,
+      double visual_yaw_update_scale = 1.0,
+      double visual_global_yaw_oc_alpha = 0.0,
+      double visual_bgz_update_scale = 1.0);
+
+  static Eigen::VectorXd compute_update_dx(std::shared_ptr<State> state,
+                                           const std::vector<std::shared_ptr<ov_type::Type>> &H_order,
+                                           const Eigen::MatrixXd &H, const Eigen::VectorXd &res,
+                                           const Eigen::MatrixXd &R,
+                                           VisualYawUpdateMode visual_yaw_update_mode = VisualYawUpdateMode::ORIGINAL,
+                                           double visual_yaw_update_scale = 1.0,
+                                           double visual_global_yaw_oc_alpha = 0.0,
+                                           double visual_bgz_update_scale = 1.0);
+
+  static double yaw_delta_from_full_dx_deg(std::shared_ptr<State> state, const Eigen::VectorXd &dx);
 
   static void reset_last_yaw_dx_projection_diag();
 
@@ -449,6 +508,70 @@ public:
                                const Eigen::VectorXd &K_full,
                                const Eigen::VectorXd &H_full,
                                double R, double res);
+
+  /// Numerical health returned by EKFUpdateJosephChecked().
+  struct JosephUpdateHealth {
+    bool finite = false;
+    bool symmetric = false;
+    bool nonnegative_diagonal = false;
+    bool psd_checked = false;
+    bool psd = false;
+    double symmetry_error = std::numeric_limits<double>::quiet_NaN();
+    double min_diagonal = std::numeric_limits<double>::quiet_NaN();
+    double min_ldlt_diagonal = std::numeric_limits<double>::quiet_NaN();
+  };
+
+  /**
+   * @brief Transactional Joseph update with covariance health checks.
+   *
+   * The candidate covariance and state increment are formed first. If they are
+   * non-finite, asymmetric, have a materially negative diagonal, or fail the
+   * requested LDLT PSD check, neither the covariance nor the nominal state is
+   * modified.
+   *
+   * @param check_psd Run a full LDLT PSD check. This is caller-controlled
+   * because it is O(N^3), unlike the always-on finite/diagonal checks.
+   */
+  static bool EKFUpdateJosephChecked(std::shared_ptr<State> state,
+                                      const Eigen::VectorXd &K_full,
+                                      const Eigen::VectorXd &H_full,
+                                      double R, double res,
+                                      bool check_psd,
+                                      JosephUpdateHealth *health = nullptr);
+
+  /**
+   * @brief NASA/Lear scalar-measurement underweighting gain.
+   *
+   * Implements Lear's method from NASA *Navigation Filter Best Practices*
+   * (NTRS 20180003657 Eq. 4.36 / 4.38; NTRS 20250002787 Eq. 5.36). The
+   * underweight factor is a fraction @p beta of the mapped prior state
+   * uncertainty `H' P H`, not a fixed scaling of the measurement noise.
+   *
+   * For a scalar measurement with gain numerator `M = P * H_full`, prior
+   * measurement-space variance `q = H_full' * P * H_full` (>= 0), measurement
+   * noise `R > 0`, and underweight coefficient `beta >= 0` (already gated by the
+   * caller — pass 0 to disable):
+   * @code
+   *   W_U   = (1 + beta) * q + R        // Eq. 4.38
+   *   R_eff = R + beta * q              // additive residual noise, U = beta*q (Eq. 4.36)
+   *   K_U   = M / W_U
+   * @endcode
+   * Passing the matched pair `(K_U, R_eff)` to EKFUpdateJosephChecked() yields
+   * the consistent Joseph update `P+ = (I-K_U H')P(I-K_U H')' + K_U R_eff K_U'`.
+   * With `beta = 0` this reduces *exactly* to the standard full-gain update
+   * (`K_U = M/(q+R)`, `R_eff = R`).
+   *
+   * @param gain_numerator  M = P * H_full (length n)
+   * @param hph             q = H_full' * P * H_full (clamped to >= 0 internally)
+   * @param R               Scalar measurement noise (> 0)
+   * @param beta            Underweight coefficient (>= 0; clamped internally)
+   * @param[out] R_eff_out  Effective residual noise R + beta*q (use in Joseph)
+   * @param[out] W_U_out    Effective innovation variance (1+beta)*q + R
+   * @return Underweighted Kalman gain K_U (zero vector on a degenerate W_U)
+   */
+  static Eigen::VectorXd computeLearUnderweightGain(const Eigen::VectorXd &gain_numerator,
+                                                    double hph, double R, double beta,
+                                                    double &R_eff_out, double &W_U_out);
 
   /**
    * @brief Convenience wrapper: compute optimal K, mask to a single state DOF, call EKFUpdateJoseph.

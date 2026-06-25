@@ -1,0 +1,20 @@
+%YAML:1.0
+
+# fly2 in-flight CONVERGED calibration (from native-online run native_guarded_repro
+# final state: cam0 intrinsics=389.184,390.123,331.238,239.428 dist=-0.044,0.037,-0.001,0.002
+# extr trans=-0.059,0.019,0.022 toff=-5.67ms). Rotation kept from native (changed <1deg).
+# Purpose: lock at the empirically-best in-flight calib instead of ground newcalib(383).
+cam0:
+  T_cam_imu:
+    - [0.99995797, -0.00282896,  0.00872137, -0.059]
+    - [-0.00277724, -0.99997852, -0.00593747,  0.019]
+    - [0.00873798,  0.00591300, -0.99994434,  0.022]
+    - [0.0,         0.0,         0.0,          1.0]
+  cam_overlaps: []
+  camera_model: pinhole
+  distortion_coeffs: [-0.044, 0.037, -0.001, 0.002]
+  distortion_model: radtan
+  intrinsics: [389.184, 390.123, 331.238, 239.428]
+  resolution: [640, 480]
+  rostopic: /camera/color/image_raw
+  timeshift_cam_imu: -0.00567

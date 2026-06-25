@@ -139,6 +139,137 @@ public:
     parse_config_yaml(node_name, node_result, required);
   }
 
+  /** Read a value from one named first-level mapping in the main YAML file. */
+  template <class T>
+  void parse_config(const std::string &parent_node_name, const std::string &node_name, T &node_result, bool required) {
+    const std::string qualified_name = parent_node_name + "/" + node_name;
+#if ROS_AVAILABLE == 1
+    if (nh != nullptr && nh->getParam(qualified_name, node_result)) {
+      PRINT_INFO(GREEN "overriding node " BOLDGREEN "%s" RESET GREEN " with value from ROS!\n" RESET, qualified_name.c_str());
+      nh->param<T>(qualified_name, node_result);
+      return;
+    }
+#elif ROS_AVAILABLE == 2
+    if (node != nullptr && node->has_parameter(qualified_name)) {
+      PRINT_INFO(GREEN "overriding node " BOLDGREEN "%s" RESET GREEN " with value from ROS!\n" RESET, qualified_name.c_str());
+      node->get_parameter<T>(qualified_name, node_result);
+      return;
+    }
+#endif
+    if (config == nullptr)
+      return;
+    const cv::FileNode root = config->root();
+    if (!node_found(root, parent_node_name)) {
+      if (required) {
+        PRINT_WARNING(YELLOW "the parent node %s was not found...\n" RESET, parent_node_name.c_str());
+        all_params_found_successfully = false;
+      } else {
+        PRINT_DEBUG("the parent node %s was not found (not required)...\n", parent_node_name.c_str());
+      }
+      return;
+    }
+    parse(root[parent_node_name], node_name, node_result, required);
+  }
+
+  /** Read a value from a two-level mapping in the main YAML file. */
+  template <class T>
+  void parse_config(const std::string &parent_node_name, const std::string &child_node_name,
+                    const std::string &node_name, T &node_result, bool required) {
+    const std::string qualified_name = parent_node_name + "/" + child_node_name + "/" + node_name;
+#if ROS_AVAILABLE == 1
+    if (nh != nullptr && nh->getParam(qualified_name, node_result)) {
+      PRINT_INFO(GREEN "overriding node " BOLDGREEN "%s" RESET GREEN " with value from ROS!\n" RESET, qualified_name.c_str());
+      nh->param<T>(qualified_name, node_result);
+      return;
+    }
+#elif ROS_AVAILABLE == 2
+    if (node != nullptr && node->has_parameter(qualified_name)) {
+      PRINT_INFO(GREEN "overriding node " BOLDGREEN "%s" RESET GREEN " with value from ROS!\n" RESET, qualified_name.c_str());
+      node->get_parameter<T>(qualified_name, node_result);
+      return;
+    }
+#endif
+    if (config == nullptr)
+      return;
+    const cv::FileNode root = config->root();
+    if (!node_found(root, parent_node_name)) {
+      if (required) {
+        PRINT_WARNING(YELLOW "the parent node %s was not found...\n" RESET, parent_node_name.c_str());
+        all_params_found_successfully = false;
+      } else {
+        PRINT_DEBUG("the parent node %s was not found (not required)...\n", parent_node_name.c_str());
+      }
+      return;
+    }
+    const cv::FileNode parent = root[parent_node_name];
+    if (!node_found(parent, child_node_name)) {
+      if (required) {
+        PRINT_WARNING(YELLOW "the child node %s/%s was not found...\n" RESET, parent_node_name.c_str(), child_node_name.c_str());
+        all_params_found_successfully = false;
+      } else {
+        PRINT_DEBUG("the child node %s/%s was not found (not required)...\n", parent_node_name.c_str(), child_node_name.c_str());
+      }
+      return;
+    }
+    parse(parent[child_node_name], node_name, node_result, required);
+  }
+
+  /** Read a value from a three-level mapping in the main YAML file. */
+  template <class T>
+  void parse_config(const std::string &parent_node_name, const std::string &child_node_name,
+                    const std::string &grandchild_node_name, const std::string &node_name,
+                    T &node_result, bool required) {
+    const std::string qualified_name = parent_node_name + "/" + child_node_name + "/" + grandchild_node_name + "/" + node_name;
+#if ROS_AVAILABLE == 1
+    if (nh != nullptr && nh->getParam(qualified_name, node_result)) {
+      PRINT_INFO(GREEN "overriding node " BOLDGREEN "%s" RESET GREEN " with value from ROS!\n" RESET, qualified_name.c_str());
+      nh->param<T>(qualified_name, node_result);
+      return;
+    }
+#elif ROS_AVAILABLE == 2
+    if (node != nullptr && node->has_parameter(qualified_name)) {
+      PRINT_INFO(GREEN "overriding node " BOLDGREEN "%s" RESET GREEN " with value from ROS!\n" RESET, qualified_name.c_str());
+      node->get_parameter<T>(qualified_name, node_result);
+      return;
+    }
+#endif
+    if (config == nullptr)
+      return;
+    const cv::FileNode root = config->root();
+    if (!node_found(root, parent_node_name)) {
+      if (required) {
+        PRINT_WARNING(YELLOW "the parent node %s was not found...\n" RESET, parent_node_name.c_str());
+        all_params_found_successfully = false;
+      } else {
+        PRINT_DEBUG("the parent node %s was not found (not required)...\n", parent_node_name.c_str());
+      }
+      return;
+    }
+    const cv::FileNode parent = root[parent_node_name];
+    if (!node_found(parent, child_node_name)) {
+      if (required) {
+        PRINT_WARNING(YELLOW "the child node %s/%s was not found...\n" RESET, parent_node_name.c_str(), child_node_name.c_str());
+        all_params_found_successfully = false;
+      } else {
+        PRINT_DEBUG("the child node %s/%s was not found (not required)...\n", parent_node_name.c_str(), child_node_name.c_str());
+      }
+      return;
+    }
+    const cv::FileNode child = parent[child_node_name];
+    if (!node_found(child, grandchild_node_name)) {
+      if (required) {
+        PRINT_WARNING(YELLOW "the child node %s/%s/%s was not found...\n" RESET, parent_node_name.c_str(),
+                      child_node_name.c_str(), grandchild_node_name.c_str());
+        all_params_found_successfully = false;
+      } else {
+        PRINT_DEBUG("the child node %s/%s/%s was not found (not required)...\n", parent_node_name.c_str(),
+                    child_node_name.c_str(), grandchild_node_name.c_str());
+      }
+      return;
+    }
+    parse(child[grandchild_node_name], node_name, node_result, required);
+  }
+
   /**
    * @brief Custom parser for the external parameter files with levels.
    *

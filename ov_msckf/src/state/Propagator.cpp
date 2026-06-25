@@ -26,9 +26,62 @@
 #include "utils/print.h"
 #include "utils/quat_ops.h"
 
+#include <boost/filesystem.hpp>
+#include <iomanip>
+
 using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
+
+namespace {
+
+double wrap_degrees_prop(double angle_deg) {
+  while (angle_deg > 180.0)
+    angle_deg -= 360.0;
+  while (angle_deg < -180.0)
+    angle_deg += 360.0;
+  return angle_deg;
+}
+
+Eigen::Vector3d rot_to_rpy_prop(const Eigen::Matrix3d &R) {
+  double pitch = std::asin(std::max(-1.0, std::min(1.0, -R(2, 0))));
+  double roll = 0.0;
+  double yaw = 0.0;
+  if (std::fabs(std::cos(pitch)) > 1e-6) {
+    roll = std::atan2(R(2, 1), R(2, 2));
+    yaw = std::atan2(R(1, 0), R(0, 0));
+  } else {
+    yaw = std::atan2(-R(0, 1), R(1, 1));
+  }
+  return {roll, pitch, yaw};
+}
+
+} // namespace
+
+void Propagator::set_yaw_diag_path(const std::string &path) {
+  if (of_yaw_diag_.is_open())
+    of_yaw_diag_.close();
+  if (path.empty())
+    return;
+  boost::filesystem::path p(path);
+  if (!p.parent_path().empty())
+    boost::filesystem::create_directories(p.parent_path());
+  of_yaw_diag_.open(path, std::ofstream::out | std::ofstream::trunc);
+  if (!of_yaw_diag_.is_open()) {
+    PRINT_WARNING(YELLOW "[IMU-PROP-YAW-DIAG] failed to open %s\n" RESET, path.c_str());
+    return;
+  }
+  of_yaw_diag_
+      << "time,dt,gyro_raw_x,gyro_raw_y,gyro_raw_z,"
+      << "gyro_unbiased_x,gyro_unbiased_y,gyro_unbiased_z,"
+      << "gyro_bias_x,gyro_bias_y,gyro_bias_z,"
+      << "omega_world_x,omega_world_y,omega_world_z,"
+      << "state_yaw_before,state_yaw_after,delta_yaw_prop,"
+      << "roll,pitch,yaw,camera_imu_timeoffset,propagation_valid\n";
+  of_yaw_diag_.flush();
+  PRINT_INFO(GREEN "[IMU-PROP-YAW-DIAG] writing %s window=[%.3f, %.3f]\n" RESET,
+             path.c_str(), yaw_diag_t0_, yaw_diag_t1_);
+}
 
 // =============================================================================
 // [中文] propagate_and_clone
@@ -503,6 +556,34 @@ void Propagator::predict_and_compute(std::shared_ptr<State> state, const ov_core
   Qd = Eigen::MatrixXd::Zero(state->imu_intrinsic_size() + 15, state->imu_intrinsic_size() + 15);
   Qd = G * Qc * G.transpose();
   Qd = 0.5 * (Qd + Qd.transpose());
+
+  if (of_yaw_diag_.is_open()) {
+    const double t_off = state->_calib_dt_CAMtoIMU ? state->_calib_dt_CAMtoIMU->value()(0) : 0.0;
+    const double t_cam = data_plus.timestamp - t_off;
+    if (t_cam >= yaw_diag_t0_ && t_cam <= yaw_diag_t1_) {
+      const Eigen::Vector3d gyro_raw = 0.5 * (data_minus.wm + data_plus.wm);
+      const Eigen::Vector3d gyro_bias = state->_imu->bias_g();
+      const Eigen::Matrix3d R_ItoG_before = state->_imu->Rot().transpose();
+      const Eigen::Vector3d omega_world = R_ItoG_before * w_hat_avg;
+      const Eigen::Vector3d rpy_before = rot_to_rpy_prop(R_ItoG_before);
+      const Eigen::Matrix3d R_ItoG_after = quat_2_Rot(new_q).transpose();
+      const Eigen::Vector3d rpy_after = rot_to_rpy_prop(R_ItoG_after);
+      const double yaw_before_deg = rpy_before(2) * 180.0 / M_PI;
+      const double yaw_after_deg = rpy_after(2) * 180.0 / M_PI;
+      of_yaw_diag_ << std::fixed << std::setprecision(9)
+        << t_cam << "," << dt << ","
+        << gyro_raw.x() << "," << gyro_raw.y() << "," << gyro_raw.z() << ","
+        << w_hat_avg.x() << "," << w_hat_avg.y() << "," << w_hat_avg.z() << ","
+        << gyro_bias.x() << "," << gyro_bias.y() << "," << gyro_bias.z() << ","
+        << omega_world.x() << "," << omega_world.y() << "," << omega_world.z() << ","
+        << yaw_before_deg << "," << yaw_after_deg << ","
+        << wrap_degrees_prop(yaw_after_deg - yaw_before_deg) << ","
+        << rpy_after(0) * 180.0 / M_PI << ","
+        << rpy_after(1) * 180.0 / M_PI << ","
+        << yaw_after_deg << ","
+        << t_off << ",1\n";
+    }
+  }
 
   // Now replace imu estimate and fej with propagated values
   Eigen::Matrix<double, 16, 1> imu_x = state->_imu->value();

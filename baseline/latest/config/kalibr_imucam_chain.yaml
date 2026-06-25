@@ -1,0 +1,19 @@
+%YAML:1.0
+
+# Unified locked D455 camera/IMU calibration for latest baseline.
+# Source: June 2026 converged report.  Extrinsic is the post-install manual
+# calibration; time shift is intentionally locked to 0.0 s in the baseline.
+cam0:
+  T_cam_imu:
+    - [0.9998730063222916, -0.0158606862166570, 0.0015523726228432, -0.0262962875930104]
+    - [-0.0158280733957978, -0.9996913355440527, -0.0191495621549498, 0.0285726543000927]
+    - [0.0018556186571182, 0.0191225592132773, -0.9998154251703234, -0.0191450620176590]
+    - [0.0, 0.0, 0.0, 1.0]
+  cam_overlaps: []
+  camera_model: pinhole
+  distortion_coeffs: [-0.043, 0.035, -0.001, 0.001]
+  distortion_model: radtan
+  intrinsics: [386.750, 387.233, 330.249, 239.916]
+  resolution: [640, 480]
+  rostopic: /camera/color/image_raw
+  timeshift_cam_imu: 0.0

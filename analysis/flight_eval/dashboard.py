@@ -1,11 +1,15 @@
 """dashboard.py — 离线 interactive_dashboard.html 组装.
 
 把后端产物（samples / segments / summary / sampling / meta）打包为一个
-内联 JSON，注入到一个自包含 HTML 模板。前端只渲染、不重算核心指标。
-
-设计参考: 见仓库内 “OpenVINS 飞行试验评价工具 设计方案.html” 的
-布局 A（分析优先，推荐默认）。本函数生成数据契约 + 最小可用页面骨架；
-完整图表交互（同步游标、段内起点对齐分析、轨迹动画）由前端脚本实现。
+内联 JSON（window.RUN_DATA），注入自包含 HTML，由 assets/dashboard_app.js
+渲染设计稿“布局A·分析优先”的完整交互页面：
+  控制条（GPS/VIO/LK 显隐·分段叠加·里程↔时间·横垂↔沿横垂·速度分量↔模值向量·
+          仅有效↔含缺口·全程↔选中段）、指标卡片、
+  XY 轨迹（分段叠加+点击高亮+随时间动画+同步游标）、
+  XY 误差、横/垂位置误差、速度对比/误差、航向误差、
+  各段局部漂移条形（点击联动）、GPS 采样质量、
+  航段浏览器 + 明细（段内起点对齐沿/横航向轨迹）、溯源面板。
+纯 SVG 实现，无外部依赖，离线可用；前端只渲染、不重算核心指标。
 """
 from __future__ import annotations
 
@@ -14,6 +18,12 @@ import os
 
 import numpy as np
 import pandas as pd
+
+DASHBOARD_FORMAT_ERROR = (
+    "ERROR: generated dashboard is not SVG v2 / window.RUN_DATA format. "
+    "Plotly dashboard is deprecated."
+)
+_FORBIDDEN_HTML_MARKERS = ("cdn.plot.ly", "Plotly.newPlot", "plotly.js")
 
 # 前端需要的样本列（与设计文档“前端数据模型”一致）
 SAMPLE_COLS = [
@@ -26,7 +36,8 @@ SAMPLE_COLS = [
     "err_along", "err_cross", "err_vertical",
     "err_vE", "err_vN", "err_vU", "err_speed_xy", "err_vXY_vec",
     "err_v_along", "err_v_cross", "err_v_vertical",
-    "course_err_deg", "segment_id", "segment_type", "valid", "gap",
+    "course_err_deg", "segment_id", "segment_type", "segment_heading_deg",
+    "heading_source", "heading_quality", "valid", "gap",
 ]
 LK_COLS = ["lk_E", "lk_N", "lk_U", "err_lk_XY"]
 
@@ -39,8 +50,21 @@ def build_payload(df: pd.DataFrame, seg_index: pd.DataFrame, seg_err: pd.DataFra
     cols += [c for c in LK_COLS if c in df.columns]
     sub = df[cols]
     if len(sub) > decimate_to:
-        step = len(sub) // decimate_to
-        sub = sub.iloc[::step]
+        # Keep payload bounded; use ceil so 4001 rows do not remain undecimated.
+        step = (len(sub) + decimate_to - 1) // decimate_to
+        keep = set(range(0, len(sub), step))
+        keep.add(len(sub) - 1)
+        # Segment detail metrics use exact segment endpoints.  Preserve both
+        # ends of every segment so a decimated browser cannot draw a different
+        # endpoint from the value printed beside it.
+        if "segment_id" in sub.columns:
+            segment_ids = sub["segment_id"].to_numpy()
+            for segment_id in pd.unique(segment_ids):
+                positions = np.flatnonzero(segment_ids == segment_id)
+                if len(positions):
+                    keep.add(int(positions[0]))
+                    keep.add(int(positions[-1]))
+        sub = sub.iloc[sorted(keep)]
 
     # segments: 合并 index + error
     seg = seg_index.merge(seg_err, on="segment_id", how="left", suffixes=("", "_e"))
@@ -55,294 +79,132 @@ def build_payload(df: pd.DataFrame, seg_index: pd.DataFrame, seg_err: pd.DataFra
     }
 
 
-_HTML = """<!DOCTYPE html>
+_HEAD = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>飞行评价 · {experiment_id}</title>
-<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
 <style>
+:root{{--ink:#1d2733;--muted:#828c99;--line:#d6dae0;--line2:#eef0f3;--panel:#fff;--bg:#eceef1}}
 *{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:"Microsoft YaHei","Noto Sans SC",system-ui,sans-serif;background:#eceef1;color:#1d2733}}
-.topbar{{background:#11171f;color:#fff;padding:12px 20px;display:flex;align-items:center;gap:16px}}
+body{{font-family:"Microsoft YaHei","Noto Sans SC",system-ui,sans-serif;background:var(--bg);color:var(--ink)}}
+.topbar{{position:sticky;top:0;z-index:30;background:#11171f;color:#fff;padding:12px 20px;display:flex;align-items:center;gap:14px}}
 .topbar h1{{font-size:15px;font-weight:600}}
-.topbar .sub{{font-size:12px;color:#9fb0c4;font-family:monospace}}
-.offline-badge{{background:#fdf6ee;color:#8a5512;border:1px solid #e8c98a;border-radius:4px;padding:2px 8px;font-size:11px}}
-.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;padding:14px 20px}}
-.card{{background:#fff;border:1px solid #d6dae0;border-radius:8px;padding:12px 14px}}
-.card .k{{font-size:11px;color:#828c99;margin-bottom:4px}}
-.card .v{{font-size:20px;font-family:monospace;font-weight:600}}
-.card .u{{font-size:11px;color:#828c99}}
-.card.warn .v{{color:#c0392b}}
-.section{{margin:0 20px 20px;background:#fff;border:1px solid #d6dae0;border-radius:8px;overflow:hidden}}
-.section-title{{padding:10px 16px;font-size:13px;font-weight:600;border-bottom:1px solid #f0f2f5;background:#f8f9fb;display:flex;justify-content:space-between;align-items:center}}
-.section-title .hint{{font-size:11px;color:#9aa3ad;font-weight:400}}
-.plotbox{{padding:4px}}
-.grid2{{display:grid;grid-template-columns:1fr 1fr;gap:0}}
-.grid2 .section{{margin:0}}
-.grid-wrap{{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:0 20px 20px}}
-.seg-table{{width:100%;border-collapse:collapse;font-size:12px}}
-.seg-table th{{background:#f8f9fb;padding:6px 10px;text-align:left;border-bottom:1px solid #e4e8ed;color:#555}}
-.seg-table td{{padding:5px 10px;border-bottom:1px solid #f0f2f5}}
-.seg-table tr:hover td{{background:#f8f9fb}}
-.badge{{display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px}}
-.badge.straight{{background:#dbeafe;color:#1e40af}}
-.badge.turn{{background:#fef3c7;color:#92400e}}
-.badge.transition{{background:#e0e7ff;color:#3730a3}}
-.badge.short{{background:#f3f4f6;color:#6b7280}}
-footer{{padding:12px 20px;font-size:11px;color:#9aa3ad;border-top:1px solid #e4e8ed;margin-top:8px}}
+.topbar .sub{{font-size:12px;color:#9fb0c4;font-family:ui-monospace,monospace}}
+.topbar .sp{{flex:1}}
+.topbar .b{{font:10.5px ui-monospace,monospace;padding:3px 8px;border-radius:5px;background:#22303f;color:#7fb2ff}}
+.dashbody{{padding-bottom:24px}}
+.syn2{{display:flex;gap:8px;align-items:center;padding:7px 20px;background:#fdf6ee;color:#8a5512;font-size:11.5px;border-bottom:1px solid var(--line)}}
+.syn2 b{{font:10px ui-monospace,monospace;letter-spacing:.06em}}
+.ctrls{{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;padding:11px 20px;background:#f6f7f9;border-bottom:1px solid var(--line);position:sticky;top:44px;z-index:20}}
+.cg{{display:flex;align-items:center;gap:7px}}
+.glbl{{font:11px ui-monospace,monospace;color:var(--muted)}}
+.segctl{{display:flex;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:#fff}}
+.segctl button{{border:none;border-right:1px solid var(--line);padding:5px 9px;font-size:11.5px;cursor:pointer;background:transparent;color:var(--ink);font-family:inherit}}
+.segctl button:last-child{{border-right:none}}
+.segctl button.on{{background:var(--ink);color:#fff}}
+.chip{{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:#fff;border-radius:20px;padding:4px 11px;font-size:11.5px;cursor:pointer;color:var(--ink);user-select:none}}
+.chip.off{{opacity:.45;text-decoration:line-through}}
+.chip .sw{{width:9px;height:9px;border-radius:2px;background:var(--muted)}}
+.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;padding:16px 20px}}
+.card{{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:13px 14px}}
+.card .k{{font-size:11px;color:var(--muted);margin-bottom:5px}}
+.card .v{{font-family:ui-monospace,monospace;font-size:22px;letter-spacing:-.02em}}
+.card .u{{font-size:12px;color:var(--muted)}}
+.card.accent{{border-top:3px solid #2563c9}}
+.card.warnc{{border-top:3px solid #d33a35}}
+.card.okc{{border-top:3px solid #1f7a4d}}
+.rowgrid{{display:grid;gap:12px;padding:0 20px 12px}}
+.panel{{background:var(--panel);border:1px solid var(--line);border-radius:9px;display:flex;flex-direction:column;min-width:0}}
+.panel.pad{{padding:16px}}
+.ch{{display:flex;align-items:baseline;gap:9px;padding:11px 13px 6px}}
+.ch .ct{{font-size:12.5px;font-weight:600}}
+.ch .cu{{font-size:10.5px;color:var(--muted);font-family:ui-monospace,monospace}}
+.ch .sp{{flex:1}}
+.q{{font-size:11px;color:var(--muted);padding:0 13px 8px;line-height:1.45}}
+.cv{{padding:0 8px 8px}}
+.lgrow{{display:flex;flex-wrap:wrap;gap:10px;padding:0 13px 11px;align-items:center}}
+.lgi{{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--ink);cursor:pointer}}
+.lgi.muted{{color:var(--muted);cursor:default}}
+.lgln{{width:14px;border-top:2.5px solid var(--muted)}}
+.tlabel{{font:11px ui-monospace,monospace;color:#2563c9;margin-left:auto}}
+.playbtn{{border:1px solid #2563c9;background:#fff;color:#2563c9;border-radius:6px;padding:4px 11px;font-size:11.5px;cursor:pointer;font-family:inherit;white-space:nowrap}}
+.playbtn.on{{background:#2563c9;color:#fff}}
+.badge{{font:10.5px ui-monospace,monospace;padding:3px 8px;border-radius:5px;display:inline-flex;gap:5px;align-items:center}}
+.badge.ok{{background:#e6f3ec;color:#1f7a4d}} .badge.warn{{background:#fdf3f2;color:#d33a35}}
+.badge .dotc{{width:7px;height:7px;border-radius:50%;background:currentColor}}
+.seglist{{max-height:320px;overflow-y:auto}}
+.segrow{{display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:center;padding:7px 13px;border-bottom:1px solid var(--line2);cursor:pointer}}
+.segrow:hover{{background:#f6f7f9}}
+.segrow.sel{{background:#f3eefe;box-shadow:inset 3px 0 0 #8b5cf6}}
+.stype{{font:10px ui-monospace,monospace;padding:2px 6px;border-radius:4px}}
+.stype.straight{{background:#eaf0fc;color:#2563c9}} .stype.turn{{background:#fdf6ee;color:#b46410}}
+.sname{{font-size:12px}} .sname .sub{{font:10px ui-monospace,monospace;color:var(--muted)}}
+.sval{{text-align:right;font:11.5px ui-monospace,monospace}} .sval .sub{{font-size:10px;color:var(--muted)}}
+.sdh{{display:flex;gap:8px;align-items:center;margin-bottom:10px}} .sdh b{{font-size:13px}}
+.gh{{font:10.5px ui-monospace,monospace;margin:12px 0 6px;letter-spacing:.04em}}
+.g3{{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}}
+.gk{{font-size:10.5px;color:var(--muted)}} .gv{{font:15px ui-monospace,monospace}}
+.kv{{display:grid;grid-template-columns:170px 1fr;gap:2px 14px;font:11px ui-monospace,monospace;padding:14px}}
+.kv dt{{color:var(--muted);padding:5px 0;border-bottom:1px solid var(--line2)}}
+.kv dd{{padding:5px 0;border-bottom:1px solid var(--line2);word-break:break-all}}
+.muted{{color:var(--muted)}}
+@media(max-width:900px){{.rowgrid{{grid-template-columns:1fr!important}}}}
 </style>
 </head>
 <body>
 <div class="topbar">
-  <h1>飞行误差分析仪表板</h1>
-  <span class="sub">{out_folder}</span>
-  <span class="offline-badge">OFFLINE · 前端不重算</span>
+  <h1>飞行误差分析仪表板</h1><span class="sub">{out_folder}</span>
+  <span class="sp"></span><span class="b">{status}</span><span class="b">起点对齐 start-heading</span>
 </div>
-
-<div id="cards" class="cards"></div>
-
-<div class="section">
-  <div class="section-title">XY 轨迹对比（ENU · 起点对齐）<span class="hint">绿=GPS飞控参考，蓝=VIO估计</span></div>
-  <div class="plotbox"><div id="plt-traj" style="height:420px"></div></div>
-</div>
-
-<div class="grid-wrap">
-  <div class="section">
-    <div class="section-title">XY 误差 vs 里程<span class="hint">GPS 更新时间采样，非插值</span></div>
-    <div class="plotbox"><div id="plt-xy-err" style="height:280px"></div></div>
-  </div>
-  <div class="section">
-    <div class="section-title">横航向 / 垂直 位置误差<span class="hint">横航向=cross-track，垂直=altitude</span></div>
-    <div class="plotbox"><div id="plt-cross-vert" style="height:280px"></div></div>
-  </div>
-</div>
-
-<div class="section">
-  <div class="section-title">ENU 速度对比（vE 东向）<span class="hint">绿=飞控原始速度，蓝=VIO traj.bias</span></div>
-  <div class="plotbox"><div id="plt-vel-e" style="height:240px"></div></div>
-</div>
-
-<div class="section">
-  <div class="section-title">ENU 速度对比（vN 北向）</div>
-  <div class="plotbox"><div id="plt-vel-n" style="height:240px"></div></div>
-</div>
-
-<div class="grid-wrap">
-  <div class="section">
-    <div class="section-title">航向 / Course 误差 vs 里程<span class="hint">VIO course − GPS course，±180° wrap</span></div>
-    <div class="plotbox"><div id="plt-yaw" style="height:260px"></div></div>
-  </div>
-  <div class="section">
-    <div class="section-title">速度标量误差<span class="hint">|VIO speed| − |GPS speed|</span></div>
-    <div class="plotbox"><div id="plt-spd-err" style="height:260px"></div></div>
-  </div>
-</div>
-
-<div class="section">
-  <div class="section-title">各段局部漂移率（段起点归零后）<span class="hint">蓝=直线段，橙=转弯/过渡</span></div>
-  <div class="plotbox"><div id="plt-seg-drift" style="height:320px"></div></div>
-</div>
-
-<div class="section">
-  <div class="section-title">GPS 采样质量 — VIO 对齐延迟<span class="hint">每个 GPS 更新时刻对应的下一帧 VIO 延迟</span></div>
-  <div class="plotbox"><div id="plt-delay" style="height:220px"></div></div>
-</div>
-
-<div class="section">
-  <div class="section-title">分段误差明细</div>
-  <div style="overflow-x:auto;padding:8px 4px">
-  <table class="seg-table" id="seg-table">
-    <thead><tr>
-      <th>#</th><th>类型</th><th>段长 m</th>
-      <th>局部漂移 %</th><th>全局XY RMSE m</th>
-      <th>沿航向 RMSE m</th><th>横航向 RMSE m</th><th>速度 RMSE m/s</th>
-    </tr></thead>
-    <tbody></tbody>
-  </table>
-  </div>
-</div>
-
-<footer>
-  数据源: window.RUN_DATA（内联 JSON） · 前端仅渲染，不重算误差 ·
-  实验ID: {experiment_id}
-</footer>
-
+<div id="app"></div>
 <script id="run-data" type="application/json">{payload}</script>
-<script>
-const D = JSON.parse(document.getElementById('run-data').textContent);
-window.RUN_DATA = D;
-const S = D.summary, Q = D.sampling, META = D.meta;
-const samps = D.samples;
-const segs  = D.segments;
-
-// ── helper: filter valid samples ──
-const valid = samps.filter(r => r.valid && !r.gap);
-
-// ── metric cards ──
-const cardDefs = [
-  ['总里程','gps_distance_km','km'],
-  ['时长','duration_s','s'],
-  ['终点XY误差','final_xy_error_m','m', v=>v>500],
-  ['终点漂移','final_xy_drift_percent','%'],
-  ['XY RMSE','xy_rmse_m','m'],
-  ['速度RMSE','speed_rmse_mps','m/s'],
-  ['航向RMSE','yaw_or_course_rmse_deg','°'],
-  ['GPS有效样本','valid_aligned_count','',null,Q],
-  ['VIO延迟p95','p95_delay_s','s',null,Q],
-  ['GPS缺口数','gps_gap_count','段',null,Q],
-];
-const cc = document.getElementById('cards');
-cardDefs.forEach(([label, key, unit, warnFn, src]) => {{
-  const obj = src || S;
-  const val = obj[key];
-  const warn = warnFn && val != null && warnFn(val);
-  const d = document.createElement('div');
-  d.className = 'card' + (warn ? ' warn' : '');
-  d.innerHTML = `<div class="k">${{label}}</div><div class="v">${{val ?? '—'}} <span class="u">${{unit}}</span></div>`;
-  cc.appendChild(d);
-}});
-
-// ── colour palette ──
-const C = {{ gps:'#1f7a4d', vio:'#2563c9', err:'#d33a35', cross:'#e07b1a', vert:'#8b5cf6', invalid:'#9aa3ad' }};
-
-const cfg = {{ responsive:true, displayModeBar:true, modeBarButtonsToRemove:['lasso2d','select2d'] }};
-const font = {{ family:'"Microsoft YaHei","Noto Sans SC",sans-serif', size:12 }};
-const marg = {{ l:55, r:20, t:30, b:45 }};
-
-// ── 1. XY 轨迹 ──
-{{
-  const gE=samps.map(r=>r.gps_E), gN=samps.map(r=>r.gps_N);
-  const vE=samps.map(r=>r.vio_E), vN=samps.map(r=>r.vio_N);
-  const txt=samps.map(r=>`t=${{r.t?.toFixed(1)}}s  里程=${{(r.cum_dist/1000)?.toFixed(2)}}km`);
-  const traces=[
-    {{x:gE,y:gN,mode:'lines',name:'GPS（飞控参考）',line:{{color:C.gps,width:2}},hovertemplate:'%{{text}}<extra>GPS</extra>',text:txt}},
-    {{x:vE,y:vN,mode:'lines',name:'VIO估计',line:{{color:C.vio,width:1.5}},hovertemplate:'%{{text}}<extra>VIO</extra>',text:txt}},
-    {{x:[gE[0]],y:[gN[0]],mode:'markers',name:'起点',marker:{{color:C.gps,size:10,symbol:'circle-open',line:{{width:2}}}},showlegend:true}},
-  ];
-  const layout={{xaxis:{{title:'东向 E / m',scaleanchor:'y',scaleratio:1}},yaxis:{{title:'北向 N / m'}},
-    legend:{{orientation:'h',y:1.05}},margin:marg,font,hovermode:'closest'}};
-  Plotly.newPlot('plt-traj',traces,layout,cfg);
-}}
-
-// ── 2. XY 误差 vs 里程 ──
-{{
-  const x=valid.map(r=>r.cum_dist/1000), y=valid.map(r=>r.err_XY);
-  const txt=valid.map(r=>`t=${{r.t?.toFixed(1)}}s`);
-  Plotly.newPlot('plt-xy-err',[
-    {{x,y,mode:'lines',name:'VIO XY误差',line:{{color:C.vio,width:1.8}},text:txt,hovertemplate:'里程%{{x:.2f}}km  误差%{{y:.1f}}m<br>%{{text}}<extra></extra>'}}
-  ],{{xaxis:{{title:'GPS累计里程 / km'}},yaxis:{{title:'XY误差 / m'}},margin:marg,font}},cfg);
-}}
-
-// ── 3. 横/垂误差 ──
-{{
-  const x=valid.map(r=>r.cum_dist/1000);
-  const cr=valid.map(r=>r.err_cross), vt=valid.map(r=>r.err_vertical);
-  Plotly.newPlot('plt-cross-vert',[
-    {{x,y:cr,mode:'lines',name:'横航向 cross-track',line:{{color:C.err,width:2}}}},
-    {{x,y:vt,mode:'lines',name:'垂直 vertical',line:{{color:C.vert,width:2}}}},
-    {{x:[x[0],x[x.length-1]],y:[0,0],mode:'lines',line:{{color:'#ccc',width:1,dash:'dash'}},showlegend:false}},
-  ],{{xaxis:{{title:'GPS累计里程 / km'}},yaxis:{{title:'误差 / m'}},
-     legend:{{orientation:'h',y:1.08}},margin:marg,font}},cfg);
-}}
-
-// ── 4/5. ENU 速度对比 ──
-const vt_t = valid.map(r=>r.t);
-['E','N'].forEach((ax,i) => {{
-  const gv=valid.map(r=>r[`gps_v${{ax}}`]), vv=valid.map(r=>r[`vio_v${{ax}}`]);
-  Plotly.newPlot(`plt-vel-${{ax.toLowerCase()}}`,[
-    {{x:vt_t,y:gv,mode:'lines',name:`飞控 v${{ax}}（参考）`,line:{{color:C.gps,width:1.8}}}},
-    {{x:vt_t,y:vv,mode:'lines',name:`VIO v${{ax}}`,line:{{color:C.vio,width:1.2}}}},
-  ],{{xaxis:{{title:'时间 t / s'}},yaxis:{{title:`v${{ax}} / m·s⁻¹`}},
-     legend:{{orientation:'h',y:1.1}},margin:marg,font}},cfg);
-}});
-
-// ── 6. 航向误差 ──
-{{
-  const x=valid.map(r=>r.cum_dist/1000), y=valid.map(r=>r.course_err_deg);
-  Plotly.newPlot('plt-yaw',[
-    {{x,y,mode:'lines',name:'course误差',line:{{color:C.err,width:1.8}}}},
-    {{x:[x[0],x[x.length-1]],y:[0,0],mode:'lines',line:{{color:'#ccc',width:1,dash:'dash'}},showlegend:false}},
-  ],{{xaxis:{{title:'GPS累计里程 / km'}},yaxis:{{title:'航向误差 / °'}},margin:marg,font}},cfg);
-}}
-
-// ── 7. 速度标量误差 ──
-{{
-  const x=valid.map(r=>r.cum_dist/1000), y=valid.map(r=>r.err_speed_xy);
-  Plotly.newPlot('plt-spd-err',[
-    {{x,y,mode:'lines',name:'速度误差 |VIO|−|GPS|',line:{{color:C.cross,width:1.8}}}},
-    {{x:[x[0],x[x.length-1]],y:[0,0],mode:'lines',line:{{color:'#ccc',width:1,dash:'dash'}},showlegend:false}},
-  ],{{xaxis:{{title:'GPS累计里程 / km'}},yaxis:{{title:'速度误差 / m·s⁻¹'}},margin:marg,font}},cfg);
-}}
-
-// ── 8. 分段漂移条图 ──
-{{
-  const ss = segs.filter(r => r.local_drift_percent != null);
-  const labels = ss.map(r => `#${{r.segment_id}} ${{r.segment_type?.slice(0,4)}}`);
-  const vals   = ss.map(r => r.local_drift_percent ?? 0);
-  const colors = ss.map(r => r.segment_type==='straight' ? C.vio : C.cross);
-  Plotly.newPlot('plt-seg-drift',[
-    {{x:vals,y:labels,type:'bar',orientation:'h',
-      marker:{{color:colors}},
-      text:vals.map(v=>v?.toFixed(1)+'%'),textposition:'outside',
-      hovertemplate:'%{{y}}<br>局部漂移: %{{x:.2f}}%<extra></extra>'}},
-  ],{{xaxis:{{title:'段内局部漂移率 / %',autorange:true}},
-     yaxis:{{autorange:'reversed',tickfont:{{size:10}}}},
-     margin:{{l:90,r:50,t:20,b:45}},font,height:Math.max(280,ss.length*18)}},cfg);
-}}
-
-// ── 9. GPS 延迟散点 ──
-{{
-  const allT = samps.map(r=>r.t), allD = samps.map(r=>r.vio_delay_s);
-  const badMask = samps.map(r=>!r.valid && !r.gap);
-  Plotly.newPlot('plt-delay',[
-    {{x:allT.filter((_,i)=>!badMask[i]), y:allD.filter((_,i)=>!badMask[i]),
-      mode:'markers',name:'有效对齐',marker:{{color:C.vio,size:3,opacity:0.5}}}},
-    {{x:allT.filter((_,i)=>badMask[i]), y:allD.filter((_,i)=>badMask[i]),
-      mode:'markers',name:'延迟超阈值',marker:{{color:C.err,size:6}}}},
-    {{x:[allT[0],allT[allT.length-1]], y:[Q.p95_delay_s,Q.p95_delay_s],
-      mode:'lines',name:`p95=${{Q.p95_delay_s?.toFixed(3)}}s`,
-      line:{{color:C.err,dash:'dash',width:1.5}}}},
-  ],{{xaxis:{{title:'时间 t / s'}},yaxis:{{title:'VIO对齐延迟 / s'}},
-     legend:{{orientation:'h',y:1.12}},margin:marg,font}},cfg);
-}}
-
-// ── 10. 分段表格 ──
-{{
-  const tbody = document.querySelector('#seg-table tbody');
-  segs.forEach(r => {{
-    if(r.dist_m < 50) return;
-    const tr = document.createElement('tr');
-    const lp = r.local_drift_percent != null ? r.local_drift_percent.toFixed(2) : '—';
-    const badgeType = r.segment_type || 'unknown';
-    tr.innerHTML = `
-      <td>${{r.segment_id}}</td>
-      <td><span class="badge ${{badgeType}}">${{badgeType}}</span></td>
-      <td>${{r.dist_m?.toFixed(0) ?? '—'}}</td>
-      <td style="color:${{parseFloat(lp)>10?'#c0392b':'inherit'}}">${{lp}}</td>
-      <td>${{r.global_xy_rmse_m?.toFixed(1) ?? '—'}}</td>
-      <td>${{r.along_rmse_m?.toFixed(1) ?? '—'}}</td>
-      <td>${{r.cross_rmse_m?.toFixed(1) ?? '—'}}</td>
-      <td>${{r.speed_rmse_mps?.toFixed(3) ?? '—'}}</td>
-    `;
-    tbody.appendChild(tr);
-  }});
-}}
-</script>
+<script>window.RUN_DATA = JSON.parse(document.getElementById('run-data').textContent);</script>
+<script>{app_js}</script>
 </body>
 </html>"""
+
+
+def _read_app_js() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(here, "assets", "dashboard_app.js"), "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def validate_dashboard_html(html: str) -> None:
+    """Fail fast if an interactive dashboard is not the SVG v2 format."""
+    problems = []
+    if "window.RUN_DATA" not in html:
+        problems.append("missing window.RUN_DATA")
+    if '"segments"' not in html:
+        problems.append("missing segments data")
+    for marker in _FORBIDDEN_HTML_MARKERS:
+        if marker in html:
+            problems.append(f"contains {marker}")
+    if problems:
+        raise RuntimeError(f"{DASHBOARD_FORMAT_ERROR} ({'; '.join(problems)})")
+
+
+def validate_dashboard_file(path: str) -> None:
+    with open(path, "r", encoding="utf-8") as f:
+        validate_dashboard_html(f.read())
 
 
 def write_dashboard(payload: dict, reports_dir: str) -> str:
     os.makedirs(reports_dir, exist_ok=True)
     meta = payload["meta"]
-    html = _HTML.format(
+    html = _HEAD.format(
         experiment_id=meta.get("experiment_id", ""),
         out_folder=meta.get("out_folder", ""),
-        payload=json.dumps(payload, ensure_ascii=False),
+        status=meta.get("status", ""),
+        # Escape closing script tags defensively before embedding JSON in HTML.
+        payload=json.dumps(payload, ensure_ascii=False).replace("</", "<\\/"),
+        app_js=_read_app_js(),
     )
+    validate_dashboard_html(html)
     p = os.path.join(reports_dir, "interactive_dashboard.html")
     with open(p, "w", encoding="utf-8") as f:
         f.write(html)
+    validate_dashboard_file(p)
     return p

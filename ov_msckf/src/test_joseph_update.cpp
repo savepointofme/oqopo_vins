@@ -555,6 +555,464 @@ static TestResult test_T9_real_imu_nonzero(std::mt19937 &rng) {
 }
 
 // ---------------------------------------------------------------------------
+// T10: Test-2 trust region scales one complete gain, preserving direction.
+// ---------------------------------------------------------------------------
+static TestResult test_T10_uniform_gain_scale(std::mt19937 &rng) {
+  TestResult r;
+  r.name = "T10 bounded full-gain scale preserves direction and PSD";
+  const int N = 15;
+  Eigen::MatrixXd P = rand_spd(N, rng);
+  Eigen::VectorXd H = Eigen::VectorXd::Zero(N);
+  H(5) = 1.0;
+  const double R = 4.0;
+  const double residual = 12.0;
+  const double S = H.dot(P * H) + R;
+  const Eigen::VectorXd K = (P * H) / S;
+  const Eigen::VectorXd dx_full = K * residual;
+  const double scale = 0.23;
+  const Eigen::VectorXd K_used = scale * K;
+  const Eigen::VectorXd dx_used = K_used * residual;
+
+  check(r, (dx_used - scale * dx_full).norm() < 1e-12,
+        "uniformly scaled correction does not equal scale*dx_full");
+  const double direction_cos = dx_used.dot(dx_full) /
+                               (dx_used.norm() * dx_full.norm());
+  check(r, std::abs(direction_cos - 1.0) < 1e-12,
+        "bounded correction changed full-state direction");
+
+  StateHelper::josephCovUpdate(P, K_used, H, R);
+  Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(P);
+  check(r, P.allFinite(), "scaled-gain Joseph covariance is non-finite");
+  check(r, (P - P.transpose()).norm() < 1e-12,
+        "scaled-gain Joseph covariance is asymmetric");
+  check(r, es.eigenvalues().minCoeff() >= -1e-8,
+        "scaled-gain Joseph covariance is not PSD");
+  return r;
+}
+
+// ---------------------------------------------------------------------------
+// T11: Invalid checked update must not partially modify P or nominal state.
+// ---------------------------------------------------------------------------
+static TestResult test_T11_checked_update_transaction(std::mt19937 &rng) {
+  (void)rng;
+  TestResult r;
+  r.name = "T11 checked Joseph numerical rejection is transactional";
+  VioManagerOptions params;
+  params.state_options.num_cameras = 0;
+  params.state_options.max_clone_size = 0;
+  params.state_options.max_slam_features = 0;
+  auto state = std::make_shared<State>(params.state_options);
+  const Eigen::MatrixXd P_before = StateHelper::get_full_covariance(state);
+  const Eigen::Vector3d p_before = state->_imu->pos();
+  const int N = (int)P_before.rows();
+  Eigen::VectorXd H = Eigen::VectorXd::Zero(N);
+  H(state->_imu->p()->id() + 2) = 1.0;
+  Eigen::VectorXd K = Eigen::VectorXd::Zero(N);
+  K(state->_imu->p()->id() + 2) =
+      std::numeric_limits<double>::quiet_NaN();
+  StateHelper::JosephUpdateHealth health;
+  const bool applied = StateHelper::EKFUpdateJosephChecked(
+      state, K, H, 1.0, 3.0, true, &health);
+  const Eigen::MatrixXd P_after = StateHelper::get_full_covariance(state);
+  check(r, !applied, "non-finite gain was unexpectedly applied");
+  check(r, (P_after - P_before).norm() == 0.0,
+        "covariance changed after rejected checked update");
+  check(r, (state->_imu->pos() - p_before).norm() == 0.0,
+        "state changed after rejected checked update");
+  return r;
+}
+
+// ===========================================================================
+// NASA/Lear measurement-underweighting tests (T12–T19)
+//
+// These exercise StateHelper::computeLearUnderweightGain — the exact shared
+// helper VioManager's NASA_LEAR coupled mode uses — and its consistency with
+// the Joseph covariance primitive.  Primary source: NASA Navigation Filter
+// Best Practices, NTRS 20180003657 Eq. 4.36/4.38 (Lear's method).
+//   M     = P H                      (gain numerator)
+//   q     = H' P H                   (prior measurement-space variance)
+//   W_U   = (1 + beta) q + R         (Eq. 4.38 effective innovation variance)
+//   R_eff = R + beta q               (Eq. 4.36 additive residual noise)
+//   K_U   = M / W_U
+//   P+    = (I - K_U H') P (I - K_U H')' + K_U R_eff K_U' = P - M M' / W_U
+// ===========================================================================
+
+// Standard optimal gain K = P H / (H'PH + R).
+static Eigen::VectorXd standard_gain(const Eigen::MatrixXd &P, const Eigen::VectorXd &H, double R) {
+  const double S = H.dot(P * H) + R;
+  return (P * H) / S;
+}
+
+// Build an SPD "arrow" covariance: diagonal d, with only the measured index
+// (mz) coupled to the others via correlation coefficients rho[i].  SPD as long
+// as sum_i rho[i]^2 < 1.  Returns P; sets M=P*e_mz implicitly (= column mz).
+static Eigen::MatrixXd arrow_spd(int N, int mz, const Eigen::VectorXd &d,
+                                 const Eigen::VectorXd &rho) {
+  Eigen::MatrixXd P = d.asDiagonal();
+  for (int i = 0; i < N; i++) {
+    if (i == mz) continue;
+    const double c = rho(i) * std::sqrt(d(i) * d(mz));
+    P(i, mz) = c;
+    P(mz, i) = c;
+  }
+  return P;
+}
+
+// ---------------------------------------------------------------------------
+// T12: beta=0 reduces NASA gain/covariance exactly to the standard update.
+// ---------------------------------------------------------------------------
+static TestResult test_T12_nasa_beta0_equivalence(std::mt19937 &rng) {
+  TestResult r;
+  r.name = "T12 NASA beta=0 == standard full-gain state + covariance";
+  const int N = 10;
+  std::uniform_real_distribution<double> ud(-1.0, 1.0);
+  for (int trial = 0; trial < 20; trial++) {
+    Eigen::MatrixXd P = rand_spd(N, rng);
+    Eigen::VectorXd H = Eigen::VectorXd::Zero(N);
+    // Mix of GPS-Z-like single-entry H and general dense H.
+    if (trial % 2 == 0) {
+      H(2) = 1.0;
+    } else {
+      for (int i = 0; i < N; i++) H(i) = ud(rng);
+    }
+    const double R = 0.5 + std::uniform_real_distribution<double>(0.0, 2.0)(rng);
+    const Eigen::VectorXd M = P * H;
+    const double q = H.dot(M);
+    const Eigen::VectorXd K_std = M / (q + R);
+
+    double R_eff = -1.0, W_U = -1.0;
+    const Eigen::VectorXd K_U =
+        StateHelper::computeLearUnderweightGain(M, q, R, /*beta=*/0.0, R_eff, W_U);
+
+    check(r, (K_U - K_std).norm() < 1e-12,
+          "trial=" + std::to_string(trial) + " K_U != K_std: " + std::to_string((K_U - K_std).norm()));
+    check(r, std::abs(R_eff - R) < 1e-12, "R_eff != R at beta=0");
+    check(r, std::abs(W_U - (q + R)) < 1e-9, "W_U != q+R at beta=0");
+
+    // Covariance also identical.
+    Eigen::MatrixXd P_nasa = P;
+    StateHelper::josephCovUpdate(P_nasa, K_U, H, R_eff);
+    Eigen::MatrixXd P_std = P;
+    StateHelper::josephCovUpdate(P_std, K_std, H, R);
+    check(r, (P_nasa - P_std).norm() < 1e-12,
+          "trial=" + std::to_string(trial) + " P_nasa != P_std at beta=0");
+  }
+  return r;
+}
+
+// ---------------------------------------------------------------------------
+// T13: beta>0 strictly reduces |K| while preserving the full gain direction.
+// ---------------------------------------------------------------------------
+static TestResult test_T13_nasa_gain_reduction(std::mt19937 &rng) {
+  TestResult r;
+  r.name = "T13 NASA beta>0 reduces |K_U|<|K_std|, direction unchanged";
+  const int N = 12;
+  std::uniform_real_distribution<double> ud(-1.0, 1.0);
+  for (int trial = 0; trial < 20; trial++) {
+    Eigen::MatrixXd P = rand_spd(N, rng);
+    Eigen::VectorXd H = Eigen::VectorXd::Zero(N);
+    H(2) = 1.0;  // GPS-Z model
+    const double R = 0.5 + std::uniform_real_distribution<double>(0.0, 2.0)(rng);
+    const Eigen::VectorXd M = P * H;
+    const double q = H.dot(M);
+    const Eigen::VectorXd K_std = M / (q + R);
+    const double beta = 0.1 + std::abs(ud(rng));  // > 0
+
+    double R_eff = -1.0, W_U = -1.0;
+    const Eigen::VectorXd K_U =
+        StateHelper::computeLearUnderweightGain(M, q, R, beta, R_eff, W_U);
+
+    check(r, K_U.norm() < K_std.norm(),
+          "trial=" + std::to_string(trial) + " |K_U| not < |K_std|");
+    const double cos = K_U.dot(K_std) / (K_U.norm() * K_std.norm());
+    check(r, std::abs(cos - 1.0) < 1e-12,
+          "trial=" + std::to_string(trial) + " gain direction changed cos=" + std::to_string(cos));
+    // Exact scaling factor gamma = (q+R)/((1+beta)q+R).
+    const double gamma = (q + R) / ((1.0 + beta) * q + R);
+    check(r, (K_U - gamma * K_std).norm() < 1e-12, "K_U != gamma*K_std");
+  }
+  return r;
+}
+
+// ---------------------------------------------------------------------------
+// T14: R_eff/W_U consistency — K_U = M/((1+beta)q+R) = M/(q+R_eff).
+// ---------------------------------------------------------------------------
+static TestResult test_T14_nasa_reff_consistency(std::mt19937 &rng) {
+  TestResult r;
+  r.name = "T14 NASA R_eff consistency: M/((1+b)q+R) == M/(q+R_eff)";
+  const int N = 9;
+  std::uniform_real_distribution<double> ud(-1.0, 1.0);
+  for (int trial = 0; trial < 20; trial++) {
+    Eigen::MatrixXd P = rand_spd(N, rng);
+    Eigen::VectorXd H = Eigen::VectorXd::Zero(N);
+    for (int i = 0; i < N; i++) H(i) = ud(rng);
+    const double R = 0.3 + std::abs(ud(rng));
+    const double beta = std::abs(ud(rng));
+    const Eigen::VectorXd M = P * H;
+    const double q = H.dot(M);
+
+    double R_eff = -1.0, W_U = -1.0;
+    const Eigen::VectorXd K_U =
+        StateHelper::computeLearUnderweightGain(M, q, R, beta, R_eff, W_U);
+
+    check(r, std::abs(R_eff - (R + beta * q)) < 1e-12, "R_eff != R + beta*q");
+    check(r, std::abs(W_U - ((1.0 + beta) * q + R)) < 1e-9, "W_U != (1+beta)q+R");
+    const Eigen::VectorXd K_reff = M / (q + R_eff);
+    check(r, (K_U - K_reff).norm() < 1e-12,
+          "trial=" + std::to_string(trial) + " K_U != M/(q+R_eff)");
+  }
+  return r;
+}
+
+// ---------------------------------------------------------------------------
+// T15: Joseph consistency — covariance from (K_U, R_eff) equals the scalar
+// rank-one form P - M M'/W_U, i.e. state and P use the same K_U.
+// ---------------------------------------------------------------------------
+static TestResult test_T15_nasa_joseph_rank_one(std::mt19937 &rng) {
+  TestResult r;
+  r.name = "T15 NASA Joseph(K_U,R_eff) == P - M M'/W_U";
+  const int N = 10;
+  std::uniform_real_distribution<double> ud(-1.0, 1.0);
+  for (int trial = 0; trial < 20; trial++) {
+    Eigen::MatrixXd P = rand_spd(N, rng);
+    Eigen::VectorXd H = Eigen::VectorXd::Zero(N);
+    H(3) = 1.0;
+    const double R = 0.5 + std::abs(ud(rng));
+    const double beta = std::abs(ud(rng));
+    const Eigen::VectorXd M = P * H;
+    const double q = H.dot(M);
+
+    double R_eff = -1.0, W_U = -1.0;
+    const Eigen::VectorXd K_U =
+        StateHelper::computeLearUnderweightGain(M, q, R, beta, R_eff, W_U);
+
+    Eigen::MatrixXd P_joseph = P;
+    StateHelper::josephCovUpdate(P_joseph, K_U, H, R_eff);
+    Eigen::MatrixXd P_rank1 = P - (M * M.transpose()) / W_U;
+    P_rank1 = 0.5 * (P_rank1 + P_rank1.transpose());
+    check(r, (P_joseph - P_rank1).norm() < 1e-9,
+          "trial=" + std::to_string(trial) + " Joseph != rank-one: " +
+              std::to_string((P_joseph - P_rank1).norm()));
+  }
+  return r;
+}
+
+// ---------------------------------------------------------------------------
+// T16: cross-covariance — GPS-Z correction propagates to XY/velocity/attitude/
+// bias with the sign of P[:,pz]; zero cross-covariance => zero correction.
+// ---------------------------------------------------------------------------
+static TestResult test_T16_nasa_cross_covariance(std::mt19937 &rng) {
+  (void)rng;
+  TestResult r;
+  r.name = "T16 NASA cross-covariance corrects XY/v/att/bias with correct signs";
+  const int N = 15;
+  const int roll = 0, px = 3, py = 4, pz = 5, vx = 6, bgx = 10, bax = 13;
+  Eigen::VectorXd d = Eigen::VectorXd::Constant(N, 1.0);
+  d(pz) = 4.0;
+  Eigen::VectorXd rho = Eigen::VectorXd::Zero(N);
+  rho(px) = 0.3;    // P_xz > 0
+  rho(py) = -0.3;   // P_yz < 0
+  rho(vx) = 0.2;    // P_vx,z != 0
+  rho(roll) = 0.2;  // P_roll,z != 0
+  rho(bax) = -0.2;  // P_bax,z != 0
+  // rho(bgx) stays 0 -> zero cross-covariance
+  Eigen::MatrixXd P = arrow_spd(N, pz, d, rho);
+
+  // SPD sanity (sum rho^2 < 1).
+  Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es0(P);
+  check(r, es0.eigenvalues().minCoeff() > 0.0, "constructed P not SPD");
+
+  Eigen::VectorXd H = Eigen::VectorXd::Zero(N);
+  H(pz) = 1.0;
+  const double R = 2.0;
+  const double beta = 0.5;
+  const double res = 3.0;  // positive residual (GPS above VIO)
+  const Eigen::VectorXd M = P * H;
+  const double q = H.dot(M);
+  check(r, std::abs(q - d(pz)) < 1e-12, "q != P_zz for GPS-Z model");
+
+  double R_eff = -1.0, W_U = -1.0;
+  const Eigen::VectorXd K_U =
+      StateHelper::computeLearUnderweightGain(M, q, R, beta, R_eff, W_U);
+  const Eigen::VectorXd dx = K_U * res;
+
+  // Sign checks (res>0, W_U>0): sign(dx_i) == sign(P_i,z) == sign(rho_i).
+  check(r, dx(px) > 0.0, "T16 P_xz>0 did not produce +x correction");
+  check(r, dx(py) < 0.0, "T16 P_yz<0 did not produce -y correction");
+  check(r, dx(vx) > 0.0, "T16 P_vx,z>0 did not produce +vx correction");
+  check(r, dx(roll) > 0.0, "T16 P_roll,z>0 did not produce +roll correction");
+  check(r, dx(bax) < 0.0, "T16 P_bax,z<0 did not produce -bax correction");
+  check(r, dx(pz) > 0.0, "T16 measured p_z not corrected");
+  // Zero cross-covariance -> exactly zero correction.
+  check(r, std::abs(dx(bgx)) < 1e-15, "T16 zero-cross-cov state was corrected");
+  check(r, std::abs(K_U(bgx)) < 1e-15, "T16 zero-cross-cov gain nonzero");
+
+  // Covariance remains PSD after the coupled NASA update.
+  Eigen::MatrixXd P_after = P;
+  StateHelper::josephCovUpdate(P_after, K_U, H, R_eff);
+  Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(P_after);
+  check(r, es.eigenvalues().minCoeff() >= -1e-9, "T16 NASA covariance not PSD");
+  return r;
+}
+
+// ---------------------------------------------------------------------------
+// T17: increasing beta monotonically shrinks the increment and weakens the
+// covariance contraction, without changing direction.
+// ---------------------------------------------------------------------------
+static TestResult test_T17_nasa_beta_monotonic(std::mt19937 &rng) {
+  TestResult r;
+  r.name = "T17 NASA increasing beta: |dx| down, contraction down, direction fixed";
+  const int N = 12;
+  Eigen::MatrixXd P = rand_spd(N, rng);
+  Eigen::VectorXd H = Eigen::VectorXd::Zero(N);
+  H(4) = 1.0;
+  const double R = 1.5;
+  const double res = 5.0;
+  const Eigen::VectorXd M = P * H;
+  const double q = H.dot(M);
+
+  const std::vector<double> betas = {0.0, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0};
+  double prev_dx_norm = std::numeric_limits<double>::infinity();
+  double prev_contraction = std::numeric_limits<double>::infinity();
+  Eigen::VectorXd K0 = standard_gain(P, H, R);
+  for (double beta : betas) {
+    double R_eff = -1.0, W_U = -1.0;
+    const Eigen::VectorXd K_U =
+        StateHelper::computeLearUnderweightGain(M, q, R, beta, R_eff, W_U);
+    const Eigen::VectorXd dx = K_U * res;
+    const double dx_norm = dx.norm();
+    check(r, dx_norm <= prev_dx_norm + 1e-12,
+          "beta=" + std::to_string(beta) + " |dx| not monotonically decreasing");
+    // direction preserved vs standard
+    const double cos = K_U.dot(K0) / (K_U.norm() * K0.norm());
+    check(r, std::abs(cos - 1.0) < 1e-12, "beta=" + std::to_string(beta) + " direction changed");
+    // covariance contraction = trace(P - P_NASA) = M'M / W_U
+    Eigen::MatrixXd P_after = P;
+    StateHelper::josephCovUpdate(P_after, K_U, H, R_eff);
+    const double contraction = (P - P_after).trace();
+    check(r, contraction <= prev_contraction + 1e-12,
+          "beta=" + std::to_string(beta) + " covariance contraction not decreasing");
+    check(r, contraction >= -1e-9, "beta=" + std::to_string(beta) + " negative contraction (P grew)");
+    prev_dx_norm = dx_norm;
+    prev_contraction = contraction;
+  }
+  return r;
+}
+
+// ---------------------------------------------------------------------------
+// T18: random trials — P_NASA PSD and Loewner order P_std <= P_NASA <= P_prior.
+// ---------------------------------------------------------------------------
+static TestResult test_T18_nasa_psd_loewner(std::mt19937 &rng) {
+  TestResult r;
+  r.name = "T18 NASA PSD + Loewner: P_std <= P_NASA <= P_prior (100 trials)";
+  const int N = 8;
+  std::uniform_real_distribution<double> ud(-1.0, 1.0);
+  int fail = 0;
+  for (int trial = 0; trial < 100; trial++) {
+    Eigen::MatrixXd P = rand_spd(N, rng, 0.5 + std::abs(ud(rng)));
+    Eigen::VectorXd H = Eigen::VectorXd::Zero(N);
+    int nnz = 1 + (trial % 3);
+    for (int k = 0; k < nnz; k++) H((trial * 5 + k * 2) % N) = ud(rng);
+    const double R = 0.2 + std::abs(ud(rng));
+    const double beta = std::abs(ud(rng)) * 2.0;
+    const Eigen::VectorXd M = P * H;
+    const double qv = H.dot(M);
+    double R_eff = -1.0, W_U = -1.0;
+    const Eigen::VectorXd K_U = StateHelper::computeLearUnderweightGain(M, qv, R, beta, R_eff, W_U);
+    const Eigen::VectorXd K_std = M / (qv + R);
+
+    Eigen::MatrixXd P_nasa = P;
+    StateHelper::josephCovUpdate(P_nasa, K_U, H, R_eff);
+    Eigen::MatrixXd P_std = P;
+    StateHelper::josephCovUpdate(P_std, K_std, H, R);
+
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es_nasa(P_nasa);
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es_hi(P - P_nasa);     // >= 0
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es_lo(P_nasa - P_std); // >= 0
+    const double tol = 1e-8 * std::max(1.0, P.diagonal().maxCoeff());
+    if (es_nasa.eigenvalues().minCoeff() < -tol ||
+        es_hi.eigenvalues().minCoeff() < -tol ||
+        es_lo.eigenvalues().minCoeff() < -tol) {
+      fail++;
+      r.detail += "  trial=" + std::to_string(trial) +
+                  " nasa_min=" + std::to_string(es_nasa.eigenvalues().minCoeff()) +
+                  " hi_min=" + std::to_string(es_hi.eigenvalues().minCoeff()) +
+                  " lo_min=" + std::to_string(es_lo.eigenvalues().minCoeff()) + "\n";
+    }
+  }
+  check(r, fail == 0, std::to_string(fail) + "/100 trials violated PSD/Loewner");
+  return r;
+}
+
+// ---------------------------------------------------------------------------
+// T19: real State injection — EKFUpdateJosephChecked with a NASA K_U applies
+// dx = K_U*res through the typed/JPL path; beta>0 reduces the p_z correction
+// relative to beta=0; masked states stay put.
+// ---------------------------------------------------------------------------
+static TestResult test_T19_nasa_real_state_injection(std::mt19937 &rng) {
+  (void)rng;
+  TestResult r;
+  r.name = "T19 NASA real-state injection via EKFUpdateJosephChecked";
+
+  auto build_state = []() {
+    VioManagerOptions params;
+    params.state_options.num_cameras = 0;
+    params.state_options.max_clone_size = 0;
+    params.state_options.max_slam_features = 0;
+    return std::make_shared<State>(params.state_options);
+  };
+
+  // beta=0 reference correction.
+  auto run_once = [&](double beta, double &dpz_out, std::shared_ptr<State> &st) {
+    st = build_state();
+    Eigen::VectorXd imu_val = Eigen::VectorXd::Zero(16);
+    imu_val(3) = 1.0;    // q_w
+    imu_val(6) = 30.0;   // p_z
+    st->_imu->set_value(imu_val);
+    const int N = (int)StateHelper::get_full_covariance(st).rows();
+    const int p_id = st->_imu->p()->id();
+    Eigen::VectorXd H_full = Eigen::VectorXd::Zero(N);
+    H_full(p_id + 2) = 1.0;
+    const Eigen::MatrixXd P = StateHelper::get_full_covariance(st);
+    const Eigen::VectorXd M = P * H_full;
+    const double q = H_full.dot(M);
+    const double R = 1.0;
+    const double res = 6.0;
+    double R_eff = -1.0, W_U = -1.0;
+    const Eigen::VectorXd K_U =
+        StateHelper::computeLearUnderweightGain(M, q, R, beta, R_eff, W_U);
+    const double p_z_before = st->_imu->pos()(2);
+    StateHelper::JosephUpdateHealth health;
+    const bool ok = StateHelper::EKFUpdateJosephChecked(st, K_U, H_full, R_eff, res, true, &health);
+    check(r, ok, "EKFUpdateJosephChecked rejected a valid NASA update (beta=" + std::to_string(beta) + ")");
+    check(r, health.psd, "NASA covariance not PSD (beta=" + std::to_string(beta) + ")");
+    dpz_out = st->_imu->pos()(2) - p_z_before;
+    // expected exact correction = K_U(pz)*res
+    const double expected = K_U(p_id + 2) * res;
+    check(r, std::abs(dpz_out - expected) < 1e-10,
+          "p_z correction != K_U*res (beta=" + std::to_string(beta) + ")");
+  };
+
+  double dpz0 = 0.0, dpzb = 0.0;
+  std::shared_ptr<State> s0, sb;
+  run_once(0.0, dpz0, s0);
+  run_once(0.8, dpzb, sb);
+
+  // beta>0 reduces the magnitude of the p_z correction.
+  check(r, std::abs(dpzb) < std::abs(dpz0),
+        "T19 beta>0 did not reduce p_z correction: |dpzb|=" + std::to_string(std::abs(dpzb)) +
+            " |dpz0|=" + std::to_string(std::abs(dpz0)));
+
+  // Masked states (p_x, p_y, velocity, attitude, biases) unchanged for diagonal P.
+  check(r, std::abs(sb->_imu->pos()(0)) < 1e-12, "T19 p_x changed");
+  check(r, std::abs(sb->_imu->pos()(1)) < 1e-12, "T19 p_y changed");
+  check(r, sb->_imu->vel().norm() < 1e-12, "T19 velocity changed");
+  check(r, sb->_imu->bias_a().norm() < 1e-12, "T19 accel bias changed");
+  check(r, sb->_imu->bias_g().norm() < 1e-12, "T19 gyro bias changed");
+  return r;
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 int main(int argc, char **argv) {
@@ -573,6 +1031,16 @@ int main(int argc, char **argv) {
   results.push_back(test_T7_T8_state_update(rng));
   results.push_back(test_T_masked_block_unchanged(rng));
   results.push_back(test_T9_real_imu_nonzero(rng));
+  results.push_back(test_T10_uniform_gain_scale(rng));
+  results.push_back(test_T11_checked_update_transaction(rng));
+  results.push_back(test_T12_nasa_beta0_equivalence(rng));
+  results.push_back(test_T13_nasa_gain_reduction(rng));
+  results.push_back(test_T14_nasa_reff_consistency(rng));
+  results.push_back(test_T15_nasa_joseph_rank_one(rng));
+  results.push_back(test_T16_nasa_cross_covariance(rng));
+  results.push_back(test_T17_nasa_beta_monotonic(rng));
+  results.push_back(test_T18_nasa_psd_loewner(rng));
+  results.push_back(test_T19_nasa_real_state_injection(rng));
 
   int passed = 0, failed = 0;
   std::cout << "\n=== josephCovUpdate / EKFUpdateJoseph Gate 1 Tests ===\n";

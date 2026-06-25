@@ -1,0 +1,19 @@
+%YAML:1.0
+
+# fly3 in-flight CONVERGED calib (from np700_chi0p20 online final state:
+# intrinsics=386.750,387.233,330.249,239.916 dist=-0.043,0.035,-0.001,0.001 toff=-1.52ms).
+# Extrinsic = newcalib (np700 had extr LOCKED at newcalib). Lock-at-converged universality test.
+cam0:
+  T_cam_imu:
+    - [0.9998730063222916, -0.015860686216656983, 0.0015523726228432147, -0.026296287593010406]
+    - [-0.01582807339579776, -0.9996913355440527, -0.01914956215494984, 0.028572654300092745]
+    - [0.0018556186571181857, 0.019122559213813277, -0.9998154251703234, -0.019145062017658972]
+    - [0.0, 0.0, 0.0, 1.0]
+  cam_overlaps: []
+  camera_model: pinhole
+  distortion_coeffs: [-0.043, 0.035, -0.001, 0.001]
+  distortion_model: radtan
+  intrinsics: [386.750, 387.233, 330.249, 239.916]
+  resolution: [640, 480]
+  rostopic: /camera/color/image_raw
+  timeshift_cam_imu: -0.00152

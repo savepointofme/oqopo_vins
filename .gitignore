@@ -65,3 +65,9 @@ test.sh
 *.zip
 imu_window_fly3*.csv
 imu_window*.csv
+
+# Local-only cleanup quarantine.  Large historical experiment outputs live
+# outside the repo at D:/vscode_dir/open_vins_legacy_quarantine_20260625.
+baseline/legacy_quarantine_20260625/*
+!baseline/legacy_quarantine_20260625/README.md
+!baseline/legacy_quarantine_20260625/MOVE_SUMMARY.md

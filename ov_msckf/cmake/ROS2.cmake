@@ -24,6 +24,7 @@ add_definitions(-DROS_AVAILABLE=2)
 # Include our header files
 include_directories(
         src
+        src/thirdparty/px4
         ${EIGEN3_INCLUDE_DIR}
         ${Boost_INCLUDE_DIRS}
         ${CERES_INCLUDE_DIRS}
@@ -59,6 +60,7 @@ list(APPEND LIBRARY_SOURCES
         src/state/State.cpp
         src/state/StateHelper.cpp
         src/state/Propagator.cpp
+        src/core/ImuFilter.cpp
         src/core/VioManager.cpp
         src/core/VioManagerHelper.cpp
         src/update/UpdaterHelper.cpp
@@ -71,7 +73,7 @@ file(GLOB_RECURSE LIBRARY_HEADERS "src/*.h")
 add_library(ov_msckf_lib SHARED ${LIBRARY_SOURCES} ${LIBRARY_HEADERS})
 ament_target_dependencies(ov_msckf_lib ${ament_libraries})
 target_link_libraries(ov_msckf_lib ${thirdparty_libraries})
-target_include_directories(ov_msckf_lib PUBLIC src/)
+target_include_directories(ov_msckf_lib PUBLIC src/ src/thirdparty/px4/)
 install(TARGETS ov_msckf_lib
         LIBRARY DESTINATION lib
         RUNTIME DESTINATION bin
@@ -107,6 +109,11 @@ add_executable(test_sim_repeat src/test_sim_repeat.cpp)
 ament_target_dependencies(test_sim_repeat ${ament_libraries})
 target_link_libraries(test_sim_repeat ov_msckf_lib ${thirdparty_libraries})
 install(TARGETS test_sim_repeat DESTINATION lib/${PROJECT_NAME})
+
+add_executable(test_imu_filter src/test_imu_filter.cpp)
+ament_target_dependencies(test_imu_filter ${ament_libraries})
+target_link_libraries(test_imu_filter ov_msckf_lib ${thirdparty_libraries})
+install(TARGETS test_imu_filter DESTINATION lib/${PROJECT_NAME})
 
 # Install launch and config directories
 install(DIRECTORY launch/ DESTINATION share/${PROJECT_NAME}/launch/)

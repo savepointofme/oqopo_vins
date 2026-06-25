@@ -191,7 +191,6 @@ Single-run output:
 plots/
   *.png
   *.svg
-  interactive_flight_analysis.html
 tables/
   global_summary.csv
   metric_statistics.csv
@@ -204,6 +203,9 @@ tables/
   reference_metric_check.csv
 data/
   gps_time_aligned_samples.csv
+reports/
+  FULL_FLIGHT_ERROR_ANALYSIS.md
+  interactive_dashboard.html
 reports/
   FULL_FLIGHT_ERROR_ANALYSIS.md
 metadata/
@@ -246,9 +248,9 @@ Mandatory single-run views also include:
 - XY trajectory
 - along/cross/vertical error plots
 
-Write every static plot as both PNG and SVG. Also write
-`interactive_flight_analysis.html` so users can zoom, box-select, inspect
-values, and toggle traces locally.
+Write every static plot as both PNG and SVG. Also write the official
+`reports/interactive_dashboard.html` dashboard so users can zoom, inspect
+segments, inspect along/cross/vertical errors, and toggle traces locally.
 
 Condition comparisons add trajectory overlay, XY-error, course-error, and
 segment-drift figures.
