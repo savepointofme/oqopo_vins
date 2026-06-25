@@ -71,3 +71,7 @@ imu_window*.csv
 baseline/legacy_quarantine_20260625/*
 !baseline/legacy_quarantine_20260625/README.md
 !baseline/legacy_quarantine_20260625/MOVE_SUMMARY.md
+
+# Local draft material kept in the workspace but excluded from the clean baseline.
+docs/patent/
+ov_msckf/scripts/run_d455_fly123_nocal.sh
