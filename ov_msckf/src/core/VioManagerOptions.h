@@ -125,8 +125,8 @@ struct VioManagerOptions {
   bool enable_vio_yaw_update = true;
 
   /// Visual yaw update control mode:
-    /// original, per_block_scale, global_yaw_oc_projection, current_only_scale,
-    /// hard_gyro_yaw, a_strict_yaw_dx0.
+  /// original, per_block_scale, global_yaw_oc_projection,
+  /// global_yaw_oc_fej_projection, or a pre-chi2 VisualObservabilityPolicy mode.
   std::string vio_yaw_update_mode = "original";
 
   /// Scale for the gravity-axis component of visual orientation updates.
@@ -144,9 +144,6 @@ struct VioManagerOptions {
 
   /// If non-empty, write VisualObservabilityPolicy per-update diagnostics here.
   std::string visual_obs_diag_path = "";
-
-  /// If non-empty, write per-visual-update Schmidt yaw diagnostics to this CSV file.
-  std::string schmidt_yaw_diag_path = "";
 
   /**
    * @brief This function will load print out all estimator settings loaded.
@@ -179,23 +176,17 @@ struct VioManagerOptions {
       parser->parse_config("imu_filter", "gyro", "notch1", "enabled", imu_filter.gyro_notch1.enabled, false);
       parser->parse_config("imu_filter", "gyro", "notch1", "frequency_hz", imu_filter.gyro_notch1.frequency_hz, false);
       parser->parse_config("imu_filter", "gyro", "notch1", "bandwidth_hz", imu_filter.gyro_notch1.bandwidth_hz, false);
-      parser->parse_config("imu_filter", "gyro", "lowpass", "enabled", imu_filter.gyro_lowpass.enabled, false);
-      parser->parse_config("imu_filter", "gyro", "lowpass", "cutoff_hz", imu_filter.gyro_lowpass.cutoff_hz, false);
       parser->parse_config("imu_filter", "gyro_notch0_enabled", imu_filter.gyro_notch0.enabled, false);
       parser->parse_config("imu_filter", "gyro_notch0_frequency_hz", imu_filter.gyro_notch0.frequency_hz, false);
       parser->parse_config("imu_filter", "gyro_notch0_bandwidth_hz", imu_filter.gyro_notch0.bandwidth_hz, false);
       parser->parse_config("imu_filter", "gyro_notch1_enabled", imu_filter.gyro_notch1.enabled, false);
       parser->parse_config("imu_filter", "gyro_notch1_frequency_hz", imu_filter.gyro_notch1.frequency_hz, false);
       parser->parse_config("imu_filter", "gyro_notch1_bandwidth_hz", imu_filter.gyro_notch1.bandwidth_hz, false);
-      parser->parse_config("imu_filter", "gyro_lowpass_enabled", imu_filter.gyro_lowpass.enabled, false);
-      parser->parse_config("imu_filter", "gyro_lowpass_cutoff_hz", imu_filter.gyro_lowpass.cutoff_hz, false);
       parser->parse_config("enable_vio_yaw_update", enable_vio_yaw_update, false);
       parser->parse_config("vio_yaw_update_mode", vio_yaw_update_mode, false);
       parser->parse_config("vio_yaw_update_scale", vio_yaw_update_scale, false);
       parser->parse_config("vio_global_yaw_oc_alpha", vio_global_yaw_oc_alpha, false);
-      parser->parse_config("vio_global_yaw_schmidt_alpha", vio_global_yaw_oc_alpha, false);
       parser->parse_config("vio_yaw_update_diag_path", vio_yaw_update_diag_path, false);
-      parser->parse_config("schmidt_yaw_diag_path", schmidt_yaw_diag_path, false);
     }
     if (!enable_vio_yaw_update) {
       vio_yaw_update_mode = "per_block_scale";
@@ -220,8 +211,6 @@ struct VioManagerOptions {
                 imu_filter.gyro_notch0.frequency_hz, imu_filter.gyro_notch0.bandwidth_hz);
     PRINT_DEBUG("  - IMU gyro notch1: %d freq=%.3f Hz bandwidth=%.3f Hz\n", (int)imu_filter.gyro_notch1.enabled,
                 imu_filter.gyro_notch1.frequency_hz, imu_filter.gyro_notch1.bandwidth_hz);
-    PRINT_DEBUG("  - IMU gyro low-pass: %d cutoff=%.3f Hz\n", (int)imu_filter.gyro_lowpass.enabled,
-                imu_filter.gyro_lowpass.cutoff_hz);
     PRINT_DEBUG("  - IMU nominal sample rate: %.3f Hz (0=timestamp estimate)\n", imu_filter.sample_rate_hz);
     PRINT_DEBUG("  - IMU raw/filtered log: %d path=%s\n", (int)imu_filter.log_raw_and_filtered, imu_filter.log_path.c_str());
     PRINT_DEBUG("  - enable VIO yaw update?: %d\n", (int)enable_vio_yaw_update);

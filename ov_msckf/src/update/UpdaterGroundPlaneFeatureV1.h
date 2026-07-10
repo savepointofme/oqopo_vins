@@ -48,7 +48,7 @@ class State;
  *   3. Predict the pixel in the CURRENT clone.
  *
  * v1 differs from v0 in the Jacobian:
- *   - v0 treats the anchor pose as FIXED (Schmidt-like) — Hx_order has only
+ *   - v0 treats the anchor pose as fixed, so Hx_order has only
  *     the current clone's (q, p).  This biases the filter: the anchor
  *     pose's true uncertainty silently inflates the measurement.
  *   - v1 includes BOTH the anchor clone and the current clone in Hx_order.

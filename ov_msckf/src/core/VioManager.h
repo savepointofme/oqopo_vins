@@ -189,17 +189,53 @@ public:
    * @param sigma      Measurement stddev (meters), e.g. 1.0-5.0 for RTK/GNSS.
    */
   void feed_measurement_gps_altitude(double timestamp, double altitude_z, double sigma,
-                                     double chi2_gate = 10000.0, bool use_schmidt = false,
-                                     bool also_update_vz = false,
-                                     bool range_mode = false);
+                                     double chi2_gate = 10000.0,
+                                     bool also_update_vz = false);
 
   /// Feed GPS altitude with VioManager-managed relative reference.
   /// On first call, captures gps_ref and vio_ref, then uses:
   ///   res = (altitude_z - gps_ref) - (p_z - vio_ref)
   /// Caller must pass raw GPS ENU z (without pre-subtracting a reference).
   void feed_measurement_gps_altitude_relative(double timestamp, double altitude_z, double sigma,
-                                               double chi2_gate = 10000.0, bool use_schmidt = false,
+                                               double chi2_gate = 10000.0,
                                                bool also_update_vz = false);
+
+  /// Periodic absolute/anchor pose repair. Intended for sparse reference-image
+  /// matches; the ros-free runner can simulate this with GPS ENU position and
+  /// course yaw. Roll/pitch are intentionally not accepted unless a real
+  /// external attitude source is supplied by a future caller.
+  struct PoseAnchorLastUpdate {
+    double t = -1.0;
+    double pos_residual_norm = std::numeric_limits<double>::quiet_NaN();
+    double yaw_residual_deg = std::numeric_limits<double>::quiet_NaN();
+    double nis = std::numeric_limits<double>::quiet_NaN();
+    double gate_ratio = std::numeric_limits<double>::quiet_NaN();
+    double predicted_pos_correction_norm = std::numeric_limits<double>::quiet_NaN();
+    double predicted_yaw_correction_deg = std::numeric_limits<double>::quiet_NaN();
+    bool yaw_used = false;
+    bool accepted = false;
+    std::string decision = "NONE";
+  };
+  bool feed_measurement_pose_anchor(double timestamp,
+                                    const Eigen::Vector3d &p_IinG_meas,
+                                    double yaw_meas_rad,
+                                    bool yaw_valid,
+                                    double pos_sigma,
+                                    double yaw_sigma_rad,
+                                    double gate_sigma,
+                                    double max_pos_correction,
+                                    double max_yaw_correction_rad);
+  /// Trusted sparse global repair. This is used when an external reference-map
+  /// match is considered authoritative enough that a large residual means VIO
+  /// is lost, not that the reference should be rejected. Applies one global
+  /// yaw+translation reset to IMU pose, clones, and global landmarks; optional
+  /// velocity/bias values come from the FCInitState-style anchor.
+  bool apply_trusted_pose_anchor_reset(const FCInitState &fc,
+                                       double camera_timestamp,
+                                       bool yaw_valid,
+                                       bool velocity_valid,
+                                       bool reset_biases);
+  const PoseAnchorLastUpdate &get_last_pose_anchor_update() const { return pose_anchor_last_; }
 
   /// Set min P_zz floor to prevent covariance collapse (0 = disabled).
   /// Floor is applied BEFORE the EKF update so K_pz stays non-degenerate,
@@ -210,19 +246,9 @@ public:
   /// transient (un-settled) monocular scale.
   void set_gps_alt_min_t_after_init(double v) { gps_alt_min_t_after_init_ = v; }
 
-  /// Enable Architecture G: augment state with h_offset (GPS-VIO altitude bias).
-  /// Measurement model: GPS_z = p_z + h_offset.  Standard (unmasked) EKF update applied.
-  /// Requires StateOptions::use_gps_h_offset = true before State construction.
-  void set_gps_alt_arch_g(bool v) { gps_alt_arch_g_ = v; }
-
-  /// Enable Z-only GPS altitude update mode (legacy).
-  /// Covariance: full P update applied (all cross-terms modified); only p_z state correction kept.
-  void set_gps_alt_zonly_update(bool v) { gps_alt_zonly_update_ = v; }
-
   /// Enable PX4-style masked Joseph update for GPS-Z / scalar height aiding.
   /// Ported from PX4-Autopilot fuseHaglRng, commit d5a0ca1bbc5e932bba5dc5b2bb58e0e0147f9909.
   /// Only p_z state DOF and p_z column/row of P are updated; all others unchanged.
-  /// Takes priority over gps_alt_zonly_update_ when both are set.
   void set_gps_alt_joseph_update(bool v) { gps_alt_joseph_update_ = v; }
 
   /// Set innovation rejection gate (meters). Updates with |residual| > threshold
@@ -238,7 +264,7 @@ public:
   void set_gps_alt_guard_dbias_max(double v) { gps_alt_guard_dbias_max_ = v; }
 
   /// Configure the staged GPS-Z coupled-update experiment.
-  /// Modes: legacy_guarded (Test 0), full (Test 1), bounded (Test 2).
+  /// Modes: guarded, full, bounded, nasa_lean.
   /// All bounds are disabled when <= 0. Attitude is in radians.
   bool configure_gps_alt_coupled_update(const std::string &mode,
                                          double residual_soft_limit,
@@ -250,7 +276,7 @@ public:
                                          double max_delta_gyro_bias,
                                          double covariance_psd_check_interval);
 
-  /// Configure NASA/Lear measurement underweighting for NASA_LEAR coupled mode.
+  /// Configure NASA measurement underweighting for NASA_LEAN coupled mode.
   /// @param beta        Lear coefficient beta (>=0). 0 disables (reduces to standard).
   /// @param q_threshold Orion-style trigger: underweight only when H'PH > q_threshold (m^2).
   void set_gps_alt_nasa_underweight(double beta, double q_threshold) {
@@ -311,9 +337,6 @@ public:
     slam_freeze_t1_ = t1;
   }
 
-  /// Open/replace the Schmidt yaw diagnostic CSV.
-  void set_schmidt_yaw_diag_path(const std::string &path);
-
   /// Per-call diagnostic snapshot populated by every GPS altitude update.
   struct GpsAltLastUpdate {
     double t = -1.0;
@@ -334,14 +357,13 @@ public:
     double chi2 = 0.0;
     double innovation_variance = 0.0;   ///< S = H'PH + R (standard innovation variance)
     double gain_scale = 1.0;            ///< BOUNDED-mode uniform gain scale alpha (1.0 otherwise)
-    double nasa_beta = 0.0;             ///< NASA_LEAR underweight coefficient actually applied
+    double nasa_beta = 0.0;             ///< NASA_LEAN underweight coefficient actually applied
     double r_effective = 0.0;           ///< measurement noise fed to Joseph (R_eff = R + beta*H'PH for NASA)
     bool large_coupled_correction = false;
     bool covariance_psd_checked = false;
     bool covariance_psd = false;
     bool clipped = false;  ///< always false (rejection gate replaces clip)
-    bool zonly = false; ///< Z-only mode was used for this update
-    std::string decision = "NONE"; ///< APPLY / REJECT_BY_DXY / REJECT_BY_GAIN_RATIO / REJECT_BY_BIAS / ZONLY
+    std::string decision = "NONE"; ///< APPLY / REJECT_BY_DXY / REJECT_BY_GAIN_RATIO / REJECT_BY_BIAS
   };
   const GpsAltLastUpdate &get_last_gps_alt_update() const { return gps_alt_last_; }
 
@@ -439,12 +461,11 @@ public:
   /// Print final GPS altitude fusion statistics summary.
   void print_gps_alt_final_summary();
 
-  /// Feed GPS altitude as pseudo slant-range to a local ground plane.
-  /// Uses UpdaterGroundPlaneRange internally.  z_ground is bootstrapped
-  /// on first call.  Use zonly=true to only correct p_z (recommended).
-  bool feed_measurement_gps_ground_plane(double timestamp, double z_gps,
-                                          double sigma_range = 0.3,
-                                          bool zonly = true);
+  /// Feed a scalar height measurement that bootstraps the local ground plane.
+  /// GPS altitude uses h(x)=p_z. Rangefinder/LiDAR uses h(x)=(p_z-z_ground)/cos_tilt.
+  bool feed_measurement_gps_ground_plane(double timestamp, double height,
+                                          double sigma = 0.3,
+                                          bool rangefinder = false);
 
   /// Access the ground-plane range updater for diagnostics.
   std::shared_ptr<UpdaterGroundPlaneRange> get_updater_gplane_range() { return updaterGPlaneRange; }
@@ -837,9 +858,9 @@ private:
   // [Cross-covariance guard] Reject if bias correction norm > this. 0=off.
   double gps_alt_guard_dbias_max_ = 0.0;
 
-  enum class GpsAltCoupledMode { LEGACY_GUARDED, FULL, BOUNDED, NASA_LEAR };
-  GpsAltCoupledMode gps_alt_coupled_mode_ = GpsAltCoupledMode::LEGACY_GUARDED;
-  // NASA/Lear measurement underweighting (NASA_LEAR mode only).
+  enum class GpsAltCoupledMode { GUARDED, FULL, BOUNDED, NASA_LEAN };
+  GpsAltCoupledMode gps_alt_coupled_mode_ = GpsAltCoupledMode::GUARDED;
+  // NASA measurement underweighting (NASA_LEAN mode only).
   double gps_alt_nasa_beta_ = 0.0;        // Lear coefficient beta (>=0; 0 disables)
   double gps_alt_nasa_q_threshold_ = 0.0; // Orion-style trigger on H'PH (m^2)
   double gps_alt_residual_soft_limit_ = 0.0;
@@ -855,18 +876,8 @@ private:
   Eigen::Vector2d gps_alt_diag_xy_ = Eigen::Vector2d::Zero();
   bool gps_alt_diag_xy_valid_ = false;
 
-  // [Architecture G] GPS-VIO altitude bias augmented state.
-  // When true, h_offset Vec(1) is in H_order alongside p_z.
-  // Standard (unmasked) EKF update applied. Mutually exclusive with ZONLY/JOSEPH.
-  bool gps_alt_arch_g_ = false;
-  double gps_alt_h_offset_last_t_ = -1.0;  // timestamp of last h_offset noise injection
-
-  // [Z-only legacy] Full covariance update; only p_z state correction applied.
-  bool gps_alt_zonly_update_ = false;
-
   // [Joseph masked] PX4-style masked Joseph update: only p_z state DOF and p_z row/col updated.
   // Ported from PX4-Autopilot fuseHaglRng, commit d5a0ca1bbc5e932bba5dc5b2bb58e0e0147f9909.
-  // Takes priority over gps_alt_zonly_update_ when both are set.
   bool gps_alt_joseph_update_ = false;
 
 public:
@@ -907,6 +918,7 @@ public:
 private:
   GpsAltStats gps_alt_stats_;
   GpsAltLastUpdate gps_alt_last_;
+  PoseAnchorLastUpdate pose_anchor_last_;
 
   // [Gyro-aided KLT] Per-camera last image timestamp used for inter-frame
   // gyro integration. Initialised to -1 (no previous image) so the first

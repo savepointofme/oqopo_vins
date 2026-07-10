@@ -1,0 +1,680 @@
+[
+  {
+    "name": "run_id",
+    "dtype": "string",
+    "group": "index",
+    "source": "run directory or manifest"
+  },
+  {
+    "name": "flight_id",
+    "dtype": "string",
+    "group": "index",
+    "source": "metadata/inferred"
+  },
+  {
+    "name": "config_id",
+    "dtype": "string",
+    "group": "index",
+    "source": "metadata/inferred"
+  },
+  {
+    "name": "frame_id",
+    "dtype": "int64",
+    "group": "index",
+    "source": "diag.csv or row number"
+  },
+  {
+    "name": "timestamp_master",
+    "dtype": "float64",
+    "group": "time",
+    "source": "camera/VIO output time"
+  },
+  {
+    "name": "camera_timestamp_raw",
+    "dtype": "float64",
+    "group": "time",
+    "source": "diag.csv t"
+  },
+  {
+    "name": "vio_state_timestamp",
+    "dtype": "float64",
+    "group": "time",
+    "source": "traj.txt t"
+  },
+  {
+    "name": "fc_timestamp_raw",
+    "dtype": "float64",
+    "group": "time",
+    "source": "FC source, optional"
+  },
+  {
+    "name": "fc_timestamp_aligned",
+    "dtype": "float64",
+    "group": "time",
+    "source": "FC source, optional"
+  },
+  {
+    "name": "gps_timestamp_raw",
+    "dtype": "float64",
+    "group": "time",
+    "source": "analysis/GPS source"
+  },
+  {
+    "name": "gps_timestamp_aligned",
+    "dtype": "float64",
+    "group": "time",
+    "source": "analysis/GPS source"
+  },
+  {
+    "name": "vio_sample_delay_ms",
+    "dtype": "float64",
+    "group": "time",
+    "source": "analysis data"
+  },
+  {
+    "name": "segment_id",
+    "dtype": "string",
+    "group": "index",
+    "source": "analysis segment index"
+  },
+  {
+    "name": "init_status",
+    "dtype": "string",
+    "group": "index",
+    "source": "diag.csv initialized"
+  },
+  {
+    "name": "stride_input",
+    "dtype": "int64",
+    "group": "stride",
+    "source": "run metadata or command"
+  },
+  {
+    "name": "stride_visual_update",
+    "dtype": "int64",
+    "group": "stride",
+    "source": "camera stride audit or command"
+  },
+  {
+    "name": "stride_analysis_sample",
+    "dtype": "int64",
+    "group": "stride",
+    "source": "analysis metadata"
+  },
+  {
+    "name": "overlap_theory_along",
+    "dtype": "float64",
+    "group": "stride",
+    "source": "future footprint model"
+  },
+  {
+    "name": "overlap_polygon_area",
+    "dtype": "float64",
+    "group": "stride",
+    "source": "future footprint model"
+  },
+  {
+    "name": "overlap_valid",
+    "dtype": "bool",
+    "group": "stride",
+    "source": "future footprint model"
+  },
+  {
+    "name": "fc_q_x",
+    "dtype": "float64",
+    "group": "fc",
+    "source": "FC source, optional"
+  },
+  {
+    "name": "fc_q_y",
+    "dtype": "float64",
+    "group": "fc",
+    "source": "FC source, optional"
+  },
+  {
+    "name": "fc_q_z",
+    "dtype": "float64",
+    "group": "fc",
+    "source": "FC source, optional"
+  },
+  {
+    "name": "fc_q_w",
+    "dtype": "float64",
+    "group": "fc",
+    "source": "FC source, optional"
+  },
+  {
+    "name": "fc_roll_raw",
+    "dtype": "float64",
+    "group": "fc",
+    "source": "FC source, optional"
+  },
+  {
+    "name": "fc_pitch_raw",
+    "dtype": "float64",
+    "group": "fc",
+    "source": "FC source, optional"
+  },
+  {
+    "name": "fc_yaw_raw",
+    "dtype": "float64",
+    "group": "fc",
+    "source": "FC source, optional"
+  },
+  {
+    "name": "fc_roll_calibrated",
+    "dtype": "float64",
+    "group": "fc",
+    "source": "future FC calibration"
+  },
+  {
+    "name": "fc_pitch_calibrated",
+    "dtype": "float64",
+    "group": "fc",
+    "source": "future FC calibration"
+  },
+  {
+    "name": "fc_yaw_calibrated",
+    "dtype": "float64",
+    "group": "fc",
+    "source": "future FC calibration"
+  },
+  {
+    "name": "fc_velocity_e",
+    "dtype": "float64",
+    "group": "fc",
+    "source": "FC source, optional"
+  },
+  {
+    "name": "fc_velocity_n",
+    "dtype": "float64",
+    "group": "fc",
+    "source": "FC source, optional"
+  },
+  {
+    "name": "fc_velocity_u",
+    "dtype": "float64",
+    "group": "fc",
+    "source": "FC source, optional"
+  },
+  {
+    "name": "vio_raw_q_x",
+    "dtype": "float64",
+    "group": "vio_raw",
+    "source": "traj.txt"
+  },
+  {
+    "name": "vio_raw_q_y",
+    "dtype": "float64",
+    "group": "vio_raw",
+    "source": "traj.txt"
+  },
+  {
+    "name": "vio_raw_q_z",
+    "dtype": "float64",
+    "group": "vio_raw",
+    "source": "traj.txt"
+  },
+  {
+    "name": "vio_raw_q_w",
+    "dtype": "float64",
+    "group": "vio_raw",
+    "source": "traj.txt"
+  },
+  {
+    "name": "vio_raw_position_x",
+    "dtype": "float64",
+    "group": "vio_raw",
+    "source": "traj.txt"
+  },
+  {
+    "name": "vio_raw_position_y",
+    "dtype": "float64",
+    "group": "vio_raw",
+    "source": "traj.txt"
+  },
+  {
+    "name": "vio_raw_position_z",
+    "dtype": "float64",
+    "group": "vio_raw",
+    "source": "traj.txt"
+  },
+  {
+    "name": "vio_raw_velocity_x",
+    "dtype": "float64",
+    "group": "vio_raw",
+    "source": "traj.txt.bias"
+  },
+  {
+    "name": "vio_raw_velocity_y",
+    "dtype": "float64",
+    "group": "vio_raw",
+    "source": "traj.txt.bias"
+  },
+  {
+    "name": "vio_raw_velocity_z",
+    "dtype": "float64",
+    "group": "vio_raw",
+    "source": "traj.txt.bias"
+  },
+  {
+    "name": "vio_gyro_bias_x",
+    "dtype": "float64",
+    "group": "vio_raw",
+    "source": "traj.txt.bias or diag.csv"
+  },
+  {
+    "name": "vio_gyro_bias_y",
+    "dtype": "float64",
+    "group": "vio_raw",
+    "source": "traj.txt.bias or diag.csv"
+  },
+  {
+    "name": "vio_gyro_bias_z",
+    "dtype": "float64",
+    "group": "vio_raw",
+    "source": "traj.txt.bias or diag.csv"
+  },
+  {
+    "name": "vio_accel_bias_x",
+    "dtype": "float64",
+    "group": "vio_raw",
+    "source": "traj.txt.bias or diag.csv"
+  },
+  {
+    "name": "vio_accel_bias_y",
+    "dtype": "float64",
+    "group": "vio_raw",
+    "source": "traj.txt.bias or diag.csv"
+  },
+  {
+    "name": "vio_accel_bias_z",
+    "dtype": "float64",
+    "group": "vio_raw",
+    "source": "traj.txt.bias or diag.csv"
+  },
+  {
+    "name": "vio_mapped_q_x",
+    "dtype": "float64",
+    "group": "vio_mapped",
+    "source": "future program mapping"
+  },
+  {
+    "name": "vio_mapped_q_y",
+    "dtype": "float64",
+    "group": "vio_mapped",
+    "source": "future program mapping"
+  },
+  {
+    "name": "vio_mapped_q_z",
+    "dtype": "float64",
+    "group": "vio_mapped",
+    "source": "future program mapping"
+  },
+  {
+    "name": "vio_mapped_q_w",
+    "dtype": "float64",
+    "group": "vio_mapped",
+    "source": "future program mapping"
+  },
+  {
+    "name": "vio_mapped_position_x",
+    "dtype": "float64",
+    "group": "vio_mapped",
+    "source": "future program mapping"
+  },
+  {
+    "name": "vio_mapped_position_y",
+    "dtype": "float64",
+    "group": "vio_mapped",
+    "source": "future program mapping"
+  },
+  {
+    "name": "vio_mapped_position_z",
+    "dtype": "float64",
+    "group": "vio_mapped",
+    "source": "future program mapping"
+  },
+  {
+    "name": "vio_mapped_velocity_x",
+    "dtype": "float64",
+    "group": "vio_mapped",
+    "source": "future program mapping"
+  },
+  {
+    "name": "vio_mapped_velocity_y",
+    "dtype": "float64",
+    "group": "vio_mapped",
+    "source": "future program mapping"
+  },
+  {
+    "name": "vio_mapped_velocity_z",
+    "dtype": "float64",
+    "group": "vio_mapped",
+    "source": "future program mapping"
+  },
+  {
+    "name": "mapping_id",
+    "dtype": "string",
+    "group": "vio_mapped",
+    "source": "future program mapping"
+  },
+  {
+    "name": "mapping_applied",
+    "dtype": "bool",
+    "group": "vio_mapped",
+    "source": "future program mapping"
+  },
+  {
+    "name": "vio_analysis_aligned_position_e",
+    "dtype": "float64",
+    "group": "vio_analysis_aligned",
+    "source": "analysis/data/gps_time_aligned_samples.csv"
+  },
+  {
+    "name": "vio_analysis_aligned_position_n",
+    "dtype": "float64",
+    "group": "vio_analysis_aligned",
+    "source": "analysis/data/gps_time_aligned_samples.csv"
+  },
+  {
+    "name": "vio_analysis_aligned_position_u",
+    "dtype": "float64",
+    "group": "vio_analysis_aligned",
+    "source": "analysis/data/gps_time_aligned_samples.csv"
+  },
+  {
+    "name": "vio_analysis_aligned_velocity_e",
+    "dtype": "float64",
+    "group": "vio_analysis_aligned",
+    "source": "analysis/data/gps_time_aligned_samples.csv"
+  },
+  {
+    "name": "vio_analysis_aligned_velocity_n",
+    "dtype": "float64",
+    "group": "vio_analysis_aligned",
+    "source": "analysis/data/gps_time_aligned_samples.csv"
+  },
+  {
+    "name": "vio_analysis_aligned_velocity_u",
+    "dtype": "float64",
+    "group": "vio_analysis_aligned",
+    "source": "analysis/data/gps_time_aligned_samples.csv"
+  },
+  {
+    "name": "alignment_id",
+    "dtype": "string",
+    "group": "alignment",
+    "source": "analysis metadata"
+  },
+  {
+    "name": "alignment_mode",
+    "dtype": "string",
+    "group": "alignment",
+    "source": "analysis metadata"
+  },
+  {
+    "name": "alignment_rotation_yaw_deg",
+    "dtype": "float64",
+    "group": "alignment",
+    "source": "analysis metadata"
+  },
+  {
+    "name": "alignment_translation_e",
+    "dtype": "float64",
+    "group": "alignment",
+    "source": "analysis metadata"
+  },
+  {
+    "name": "alignment_translation_n",
+    "dtype": "float64",
+    "group": "alignment",
+    "source": "analysis metadata"
+  },
+  {
+    "name": "alignment_translation_u",
+    "dtype": "float64",
+    "group": "alignment",
+    "source": "analysis metadata"
+  },
+  {
+    "name": "alignment_applied",
+    "dtype": "bool",
+    "group": "alignment",
+    "source": "analysis data present"
+  },
+  {
+    "name": "truth_position_e",
+    "dtype": "float64",
+    "group": "truth",
+    "source": "analysis GPS/reference"
+  },
+  {
+    "name": "truth_position_n",
+    "dtype": "float64",
+    "group": "truth",
+    "source": "analysis GPS/reference"
+  },
+  {
+    "name": "truth_position_u",
+    "dtype": "float64",
+    "group": "truth",
+    "source": "analysis GPS/reference"
+  },
+  {
+    "name": "truth_velocity_e",
+    "dtype": "float64",
+    "group": "truth",
+    "source": "analysis GPS/reference"
+  },
+  {
+    "name": "truth_velocity_n",
+    "dtype": "float64",
+    "group": "truth",
+    "source": "analysis GPS/reference"
+  },
+  {
+    "name": "truth_velocity_u",
+    "dtype": "float64",
+    "group": "truth",
+    "source": "analysis GPS/reference"
+  },
+  {
+    "name": "truth_course_deg",
+    "dtype": "float64",
+    "group": "truth",
+    "source": "analysis GPS/reference"
+  },
+  {
+    "name": "gps_quality",
+    "dtype": "string",
+    "group": "truth",
+    "source": "GPS source, optional"
+  },
+  {
+    "name": "gps_velocity_source",
+    "dtype": "string",
+    "group": "truth",
+    "source": "analysis data"
+  },
+  {
+    "name": "err_e",
+    "dtype": "float64",
+    "group": "error",
+    "source": "analysis data"
+  },
+  {
+    "name": "err_n",
+    "dtype": "float64",
+    "group": "error",
+    "source": "analysis data"
+  },
+  {
+    "name": "err_u",
+    "dtype": "float64",
+    "group": "error",
+    "source": "analysis data"
+  },
+  {
+    "name": "err_xy",
+    "dtype": "float64",
+    "group": "error",
+    "source": "analysis data"
+  },
+  {
+    "name": "err_3d",
+    "dtype": "float64",
+    "group": "error",
+    "source": "analysis data"
+  },
+  {
+    "name": "err_along",
+    "dtype": "float64",
+    "group": "error",
+    "source": "analysis data"
+  },
+  {
+    "name": "err_cross",
+    "dtype": "float64",
+    "group": "error",
+    "source": "analysis data"
+  },
+  {
+    "name": "err_vertical",
+    "dtype": "float64",
+    "group": "error",
+    "source": "analysis data"
+  },
+  {
+    "name": "err_v_e",
+    "dtype": "float64",
+    "group": "error",
+    "source": "analysis data"
+  },
+  {
+    "name": "err_v_n",
+    "dtype": "float64",
+    "group": "error",
+    "source": "analysis data"
+  },
+  {
+    "name": "err_v_u",
+    "dtype": "float64",
+    "group": "error",
+    "source": "analysis data"
+  },
+  {
+    "name": "err_v_along",
+    "dtype": "float64",
+    "group": "error",
+    "source": "analysis data"
+  },
+  {
+    "name": "err_v_cross",
+    "dtype": "float64",
+    "group": "error",
+    "source": "analysis data"
+  },
+  {
+    "name": "err_v_vertical",
+    "dtype": "float64",
+    "group": "error",
+    "source": "analysis data"
+  },
+  {
+    "name": "course_error_deg",
+    "dtype": "float64",
+    "group": "error",
+    "source": "analysis data"
+  },
+  {
+    "name": "feature_klt_raw",
+    "dtype": "int64",
+    "group": "diagnostic",
+    "source": "diag.csv"
+  },
+  {
+    "name": "feature_tracked",
+    "dtype": "int64",
+    "group": "diagnostic",
+    "source": "diag.csv"
+  },
+  {
+    "name": "feature_msckf_accepted",
+    "dtype": "int64",
+    "group": "diagnostic",
+    "source": "diag.csv"
+  },
+  {
+    "name": "feature_slam_count",
+    "dtype": "int64",
+    "group": "diagnostic",
+    "source": "diag.csv"
+  },
+  {
+    "name": "mean_track_length",
+    "dtype": "float64",
+    "group": "diagnostic",
+    "source": "future tracker summary"
+  },
+  {
+    "name": "visual_update_executed",
+    "dtype": "bool",
+    "group": "diagnostic",
+    "source": "future per-frame update log"
+  },
+  {
+    "name": "data_missing_flags",
+    "dtype": "string",
+    "group": "diagnostic",
+    "source": "builder"
+  },
+  {
+    "name": "repo_commit",
+    "dtype": "string",
+    "group": "provenance",
+    "source": "git"
+  },
+  {
+    "name": "dirty_worktree",
+    "dtype": "bool",
+    "group": "provenance",
+    "source": "git"
+  },
+  {
+    "name": "runner_path",
+    "dtype": "string",
+    "group": "provenance",
+    "source": "run metadata"
+  },
+  {
+    "name": "config_path",
+    "dtype": "string",
+    "group": "provenance",
+    "source": "run metadata"
+  },
+  {
+    "name": "config_hash",
+    "dtype": "string",
+    "group": "provenance",
+    "source": "future hash"
+  },
+  {
+    "name": "calibration_id",
+    "dtype": "string",
+    "group": "provenance",
+    "source": "config snapshot"
+  },
+  {
+    "name": "command_path",
+    "dtype": "string",
+    "group": "provenance",
+    "source": "run directory"
+  },
+  {
+    "name": "analysis_source",
+    "dtype": "string",
+    "group": "provenance",
+    "source": "analysis directory"
+  }
+]

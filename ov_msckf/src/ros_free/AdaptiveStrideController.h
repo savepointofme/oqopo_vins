@@ -30,6 +30,7 @@ struct AdaptiveStrideConfig {
   double height_tau_s = 2.0;
   double speed_tau_s = 1.0;
   double gyro_tau_s = 0.25;
+  double parallax_tau_s = 0.50;
   double speed_reference_mps = 40.0;
   double speed_height_correction_m_per_mps = 2.0;
   double max_speed_height_correction_m = 40.0;
@@ -58,6 +59,26 @@ struct AdaptiveStrideConfig {
   double feature_severe_fraction = 0.35;
   double feature_recovery_s = 2.0;
 
+  // Closed-loop image parallax target. The controller uses the last accepted
+  // tracking flow as the primary stride signal. Height is only a causal fallback
+  // when no parallax is available yet. The stride range intentionally covers
+  // the fixed globalbaseline stride12 comparator.
+  int stride_min = 1;
+  int stride_max = 12;
+  double parallax_target_px = 30.0;
+  double parallax_per_raw_min_px = 0.5;
+  double parallax_low_px = 2.0;
+  double parallax_low_recover_px = 3.0;
+  double parallax_high_px = 45.0;
+  double parallax_high_recover_px = 35.0;
+  double parallax_severe_px = 65.0;
+  double parallax_recovery_s = 1.0;
+  int turn_severe_max_stride = 6;
+  int feature_low_max_stride = 6;
+  int feature_severe_max_stride = 1;
+  int parallax_high_max_stride = 3;
+  int parallax_severe_max_stride = 1;
+
   double down_hold_s = 0.50;
   double up_hold_s = 3.0;
 };
@@ -70,6 +91,7 @@ struct AdaptiveStrideInput {
   double roll_deg = std::numeric_limits<double>::quiet_NaN();
   double pitch_deg = std::numeric_limits<double>::quiet_NaN();
   double gyro_norm_radps = std::numeric_limits<double>::quiet_NaN();
+  double median_parallax_px = std::numeric_limits<double>::quiet_NaN();
   int active_msckf_features = -1;
   int active_slam_features = -1;
   int configured_feature_count = 0;
@@ -81,13 +103,20 @@ struct AdaptiveStrideDecision {
   bool changed = false;
   bool reason_turn = false;
   bool reason_feature_low = false;
+  bool reason_parallax_low = false;
+  bool reason_parallax_high = false;
   bool reason_height_valid = false;
   bool severe_turn = false;
   bool severe_feature_low = false;
+  bool severe_parallax_high = false;
+  bool force_fullrate_tracking = false;
   double filtered_height_m = std::numeric_limits<double>::quiet_NaN();
   double filtered_speed_mps = std::numeric_limits<double>::quiet_NaN();
+  double filtered_parallax_px = std::numeric_limits<double>::quiet_NaN();
+  double normalized_parallax_px = std::numeric_limits<double>::quiet_NaN();
   double effective_height_m = std::numeric_limits<double>::quiet_NaN();
   double filtered_gyro_radps = std::numeric_limits<double>::quiet_NaN();
+  int parallax_target_stride = 1;
   double hold_timer_s = 0.0;
   std::string hysteresis_state = "uninitialized";
   std::string switch_reason = "none";
@@ -108,10 +137,12 @@ public:
     update_lowpass(in.relative_height_m, dt, config_.height_tau_s, filtered_height_m_);
     update_lowpass(in.horizontal_speed_mps, dt, config_.speed_tau_s, filtered_speed_mps_);
     update_lowpass(in.gyro_norm_radps, dt, config_.gyro_tau_s, filtered_gyro_radps_);
+    update_lowpass(in.median_parallax_px, dt, config_.parallax_tau_s, filtered_parallax_px_);
 
     out.filtered_height_m = filtered_height_m_;
     out.filtered_speed_mps = filtered_speed_mps_;
     out.filtered_gyro_radps = filtered_gyro_radps_;
+    out.filtered_parallax_px = filtered_parallax_px_;
     out.reason_height_valid = std::isfinite(filtered_height_m_);
 
     double effective_height = filtered_height_m_;
@@ -193,12 +224,79 @@ public:
       }
     }
 
-    int desired = in.initialized && out.reason_height_valid ? height_base_stride_ : 1;
-    if (turn_active_)
-      desired = std::min(desired, turn_severe_active_ ? 1 : 2);
+    const bool parallax_available = std::isfinite(filtered_parallax_px_);
+    const bool parallax_low_now = parallax_available &&
+                                  filtered_parallax_px_ < config_.parallax_low_px;
+    const bool parallax_high_now = parallax_available &&
+                                   filtered_parallax_px_ > config_.parallax_high_px;
+    const bool parallax_severe_now = parallax_available &&
+                                     filtered_parallax_px_ > config_.parallax_severe_px;
+    if (parallax_low_now) {
+      parallax_low_active_ = true;
+      parallax_recovered_since_ = std::numeric_limits<double>::quiet_NaN();
+    } else if (parallax_low_active_) {
+      if (parallax_available && filtered_parallax_px_ >= config_.parallax_low_recover_px) {
+        if (!std::isfinite(parallax_recovered_since_))
+          parallax_recovered_since_ = in.timestamp;
+        if (in.timestamp - parallax_recovered_since_ >= config_.parallax_recovery_s)
+          parallax_low_active_ = false;
+      } else {
+        parallax_recovered_since_ = std::numeric_limits<double>::quiet_NaN();
+      }
+    }
+    if (parallax_high_now) {
+      parallax_high_active_ = true;
+      if (parallax_severe_now)
+        parallax_severe_active_ = true;
+      parallax_recovered_since_ = std::numeric_limits<double>::quiet_NaN();
+    } else if (parallax_high_active_) {
+      if (parallax_available && filtered_parallax_px_ <= config_.parallax_high_recover_px) {
+        if (!std::isfinite(parallax_recovered_since_))
+          parallax_recovered_since_ = in.timestamp;
+        if (in.timestamp - parallax_recovered_since_ >= config_.parallax_recovery_s) {
+          parallax_high_active_ = false;
+          parallax_severe_active_ = false;
+        }
+      } else {
+        parallax_recovered_since_ = std::numeric_limits<double>::quiet_NaN();
+      }
+    }
+
+    const bool parallax_primary_available =
+        in.initialized && parallax_available && filtered_parallax_px_ > 1e-9;
+    int desired = 1;
+    if (parallax_primary_available) {
+      const int previous_stride = std::max(1, recommended_stride_);
+      out.normalized_parallax_px =
+          filtered_parallax_px_ / static_cast<double>(previous_stride);
+      const double per_raw =
+          std::max(config_.parallax_per_raw_min_px, out.normalized_parallax_px);
+      out.parallax_target_stride = clamp_stride(
+          static_cast<int>(std::lround(config_.parallax_target_px / per_raw)));
+      desired = out.parallax_target_stride;
+      out.base_stride = desired;
+    } else {
+      desired = in.initialized && out.reason_height_valid ? height_base_stride_ : 1;
+      out.parallax_target_stride = desired;
+      out.base_stride = height_base_stride_;
+    }
+    if (parallax_low_active_ && !turn_active_ && !feature_low_active_)
+      desired = std::max(desired, clamp_stride(desired + 1));
+    if (parallax_high_active_)
+      desired = std::min(desired, clamp_stride(parallax_severe_active_
+                                                    ? config_.parallax_severe_max_stride
+                                                    : config_.parallax_high_max_stride));
+    if (turn_severe_active_)
+      desired = std::min(desired, clamp_stride(config_.turn_severe_max_stride));
     if (feature_low_active_)
-      desired = std::min(desired, feature_severe_active_ ? 1 : 2);
-    desired = std::max(1, std::min(5, desired));
+      desired = std::min(desired, clamp_stride(feature_severe_active_
+                                                    ? config_.feature_severe_max_stride
+                                                    : config_.feature_low_max_stride));
+    const bool force_fullrate_tracking =
+        parallax_severe_active_ || feature_severe_active_;
+    if (force_fullrate_tracking)
+      desired = clamp_stride(1);
+    desired = clamp_stride(desired);
 
     if (!have_switch_time_) {
       last_switch_time_ = in.timestamp;
@@ -206,16 +304,30 @@ public:
     }
     const double since_switch = std::max(0.0, in.timestamp - last_switch_time_);
     const double required_hold = desired < recommended_stride_ ? config_.down_hold_s : config_.up_hold_s;
-    if (desired != recommended_stride_ && since_switch + 1e-12 >= required_hold) {
+    const bool fast_down = force_fullrate_tracking && desired < recommended_stride_;
+    if (desired != recommended_stride_ && (fast_down || since_switch + 1e-12 >= required_hold)) {
       const bool moving_up = desired > recommended_stride_;
-      recommended_stride_ += moving_up ? 1 : -1;
-      recommended_stride_ = std::max(1, std::min(5, recommended_stride_));
+      if (fast_down)
+        recommended_stride_ = desired;
+      else
+        recommended_stride_ += moving_up ? 1 : -1;
+      recommended_stride_ = clamp_stride(recommended_stride_);
       last_switch_time_ = in.timestamp;
       out.changed = true;
-      if (feature_low_active_)
+      if (parallax_severe_active_)
+        out.switch_reason = "parallax_severe_fullrate";
+      else if (feature_severe_active_)
+        out.switch_reason = "feature_severe_fullrate";
+      else if (feature_low_active_)
         out.switch_reason = feature_severe_active_ ? "feature_severe" : "feature_low";
       else if (turn_active_)
         out.switch_reason = turn_severe_active_ ? "turn_severe" : "turn";
+      else if (parallax_high_active_)
+        out.switch_reason = parallax_severe_active_ ? "parallax_severe" : "parallax_high";
+      else if (parallax_low_active_)
+        out.switch_reason = "parallax_low";
+      else if (parallax_primary_available)
+        out.switch_reason = "parallax_target";
       else
         out.switch_reason = moving_up ? "height_up" : "height_down";
     }
@@ -223,8 +335,12 @@ public:
     out.recommended_stride = recommended_stride_;
     out.reason_turn = turn_active_;
     out.reason_feature_low = feature_low_active_;
+    out.reason_parallax_low = parallax_low_active_;
+    out.reason_parallax_high = parallax_high_active_;
     out.severe_turn = turn_severe_active_;
     out.severe_feature_low = feature_severe_active_;
+    out.severe_parallax_high = parallax_severe_active_;
+    out.force_fullrate_tracking = force_fullrate_tracking;
     const double active_hold = desired < recommended_stride_ ? config_.down_hold_s : config_.up_hold_s;
     out.hold_timer_s = std::max(0.0, active_hold - std::max(0.0, in.timestamp - last_switch_time_));
     if (!in.initialized)
@@ -233,6 +349,12 @@ public:
       out.hysteresis_state = "feature_low";
     else if (turn_active_)
       out.hysteresis_state = "turn_hold";
+    else if (parallax_high_active_)
+      out.hysteresis_state = "parallax_high";
+    else if (parallax_low_active_)
+      out.hysteresis_state = "parallax_low";
+    else if (parallax_primary_available && desired != recommended_stride_)
+      out.hysteresis_state = "parallax_target_wait";
     else if (desired > recommended_stride_)
       out.hysteresis_state = "height_recovery_wait";
     else if (desired < recommended_stride_)
@@ -255,6 +377,12 @@ private:
     }
     const double alpha = 1.0 - std::exp(-dt / tau);
     state += alpha * (value - state);
+  }
+
+  int clamp_stride(int stride) const {
+    const int lo = std::max(1, config_.stride_min);
+    const int hi = std::max(lo, config_.stride_max);
+    return std::max(lo, std::min(hi, stride));
   }
 
   void update_height_band(double height_m) {
@@ -286,14 +414,19 @@ private:
   double filtered_height_m_ = std::numeric_limits<double>::quiet_NaN();
   double filtered_speed_mps_ = std::numeric_limits<double>::quiet_NaN();
   double filtered_gyro_radps_ = std::numeric_limits<double>::quiet_NaN();
+  double filtered_parallax_px_ = std::numeric_limits<double>::quiet_NaN();
   double turn_quiet_since_ = std::numeric_limits<double>::quiet_NaN();
   double feature_recovered_since_ = std::numeric_limits<double>::quiet_NaN();
+  double parallax_recovered_since_ = std::numeric_limits<double>::quiet_NaN();
   int recommended_stride_ = 1;
   int height_base_stride_ = 1;
   bool turn_active_ = false;
   bool turn_severe_active_ = false;
   bool feature_low_active_ = false;
   bool feature_severe_active_ = false;
+  bool parallax_low_active_ = false;
+  bool parallax_high_active_ = false;
+  bool parallax_severe_active_ = false;
 };
 
 } // namespace ov_msckf

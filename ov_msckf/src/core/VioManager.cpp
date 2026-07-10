@@ -123,6 +123,38 @@ double course_yaw_from_velocity_deg(const Eigen::Vector3d &v) {
   return std::atan2(v.y(), v.x()) * 180.0 / M_PI;
 }
 
+double wrap_radians(double angle_rad) {
+  while (angle_rad > M_PI)
+    angle_rad -= 2.0 * M_PI;
+  while (angle_rad < -M_PI)
+    angle_rad += 2.0 * M_PI;
+  return angle_rad;
+}
+
+double yaw_from_Rwi_rad(const Eigen::Matrix3d &R_wi) {
+  return std::atan2(R_wi(1, 0), R_wi(0, 0));
+}
+
+double yaw_from_jpl_q_GtoI_rad(const Eigen::Vector4d &q_GtoI) {
+  return yaw_from_Rwi_rad(ov_core::quat_2_Rot(q_GtoI).transpose());
+}
+
+Eigen::RowVector3d numerical_yaw_jacobian_wrt_jpl_left_error(
+    const Eigen::Vector4d &q_GtoI) {
+  Eigen::RowVector3d H;
+  const double eps = 1e-6;
+  const double yaw0 = yaw_from_jpl_q_GtoI_rad(q_GtoI);
+  for (int i = 0; i < 3; ++i) {
+    Eigen::Vector4d dq = Eigen::Vector4d::Zero();
+    dq(i) = 0.5 * eps;
+    dq(3) = 1.0;
+    dq = ov_core::quatnorm(dq);
+    const Eigen::Vector4d q_plus = ov_core::quat_multiply(dq, q_GtoI);
+    H(i) = wrap_radians(yaw_from_jpl_q_GtoI_rad(q_plus) - yaw0) / eps;
+  }
+  return H;
+}
+
 Eigen::Matrix3d rpy_to_rot(double roll, double pitch, double yaw) {
   Eigen::AngleAxisd Rz(yaw, Eigen::Vector3d::UnitZ());
   Eigen::AngleAxisd Ry(pitch, Eigen::Vector3d::UnitY());
@@ -135,45 +167,10 @@ StateHelper::VisualYawUpdateMode visual_yaw_mode_from_string(const std::string &
     return StateHelper::VisualYawUpdateMode::ORIGINAL;
   if (mode == "per_block_scale")
     return StateHelper::VisualYawUpdateMode::PER_BLOCK_SCALE;
-  if (mode == "global_yaw_oc_projection" || mode == "global_yaw_schmidt")
+  if (mode == "global_yaw_oc_projection")
     return StateHelper::VisualYawUpdateMode::GLOBAL_YAW_OC_PROJECTION;
-  if (mode == "current_only_scale")
-    return StateHelper::VisualYawUpdateMode::CURRENT_ONLY_SCALE;
-  if (mode == "hard_gyro_yaw" || mode == "gyro_yaw_only")
-    return StateHelper::VisualYawUpdateMode::HARD_GYRO_YAW;
-  if (mode == "a_strict_yaw_dx0" || mode == "strict_yaw_dx0")
-    return StateHelper::VisualYawUpdateMode::A_STRICT_YAW_DX0;
-  if (mode == "visual_yaw_schmidt_current_gauge")
-    return StateHelper::VisualYawUpdateMode::VISUAL_YAW_SCHMIDT_CURRENT_GAUGE;
-  if (mode == "visual_yaw_h_projection_current")
-    return StateHelper::VisualYawUpdateMode::VISUAL_YAW_H_PROJECTION_CURRENT;
-  if (mode == "visual_yaw_schmidt_guarded")
-    return StateHelper::VisualYawUpdateMode::VISUAL_YAW_SCHMIDT_GUARDED;
-  if (mode == "visual_yaw_schmidt_fej_gauge")
-    return StateHelper::VisualYawUpdateMode::VISUAL_YAW_SCHMIDT_FEJ_GAUGE;
   if (mode == "global_yaw_oc_fej_projection")
     return StateHelper::VisualYawUpdateMode::GLOBAL_YAW_OC_FEJ_PROJECTION;
-  if (mode == "constrained_yaw_nullspace") {
-    // RETIRED 2026-06-06: smoke FAILED — P_n exhausted after ~40 calls; covariance indefinite.
-    // The CLI alias already exits before reaching here, but guard against direct string use.
-    PRINT_WARNING(YELLOW "[VIO-YAW] RETIRED: constrained_yaw_nullspace smoke FAILED (P_n exhausted); "
-                         "using original. See constrained_yaw_nullspace_smoke_report.md\n" RESET);
-    return StateHelper::VisualYawUpdateMode::ORIGINAL;
-  }
-  if (mode == "dso_increment_ortho") {
-    // RETIRED 2026-06-06: v1 K-projection failed fly3 smoke (P_{z,x} corrupted, t=450s).
-    // The CLI alias already exits before reaching here, but guard against direct string use.
-    PRINT_WARNING(YELLOW "[VIO-YAW] RETIRED: dso_increment_ortho v1 (K-projection smoke fail); "
-                         "redirecting to global_yaw_oc_fej_projection (mode 10).\n" RESET);
-    return StateHelper::VisualYawUpdateMode::GLOBAL_YAW_OC_FEJ_PROJECTION;
-  }
-  if (mode == "vins_numeric_nullspace") {
-    // RETIRED 2026-06-06: smoke showed n_zeroed=0; EVD on S ≠ VINS marginalization.
-    PRINT_WARNING(YELLOW "[VIO-YAW] RETIRED: vins_numeric_nullspace (n_zeroed=0 smoke fail); "
-                         "using original.\n" RESET);
-    return StateHelper::VisualYawUpdateMode::ORIGINAL;
-  }
-  // Pre-chi2 VOP modes: EKFUpdate runs ORIGINAL (projection already applied by VOP)
   if (VisualObservabilityPolicy::is_prechi2_mode_string(mode))
     return StateHelper::VisualYawUpdateMode::ORIGINAL;
   PRINT_WARNING(YELLOW "[VIO-YAW] unknown vio_yaw_update_mode=%s, using original\n" RESET, mode.c_str());
@@ -190,7 +187,7 @@ std::shared_ptr<VisualObservabilityPolicy> make_vop(const std::string &mode) {
   return nullptr;
 }
 
-// Apply VOP (and legacy yaw mode) to all visual updaters.
+// Apply the selected visual yaw policy to all visual updaters.
 void apply_yaw_control_to_updaters(
     const std::string &mode, double scale, double alpha,
     std::shared_ptr<UpdaterMSCKF> &msckf,
@@ -198,9 +195,7 @@ void apply_yaw_control_to_updaters(
   auto sh_mode = visual_yaw_mode_from_string(mode);
   auto vop = make_vop(mode);
   // For pre-chi2 VOP modes, EKFUpdate runs ORIGINAL (OC already applied pre-chi2).
-  // For visual_yaw_schmidt_current_gauge, EKFUpdate dispatches to the Schmidt path —
-  //   no VOP is used, and the mode is passed through directly.
-  // For all other (legacy) modes, sh_mode carries the projection.
+  // For non-VOP modes, sh_mode carries the projection.
   auto ekf_mode = vop ? StateHelper::VisualYawUpdateMode::ORIGINAL : sh_mode;
   double ekf_scale = vop ? 1.0 : scale;
   double ekf_alpha = vop ? 0.0 : alpha;
@@ -217,15 +212,7 @@ void apply_yaw_control_to_updaters(
 } // namespace
 
 // =============================================================================
-// [中文] 构造函数
-//  按顺序搭建整个 VIO 系统:
-//    1. 加载与打印配置
 //    2. 创建 State 并将调用者传入的外参/内参/IMU内参写入
-//    3. 根据 params.use_klt / params.use_aruco 创建前端跟踪器
-//    4. 创建 Propagator（传播）、InertialInitializer (初始化),
-//       各类更新器 (MSCKF / SLAM / ZUPT)
-//  注意构造完成后系统处于"等待初始化"状态, State 的核心变量 (q, p, v, b) 未被赋值,
-//  真正的初值在 try_to_initialize() 成功后才写入。
 // =============================================================================
 VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false), thread_init_success(false) {
 
@@ -308,9 +295,6 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   if (!params.visual_obs_diag_path.empty()) {
     set_visual_obs_diag_path(params.visual_obs_diag_path);
   }
-  if (!params.schmidt_yaw_diag_path.empty()) {
-    set_schmidt_yaw_diag_path(params.schmidt_yaw_diag_path);
-  }
 
   //===================================================================================
   //===================================================================================
@@ -319,8 +303,6 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
   // Let's make a feature extractor
   // NOTE: after we initialize we will increase the total number of feature tracks
   // NOTE: we will split the total number of features over all cameras uniformly
-  // [中文] 初始阶段将总特征数均匀地分配到每个相机上;
-  //        初始化完成后, State 内的 num_pts 会被调大为 params.num_pts (正常跟踪阶段)。
   int init_max_features = std::floor((double)params.init_options.init_max_features / (double)params.state_options.num_cameras);
   if (params.use_klt) {
     trackFEATS = std::shared_ptr<TrackBase>(new TrackKLT(state->_cam_intrinsics_cameras, init_max_features,
@@ -390,11 +372,7 @@ VioManager::~VioManager() {
 
 // =============================================================================
 // [中文] IMU 消息入口
-//  - 未初始化时: oldest_time = 当前时刻减去初始化窗口, 保留窗内所有 IMU
-//  - 已初始化时: oldest_time = 最老克隆的时间（margtimestep）,
-//                    小于它的 IMU 已经被用掉, 可安全丢弃
 //  对下游计算的影响:
-//    - propagator 用其基本保证可拿到下次 propagate_and_clone 所需 IMU
 //    - initializer / ZUPT 在各自的窗口外丢弃旧测量
 // =============================================================================
 void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
@@ -410,7 +388,6 @@ void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
     oldest_time = -1;
   }
   if (!is_initialized_vio) {
-    // [中文] -0.10 留了 100ms 宽容时间, 避免因相机/IMU 不同步把即将使用的 IMU 误删
     oldest_time = processed_message.timestamp - params.init_options.init_window_time + state->_calib_dt_CAMtoIMU->value()(0) - 0.10;
   }
   propagator->feed_imu(processed_message, oldest_time);
@@ -436,22 +413,20 @@ bool VioManager::configure_gps_alt_coupled_update(
   std::transform(normalized.begin(), normalized.end(), normalized.begin(),
                  [](unsigned char c) { return (char)std::tolower(c); });
   std::replace(normalized.begin(), normalized.end(), '-', '_');
-  if (normalized == "classic" || normalized == "guarded" ||
-      normalized == "legacy_guarded" || normalized == "legacy") {
-    gps_alt_coupled_mode_ = GpsAltCoupledMode::LEGACY_GUARDED;
+  if (normalized == "guarded") {
+    gps_alt_coupled_mode_ = GpsAltCoupledMode::GUARDED;
   } else if (normalized == "full" || normalized == "standard") {
     // "standard": full standard Kalman gain + coupled Joseph, no underweighting.
     gps_alt_coupled_mode_ = GpsAltCoupledMode::FULL;
   } else if (normalized == "bounded" || normalized == "scaled_joseph") {
     // "scaled_joseph": Codex trust-region uniform-gain scaling (frozen Test 2).
     gps_alt_coupled_mode_ = GpsAltCoupledMode::BOUNDED;
-  } else if (normalized == "nasa_lear" || normalized == "nasa_lean" ||
-             normalized == "nasa_underweight") {
-    // NASA/Lear measurement underweighting (independent third mode).
-    gps_alt_coupled_mode_ = GpsAltCoupledMode::NASA_LEAR;
+  } else if (normalized == "nasa_lean" || normalized == "nasa_underweight") {
+    // NASA measurement underweighting (independent third mode).
+    gps_alt_coupled_mode_ = GpsAltCoupledMode::NASA_LEAN;
   } else {
     PRINT_ERROR(RED "[GPS-ALT] unknown coupled mode '%s' "
-                    "(expected legacy_guarded|full(standard)|bounded(scaled_joseph)|nasa_lear)\n" RESET,
+                    "(expected guarded|full(standard)|bounded(scaled_joseph)|nasa_lean)\n" RESET,
                 mode.c_str());
     return false;
   }
@@ -516,11 +491,261 @@ void VioManager::set_gps_alt_xy_diagnostic_reference(
   gps_alt_diag_xy_valid_ = valid && xy.allFinite();
 }
 
-void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude_z, double sigma,
-                                               double chi2_gate, bool use_schmidt,
-                                               bool also_update_vz, bool range_mode) {
+bool VioManager::feed_measurement_pose_anchor(
+    double timestamp, const Eigen::Vector3d &p_IinG_meas,
+    double yaw_meas_rad, bool yaw_valid, double pos_sigma,
+    double yaw_sigma_rad, double gate_sigma,
+    double max_pos_correction, double max_yaw_correction_rad) {
 
-  // 需要先初始化完成
+  pose_anchor_last_ = PoseAnchorLastUpdate();
+  pose_anchor_last_.t = state ? state->_timestamp : timestamp;
+  pose_anchor_last_.yaw_used = false;
+
+  if (!is_initialized_vio || state == nullptr || state->_imu == nullptr) {
+    pose_anchor_last_.decision = "SKIP_NOT_INITIALIZED";
+    return false;
+  }
+  if (!p_IinG_meas.allFinite() || pos_sigma <= 0.0 || gate_sigma <= 0.0) {
+    pose_anchor_last_.decision = "REJECT_BAD_INPUT";
+    return false;
+  }
+  if (std::fabs(state->_timestamp - timestamp) > 0.50) {
+    pose_anchor_last_.decision = "SKIP_TIME_MISALIGN";
+    return false;
+  }
+
+  const Eigen::Vector3d p_pred = state->_imu->pos();
+  const double yaw_pred = current_imu_yaw_deg() * M_PI / 180.0;
+  const bool use_yaw = yaw_valid && std::isfinite(yaw_meas_rad) &&
+                       yaw_sigma_rad > 0.0;
+  const int rows = use_yaw ? 4 : 3;
+  pose_anchor_last_.yaw_used = use_yaw;
+
+  std::vector<std::shared_ptr<ov_type::Type>> H_order;
+  Eigen::MatrixXd H;
+  Eigen::VectorXd res = Eigen::VectorXd::Zero(rows);
+  Eigen::MatrixXd R = Eigen::MatrixXd::Zero(rows, rows);
+
+  if (use_yaw) {
+    H_order = {state->_imu->q(), state->_imu->p()};
+    H = Eigen::MatrixXd::Zero(rows, 6);
+    H.block<3, 3>(0, 3) = Eigen::Matrix3d::Identity();
+    H.block<1, 3>(3, 0) =
+        numerical_yaw_jacobian_wrt_jpl_left_error(state->_imu->quat());
+    res.segment<3>(0) = p_IinG_meas - p_pred;
+    res(3) = wrap_radians(yaw_meas_rad - yaw_pred);
+    R.block<3, 3>(0, 0) =
+        std::pow(pos_sigma, 2) * Eigen::Matrix3d::Identity();
+    R(3, 3) = std::pow(yaw_sigma_rad, 2);
+  } else {
+    H_order = {state->_imu->p()};
+    H = Eigen::MatrixXd::Zero(rows, 3);
+    H.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity();
+    res = p_IinG_meas - p_pred;
+    R = std::pow(pos_sigma, 2) * Eigen::Matrix3d::Identity();
+  }
+
+  pose_anchor_last_.pos_residual_norm = res.segment<3>(0).norm();
+  pose_anchor_last_.yaw_residual_deg =
+      use_yaw ? res(3) * 180.0 / M_PI : quiet_nan();
+
+  Eigen::MatrixXd P_small = StateHelper::get_marginal_covariance(state, H_order);
+  Eigen::MatrixXd S = H * P_small * H.transpose() + R;
+  if (!S.allFinite()) {
+    pose_anchor_last_.decision = "REJECT_NONFINITE_S";
+    return false;
+  }
+  Eigen::LDLT<Eigen::MatrixXd> ldlt(S);
+  if (ldlt.info() != Eigen::Success) {
+    pose_anchor_last_.decision = "REJECT_S_DECOMPOSITION";
+    return false;
+  }
+  const Eigen::VectorXd Sinv_res = ldlt.solve(res);
+  if (!Sinv_res.allFinite()) {
+    pose_anchor_last_.decision = "REJECT_NONFINITE_NIS";
+    return false;
+  }
+  const double nis = res.dot(Sinv_res);
+  const double ratio = nis / (gate_sigma * gate_sigma * (double)rows);
+  pose_anchor_last_.nis = nis;
+  pose_anchor_last_.gate_ratio = ratio;
+  if (!std::isfinite(ratio) || ratio > 1.0) {
+    pose_anchor_last_.decision = "REJECT_INNOVATION";
+    return false;
+  }
+
+  Eigen::VectorXd dx = StateHelper::compute_update_dx(state, H_order, H, res, R);
+  if (!dx.allFinite()) {
+    pose_anchor_last_.decision = "REJECT_NONFINITE_DX";
+    return false;
+  }
+  const int p_start = state->_imu->p()->id();
+  const int q_start = state->_imu->q()->id();
+  Eigen::Vector3d dp = Eigen::Vector3d::Zero();
+  Eigen::Vector3d dq = Eigen::Vector3d::Zero();
+  if (p_start >= 0 && p_start + 2 < dx.rows())
+    dp = dx.segment<3>(p_start);
+  if (q_start >= 0 && q_start + 2 < dx.rows())
+    dq = dx.segment<3>(q_start);
+  pose_anchor_last_.predicted_pos_correction_norm = dp.norm();
+  pose_anchor_last_.predicted_yaw_correction_deg = dq(2) * 180.0 / M_PI;
+  if (max_pos_correction > 0.0 && dp.norm() > max_pos_correction) {
+    pose_anchor_last_.decision = "REJECT_TRUST_REGION_POS";
+    return false;
+  }
+  if (use_yaw && max_yaw_correction_rad > 0.0 &&
+      std::fabs(dq(2)) > max_yaw_correction_rad) {
+    pose_anchor_last_.decision = "REJECT_TRUST_REGION_YAW";
+    return false;
+  }
+
+  const double yaw_before = current_imu_yaw_deg();
+  StateHelper::reset_last_yaw_dx_projection_diag();
+  StateHelper::EKFUpdate(state, H_order, H, res, R);
+  const double yaw_after = current_imu_yaw_deg();
+  pose_anchor_last_.accepted = true;
+  pose_anchor_last_.decision = use_yaw ? "ACCEPT_POS_YAW" : "ACCEPT_POS";
+  log_vio_yaw_update(state->_timestamp, "POSE_ANCHOR",
+                     yaw_before, yaw_after,
+                     wrap_degrees(yaw_after - yaw_before),
+                     state->_imu->bias_g()(2), 1, nis, 1, 0,
+                     trackFEATS ? get_feature_database_size() : -1);
+  log_yaw_update_mechanism(state->_timestamp, "POSE_ANCHOR",
+                           yaw_before, yaw_after,
+                           course_yaw_from_velocity_deg(state->_imu->vel()),
+                           course_yaw_from_velocity_deg(state->_imu->vel()),
+                           wrap_degrees(yaw_after - yaw_before),
+                           1, nis, 1, 0,
+                           trackFEATS ? get_feature_database_size() : -1);
+  PRINT_INFO(CYAN "[POSE-ANCHOR] %s t=%.3f |pos_res|=%.2f yaw_res=%.2fdeg "
+                  "nis=%.2f ratio=%.3f |dp|=%.2f dyaw_pred=%.2fdeg\n" RESET,
+             pose_anchor_last_.decision.c_str(), state->_timestamp,
+             pose_anchor_last_.pos_residual_norm,
+             pose_anchor_last_.yaw_residual_deg,
+             pose_anchor_last_.nis, pose_anchor_last_.gate_ratio,
+             pose_anchor_last_.predicted_pos_correction_norm,
+             pose_anchor_last_.predicted_yaw_correction_deg);
+  return true;
+}
+
+bool VioManager::apply_trusted_pose_anchor_reset(const FCInitState &fc,
+                                                  double camera_timestamp,
+                                                  bool yaw_valid,
+                                                  bool velocity_valid,
+                                                  bool reset_biases) {
+  pose_anchor_last_ = PoseAnchorLastUpdate();
+  pose_anchor_last_.t = state ? state->_timestamp : camera_timestamp;
+  pose_anchor_last_.yaw_used = yaw_valid;
+
+  if (!is_initialized_vio || state == nullptr || state->_imu == nullptr) {
+    pose_anchor_last_.decision = "TRUSTED_RESET_SKIP_NOT_INITIALIZED";
+    return false;
+  }
+  if (!fc.p_IinG.allFinite()) {
+    pose_anchor_last_.decision = "TRUSTED_RESET_REJECT_BAD_POSITION";
+    return false;
+  }
+  if (std::fabs(state->_timestamp - camera_timestamp) > 0.50) {
+    pose_anchor_last_.decision = "TRUSTED_RESET_SKIP_TIME_MISALIGN";
+    return false;
+  }
+
+  const Eigen::Vector3d p_before = state->_imu->pos();
+  const double yaw_before_deg = current_imu_yaw_deg();
+  double yaw_delta_rad = 0.0;
+  if (yaw_valid && fc.q_GtoI.allFinite()) {
+    const Eigen::Matrix3d R_ItoG_meas = ov_core::quat_2_Rot(fc.q_GtoI).transpose();
+    const double yaw_meas_rad = rot_to_rpy(R_ItoG_meas)(2);
+    yaw_delta_rad = wrap_radians(yaw_meas_rad - yaw_before_deg * M_PI / 180.0);
+  }
+  const Eigen::Matrix3d R_delta =
+      Eigen::AngleAxisd(yaw_delta_rad, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+  const Eigen::Vector3d t_delta = fc.p_IinG - R_delta * p_before;
+
+  auto transform_pose_value = [&](const Eigen::MatrixXd &value) {
+    Eigen::Matrix<double, 7, 1> out = value;
+    const Eigen::Matrix3d R_ItoG = ov_core::quat_2_Rot(out.block<4, 1>(0, 0)).transpose();
+    const Eigen::Matrix3d R_ItoG_new = R_delta * R_ItoG;
+    out.block<4, 1>(0, 0) = ov_core::rot_2_quat(R_ItoG_new.transpose());
+    out.block<3, 1>(4, 0) = R_delta * out.block<3, 1>(4, 0) + t_delta;
+    return out;
+  };
+
+  {
+    Eigen::Matrix<double, 16, 1> imu = state->_imu->value();
+    const Eigen::Matrix3d R_ItoG = ov_core::quat_2_Rot(imu.block<4, 1>(0, 0)).transpose();
+    const Eigen::Matrix3d R_ItoG_new = R_delta * R_ItoG;
+    imu.block<4, 1>(0, 0) = ov_core::rot_2_quat(R_ItoG_new.transpose());
+    imu.block<3, 1>(4, 0) = fc.p_IinG;
+    imu.block<3, 1>(7, 0) =
+        (velocity_valid && fc.v_IinG.allFinite()) ? fc.v_IinG : R_delta * imu.block<3, 1>(7, 0);
+    if (reset_biases && fc.bg.allFinite())
+      imu.block<3, 1>(10, 0) = fc.bg;
+    if (reset_biases && fc.ba.allFinite())
+      imu.block<3, 1>(13, 0) = fc.ba;
+    state->_imu->set_value(imu);
+
+    Eigen::Matrix<double, 16, 1> imu_fej = state->_imu->fej();
+    const Eigen::Matrix3d R_ItoG_fej = ov_core::quat_2_Rot(imu_fej.block<4, 1>(0, 0)).transpose();
+    const Eigen::Matrix3d R_ItoG_fej_new = R_delta * R_ItoG_fej;
+    imu_fej.block<4, 1>(0, 0) = ov_core::rot_2_quat(R_ItoG_fej_new.transpose());
+    imu_fej.block<3, 1>(4, 0) = R_delta * imu_fej.block<3, 1>(4, 0) + t_delta;
+    imu_fej.block<3, 1>(7, 0) =
+        (velocity_valid && fc.v_IinG.allFinite()) ? fc.v_IinG : R_delta * imu_fej.block<3, 1>(7, 0);
+    if (reset_biases && fc.bg.allFinite())
+      imu_fej.block<3, 1>(10, 0) = fc.bg;
+    if (reset_biases && fc.ba.allFinite())
+      imu_fej.block<3, 1>(13, 0) = fc.ba;
+    state->_imu->set_fej(imu_fej);
+  }
+
+  for (auto &clone_pair : state->_clones_IMU) {
+    clone_pair.second->set_value(transform_pose_value(clone_pair.second->value()));
+    clone_pair.second->set_fej(transform_pose_value(clone_pair.second->fej()));
+  }
+
+  for (auto &feat_pair : state->_features_SLAM) {
+    auto &lm = feat_pair.second;
+    if (!lm)
+      continue;
+    const auto rep = lm->_feat_representation;
+    const bool global_rep =
+        rep == LandmarkRepresentation::Representation::GLOBAL_3D ||
+        rep == LandmarkRepresentation::Representation::GLOBAL_FULL_INVERSE_DEPTH;
+    if (!global_rep)
+      continue;
+    const Eigen::Vector3d xyz = lm->get_xyz(false);
+    if (xyz.allFinite())
+      lm->set_from_xyz(R_delta * xyz + t_delta, false);
+    const Eigen::Vector3d xyz_fej = lm->get_xyz(true);
+    if (xyz_fej.allFinite())
+      lm->set_from_xyz(R_delta * xyz_fej + t_delta, true);
+  }
+
+  reset_gps_altitude_bootstrap();
+  pose_anchor_last_.pos_residual_norm = (fc.p_IinG - p_before).norm();
+  pose_anchor_last_.yaw_residual_deg = yaw_delta_rad * 180.0 / M_PI;
+  pose_anchor_last_.accepted = true;
+  pose_anchor_last_.decision = yaw_valid ? "TRUSTED_RESET_POS_YAW" : "TRUSTED_RESET_POS";
+
+  const double yaw_after_deg = current_imu_yaw_deg();
+  log_vio_yaw_update(state->_timestamp, "POSE_ANCHOR_TRUSTED_RESET",
+                     yaw_before_deg, yaw_after_deg,
+                     wrap_degrees(yaw_after_deg - yaw_before_deg),
+                     state->_imu->bias_g()(2), 1, 0.0, 1, 0,
+                     trackFEATS ? get_feature_database_size() : -1);
+  PRINT_WARNING(YELLOW "[POSE-ANCHOR] %s t=%.3f |pos_res|=%.2f yaw_reset=%.2fdeg "
+                       "vel_reset=%d bias_reset=%d\n" RESET,
+                pose_anchor_last_.decision.c_str(), state->_timestamp,
+                pose_anchor_last_.pos_residual_norm,
+                pose_anchor_last_.yaw_residual_deg,
+                velocity_valid ? 1 : 0, reset_biases ? 1 : 0);
+  return true;
+}
+
+void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude_z, double sigma,
+                                                double chi2_gate, bool also_update_vz) {
+
   if (!is_initialized_vio) {
     return;
   }
@@ -557,12 +782,25 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
     gps_alt_stats_.last_summary_time = t_state;
     size_t n_evals = gps_alt_stats_.n_accepted + gps_alt_stats_.n_rejected;
     double rate = n_evals > 0 ? 100.0 * gps_alt_stats_.n_accepted / n_evals : 0;
-    PRINT_INFO(CYAN "[GPS-ALT-STAT] t=%.1f calls=%zu acc=%zu rej=%zu(dxy=%zu kxy=%zu bias=%zu) skip=%zu rate=%.1f%% "
-               "K_pz_mu=%.5f |K_xy|_mu=%.5f |dxy|_mu=%.4f |dtheta|_mu=%.4f |dba|_mu=%.5f |dbg|_mu=%.5f "
-               "P_zz_mu=%.4f |res|_mu=%.2f dpz_mu=%.3f\n" RESET,
-               t_state, gps_alt_stats_.n_called, gps_alt_stats_.n_accepted, gps_alt_stats_.n_rejected,
-               gps_alt_stats_.n_rejected_dxy, gps_alt_stats_.n_rejected_kxy, gps_alt_stats_.n_rejected_bias,
-               gps_alt_stats_.n_skipped, rate,
+    PRINT_INFO(CYAN
+               "[GPS-ALT-STAT]\n"
+               "+----------+--------+--------+--------+--------+--------+\n"
+               "| t_cam    | calls  | acc    | rej    | skip   | rate   |\n"
+               "| %8.1f | %6zu | %6zu | %6zu | %6zu | %5.1f%% |\n"
+               "+----------+--------+--------+--------+--------+--------+\n"
+               "| reject dxy | reject kxy | reject bias | large coupled |\n"
+               "| %10zu | %10zu | %11zu | %13zu |\n"
+               "+------------+------------+-------------+---------------+\n"
+               "| K_pz_mu | K_xy_mu | dxy_mu | dtheta_mu | dba_mu  | dbg_mu  |\n"
+               "| %7.5f | %7.5f | %6.4f | %9.4f | %7.5f | %7.5f |\n"
+               "+---------+---------+--------+-----------+---------+---------+\n"
+               "| P_zz_mu | abs_res_mu | abs_dpz_mu |\n"
+               "| %7.4f | %10.2f | %10.3f |\n"
+               "+---------+------------+------------+\n" RESET,
+               t_state, gps_alt_stats_.n_called, gps_alt_stats_.n_accepted,
+               gps_alt_stats_.n_rejected, gps_alt_stats_.n_skipped, rate,
+               gps_alt_stats_.n_rejected_dxy, gps_alt_stats_.n_rejected_kxy,
+               gps_alt_stats_.n_rejected_bias, gps_alt_stats_.n_large_coupled,
                n_evals > 0 ? gps_alt_stats_.sum_K_pz / n_evals : 0.0,
                n_evals > 0 ? gps_alt_stats_.sum_K_xy_norm / n_evals : 0.0,
                n_evals > 0 ? gps_alt_stats_.sum_dxy_norm / n_evals : 0.0,
@@ -575,7 +813,6 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
   }
 
   // [中文] 时间差容忍放宽到 200ms. GPS 5Hz 间隔 200ms, cam 20Hz 间隔 50ms.
-  // 调用方已经在最近的 cam 帧触发, 所以差值通常 < 100ms.
   if (t_state < timestamp - 0.2 || t_state > timestamp + 0.2) {
     gps_alt_stats_.n_skipped++;
     PRINT_DEBUG(YELLOW "[GPS-ALT-EVAL] status=SKIP t_cam=%.3f t_gps=%.3f dt=%+.3fs (state=%.3f meas=%.3f)\n" RESET,
@@ -584,96 +821,14 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
   }
 
   Eigen::Vector3d p_IinG = state->_imu->pos();
-  Eigen::Matrix3d R_GtoI = state->_imu->Rot();
-  // body z-axis expressed in world = R_ItoG * e_z = 3rd row of R_GtoI as column
-  const double r22 = R_GtoI(2, 2);   // cos(tilt) for a downward LRF pointing along -body_z
 
   // H_order: active state variables included in the Jacobian
   std::vector<std::shared_ptr<Type>> Hx_order;
   Eigen::MatrixXd H;
   double z_pred;
 
-  if (range_mode) {
-    // [C-mode] Range model: measurement = body-frame downward range to flat ground.
-    //   h(x) = (p_z - z_ground) / R_GtoI(2,2)
-    //   Bootstrap z_ground once from the first accepted sample so that any
-    //   VIO / altimeter origin mismatch is absorbed into z_ground (and NOT
-    //   into a large residual that would corrupt ba through cross-cov).
-    // For a non-tilted drone R_GtoI(2,2)≈1 and this reduces to (p_z - z0).
-    if (!gps_alt_bootstrapped_) {
-      // bootstrap: make predicted range match measured range at first sample
-      gps_alt_z_ground_ = p_IinG(2) - altitude_z * r22;
-      gps_alt_bootstrapped_ = true;
-      PRINT_INFO(CYAN "[GPS-ALT-C]: bootstrap z_ground=%.3fm (p_z=%.3f, meas=%.3f, r22=%.3f)\n" RESET,
-                 gps_alt_z_ground_, p_IinG(2), altitude_z, r22);
-    }
-
-    if (std::abs(r22) < 0.3) {
-      // severely tilted (>72deg) - skip, model unreliable
-      PRINT_WARNING(YELLOW "[GPS-ALT-C]: skip, r22=%.3f too small (drone tilted)\n" RESET, r22);
-      return;
-    }
-
-    z_pred = (p_IinG(2) - gps_alt_z_ground_) / r22;
-
-    // Jacobian: d h / d p_z = 1/r22
-    //           d h / d theta_imu (world-frame err.state, left-mult on R_GtoI):
-    //     R_GtoI'(2,2) = R_GtoI(2,2) + [R_GtoI(1,2)*dtheta_x - R_GtoI(0,2)*dtheta_y]
-    //     so d r22 / d theta = [R(1,2), -R(0,2), 0]
-    //     d h / d theta = -(p_z - z0)/r22^2 * [R(1,2), -R(0,2), 0]
-    Hx_order.push_back(state->_imu->q());   // 3 (orientation)
-    Hx_order.push_back(state->_imu->p());   // 3 (position)
-    if (also_update_vz) {
-      Hx_order.push_back(state->_imu->v()); // 3 (velocity)
-    }
-    int ncol = 3 * Hx_order.size();
-    H = Eigen::MatrixXd::Zero(1, ncol);
-    double coef = -(p_IinG(2) - gps_alt_z_ground_) / (r22 * r22);
-    H(0, 0) = coef * R_GtoI(1, 2);   // d/d theta_x
-    H(0, 1) = coef * (-R_GtoI(0, 2)); // d/d theta_y
-    H(0, 2) = 0.0;                    // d/d theta_z (yaw around g has no effect on r22)
-    H(0, 3 + 2) = 1.0 / r22;          // d/d p_z
-    // velocity columns (if included) default 0
-  } else if (gps_alt_arch_g_ && state->_h_offset && state->_h_offset->id() >= 0) {
-    // Architecture G (new_height_aid_research.md §5.3):
-    //   GPS_z = p_z + h_offset    (h_offset = GPS-VIO altitude reference bias)
-    //   H = [0, 0, 1,  1]   in {p_x, p_y, p_z, h_offset}
-    //
-    // Both p_z and h_offset receive consistent corrections. No masking.
-    // h_offset absorbs measurement innovation; cross-covariances evolve correctly.
-
-    // Inject random-walk process noise into h_offset (models slow drift of bias)
-    if (gps_alt_h_offset_last_t_ > 0.0) {
-      double dt_noise = t_state - gps_alt_h_offset_last_t_;
-      if (dt_noise > 0.0 && dt_noise < 10.0) {
-        double walk_var = std::pow(params.state_options.gps_h_offset_walk_sigma, 2) * dt_noise;
-        StateHelper::inject_h_offset_noise(state, walk_var);
-      }
-    }
-    gps_alt_h_offset_last_t_ = t_state;
-
-    double h_offset_val = state->_h_offset->value()(0);
-    z_pred = p_IinG(2) + h_offset_val;
-
-    Hx_order.push_back(state->_imu->p());
-    Hx_order.push_back(state->_h_offset);
-    if (also_update_vz) {
-      // Insert velocity before h_offset so h_offset is last
-      Hx_order.clear();
-      Hx_order.push_back(state->_imu->p());
-      Hx_order.push_back(state->_imu->v());
-      Hx_order.push_back(state->_h_offset);
-      H = Eigen::MatrixXd::Zero(1, 7); // p(3) + v(3) + h_offset(1)
-      H(0, 2) = 1.0;   // p_z
-      H(0, 6) = 1.0;   // h_offset
-    } else {
-      H = Eigen::MatrixXd::Zero(1, 4); // p(3) + h_offset(1)
-      H(0, 2) = 1.0;   // p_z
-      H(0, 3) = 1.0;   // h_offset
-    }
-    // pz_idx stays 2 (within H_order: p is first, p_z is column 2)
-  } else {
-    // Legacy measurement model: h(x) = p_IinG[2]  (altitude directly in world)
+  {
+    // GPS altitude is already a world-frame height measurement: h(x) = p_z.
     z_pred = p_IinG(2);
     Hx_order.push_back(state->_imu->p());
     if (also_update_vz) {
@@ -691,10 +846,9 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
   Eigen::MatrixXd R = Eigen::MatrixXd::Zero(1, 1);
   R(0, 0) = std::pow(sigma, 2);
 
-  int pz_idx = range_mode ? (3 + 2) : 2;
+  int pz_idx = 2;
 
   // --- P_zz floor BEFORE update: prevent K_pz from collapsing to ~0 ---
-  // When P_pz << R, K_pz = P_pz/(P_pz+R) ≈ P_pz/R ≈ 0, making GPS useless.
   // Injecting noise before computing S/K keeps the Kalman gain alive.
   if (gps_alt_min_pzz_ > 0) {
     Eigen::MatrixXd P_pre_check = StateHelper::get_marginal_covariance(state, Hx_order);
@@ -756,10 +910,10 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
   // Large residuals indicate a systematic GPS offset that would pull the state
   // incorrectly.  Skipping the update entirely is safer than clamping.
   const double raw_res = res_scalar;
-  if (gps_alt_coupled_mode_ == GpsAltCoupledMode::LEGACY_GUARDED &&
+  if (gps_alt_coupled_mode_ == GpsAltCoupledMode::GUARDED &&
       gps_alt_max_res_gate_ < 1e8 && std::fabs(res_scalar) > gps_alt_max_res_gate_) {
     gps_alt_stats_.n_rejected++;
-    PRINT_INFO(YELLOW "[GPS-ALT] REJECT t=%.3f |res|=%.1f > %.1f m — skipping update\n" RESET,
+    PRINT_INFO(YELLOW "[GPS-ALT] REJECT t=%.3f |res|=%.1f > %.1f m - skipping update\n" RESET,
                t_state, std::fabs(raw_res), gps_alt_max_res_gate_);
     return;
   }
@@ -767,11 +921,9 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
   Eigen::VectorXd res = Eigen::VectorXd::Zero(1);
   res(0) = res_scalar;
 
-  // GPS 高度是绝对基准 — VIO 飘了的时候应该信 GPS 而不是拒掉它.
-  // 保留 chi2 用于诊断日志, 但不再拒绝更新. Schmidt filter 已保护 IMU bias.
   // Log large residuals for diagnostics (no rejection)
   if (chi2 > chi2_gate) {
-    PRINT_INFO(YELLOW "[GPS-ALT-DIAG] large-res t=%.3f res=%.2f chi2=%.1f P_zz=%.4f — accepting anyway\n" RESET,
+    PRINT_INFO(YELLOW "[GPS-ALT-DIAG] large-res t=%.3f res=%.2f chi2=%.1f P_zz=%.4f - accepting anyway\n" RESET,
                t_state, raw_res, chi2, P_pz);
   }
 
@@ -796,7 +948,7 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
   double pred_dbg_norm = pred_dbg.norm();
   bool guards_active = (gps_alt_guard_dxy_max_ > 0.0 || gps_alt_guard_kxy_ratio_max_ > 0.0 ||
                         gps_alt_guard_dbias_max_ > 0.0);
-  if (guards_active && gps_alt_coupled_mode_ == GpsAltCoupledMode::LEGACY_GUARDED) {
+  if (guards_active && gps_alt_coupled_mode_ == GpsAltCoupledMode::GUARDED) {
     // Compute full K for the entire state: K_full = P_full * H_full^T / S.
     // H_full has a 1 at the global index of state->_imu->p()(2), 0 elsewhere.
     Eigen::MatrixXd P_full = StateHelper::get_full_covariance(state);
@@ -839,22 +991,21 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
   if (large_coupled_correction) gps_alt_stats_.n_large_coupled++;
 
   // Guard 1: predicted XY position correction too large
-  if (gps_alt_coupled_mode_ == GpsAltCoupledMode::LEGACY_GUARDED &&
+  if (gps_alt_coupled_mode_ == GpsAltCoupledMode::GUARDED &&
       exceeds_dxy_guard) {
     decision = "REJECT_BY_DXY";
   }
-  // Guard 2: K_xy / |K_pz| ratio too large → too much XY leakage per unit Z correction
-  if (gps_alt_coupled_mode_ == GpsAltCoupledMode::LEGACY_GUARDED &&
+  if (gps_alt_coupled_mode_ == GpsAltCoupledMode::GUARDED &&
       decision == "APPLY" && exceeds_gain_ratio_guard) {
     decision = "REJECT_BY_GAIN_RATIO";
   }
   // Guard 3: predicted bias correction too large
-  if (gps_alt_coupled_mode_ == GpsAltCoupledMode::LEGACY_GUARDED &&
+  if (gps_alt_coupled_mode_ == GpsAltCoupledMode::GUARDED &&
       decision == "APPLY" && exceeds_bias_guard) {
     decision = "REJECT_BY_BIAS";
   }
 
-  if (gps_alt_coupled_mode_ == GpsAltCoupledMode::LEGACY_GUARDED &&
+  if (gps_alt_coupled_mode_ == GpsAltCoupledMode::GUARDED &&
       decision != "APPLY") {
     if (decision == "REJECT_BY_DXY") gps_alt_stats_.n_rejected_dxy++;
     else if (decision == "REJECT_BY_GAIN_RATIO") gps_alt_stats_.n_rejected_kxy++;
@@ -881,7 +1032,7 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
     gps_alt_last_.decision = decision;
 
     PRINT_INFO(YELLOW "[GPS-ALT-GUARD] %s t=%.3f res=%.2f |dxy|=%.4f K_xy/|Kz|=%.4f "
-               "|dbias|=%.5f |dtheta|=%.5f — skipping update\n" RESET,
+               "|dbias|=%.5f |dtheta|=%.5f - skipping update\n" RESET,
                decision.c_str(), t_state, raw_res, pred_dxy_norm,
                (K_pz_gain != 0.0 ? K_xy_norm / std::fabs(K_pz_gain) : -1.0),
                std::max(pred_dba_norm, pred_dbg_norm), pred_dtheta_norm);
@@ -892,7 +1043,7 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
   // scale. Scaling K (rather than clipping state blocks independently) allows
   // the same effective gain to be used in the Joseph covariance update.
   double gain_scale = 1.0;           // BOUNDED-mode uniform gain scale (alpha)
-  double nasa_beta_eff = 0.0;        // NASA_LEAR underweight coefficient actually applied
+  double nasa_beta_eff = 0.0;        // NASA_LEAN underweight coefficient actually applied
   double R_joseph = R(0, 0);         // measurement noise fed to Joseph (R_eff for NASA)
   Eigen::VectorXd K_used_full;       // effective gain (state injection + Joseph share it)
   if (gps_alt_coupled_mode_ == GpsAltCoupledMode::BOUNDED) {
@@ -910,8 +1061,8 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
     gain_scale = std::max(0.0, std::min(1.0, gain_scale));
     if (gain_scale < 1.0 - 1e-12) gps_alt_stats_.n_bounded++;
     K_used_full = gain_scale * K_full;
-  } else if (gps_alt_coupled_mode_ == GpsAltCoupledMode::NASA_LEAR) {
-    // NASA/Lear measurement underweighting (NTRS 20180003657 Eq. 4.36/4.38):
+  } else if (gps_alt_coupled_mode_ == GpsAltCoupledMode::NASA_LEAN) {
+    // NASA measurement underweighting (NTRS 20180003657 Eq. 4.36/4.38):
     // reduce the gain by inflating the measurement-space prior uncertainty
     // H'PH, not by clipping the state increment.  Orion-style trigger on H'PH.
     const double q_hph = H_full.dot(gain_numerator_full);   // = H' P H >= 0
@@ -923,7 +1074,7 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
         gain_numerator_full, q_hph, R(0, 0), nasa_beta_eff, R_joseph, W_U);
     if (nasa_enabled) gps_alt_stats_.n_nasa_underweight++;
   } else {
-    // FULL / standard and LEGACY_GUARDED diagnostics: full standard gain.
+    // FULL / standard and GUARDED diagnostics: full standard gain.
     K_used_full = K_full;
   }
   const Eigen::VectorXd dx_used_full = K_used_full * raw_res;
@@ -936,7 +1087,7 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
     decision = large_coupled_correction ? "FULL_LARGE_COUPLED" : "FULL";
   else if (gps_alt_coupled_mode_ == GpsAltCoupledMode::BOUNDED)
     decision = gain_scale < 1.0 - 1e-12 ? "BOUNDED" : "BOUNDED_FULL_GAIN";
-  else if (gps_alt_coupled_mode_ == GpsAltCoupledMode::NASA_LEAR)
+  else if (gps_alt_coupled_mode_ == GpsAltCoupledMode::NASA_LEAN)
     decision = nasa_beta_eff > 0.0 ? "NASA_UNDERWEIGHT" : "NASA_FULL_GAIN";
 
   // === capture state BEFORE update for delta computation ===
@@ -950,14 +1101,14 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
   StateHelper::reset_last_yaw_dx_projection_diag();
 
   StateHelper::JosephUpdateHealth covariance_health;
-  if (gps_alt_coupled_mode_ != GpsAltCoupledMode::LEGACY_GUARDED) {
+  if (gps_alt_coupled_mode_ != GpsAltCoupledMode::GUARDED) {
     const bool check_psd = gps_alt_covariance_psd_check_interval_ <= 0.0 ||
                            gps_alt_last_covariance_psd_check_time_ < 0.0 ||
                            t_state - gps_alt_last_covariance_psd_check_time_ >=
                                gps_alt_covariance_psd_check_interval_ ||
                            large_coupled_correction || gain_scale < 1.0 - 1e-12 ||
                            nasa_beta_eff > 0.0;
-    // NASA_LEAR feeds the matched effective noise R_eff = R + beta*H'PH; all
+    // NASA_LEAN feeds the matched effective noise R_eff = R + beta*H'PH; all
     // other modes pass the original R unchanged (R_joseph defaults to R(0,0)).
     const bool applied = StateHelper::EKFUpdateJosephChecked(
         state, K_used_full, H_full, R_joseph, raw_res, check_psd,
@@ -1006,20 +1157,8 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
     StateHelper::EKFUpdateJosephMasked(state, Hx_order, H, res, R,
                                        state->_imu->p(), 2);
     decision = "JOSEPH_MASKED";
-  } else if (gps_alt_zonly_update_) {
-    StateHelper::EKFUpdateZOnly(state, Hx_order, H, res, R);
-    decision = "ZONLY";
-  } else if (use_schmidt) {
-    StateHelper::EKFUpdateSchmidt(state, Hx_order, H, res, R);
   } else {
-    const auto yaw_mode = visual_yaw_mode_from_string(params.vio_yaw_update_mode);
-    if (yaw_mode == StateHelper::VisualYawUpdateMode::A_STRICT_YAW_DX0) {
-      StateHelper::EKFUpdate(state, Hx_order, H, res, R, yaw_mode,
-                             params.vio_yaw_update_scale,
-                             params.vio_global_yaw_oc_alpha);
-    } else {
-      StateHelper::EKFUpdate(state, Hx_order, H, res, R);
-    }
+    StateHelper::EKFUpdate(state, Hx_order, H, res, R);
   }
 
   // === capture state AFTER update ===
@@ -1038,7 +1177,7 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
   const double Pyz_before = P_full_before(p_start + 1, p_start + 2);
   const double Pxz_after = P_full_after_update(p_start, p_start + 2);
   const double Pyz_after = P_full_after_update(p_start + 1, p_start + 2);
-  if (gps_alt_coupled_mode_ == GpsAltCoupledMode::LEGACY_GUARDED) {
+  if (gps_alt_coupled_mode_ == GpsAltCoupledMode::GUARDED) {
     covariance_health.finite = P_full_after_update.allFinite();
     covariance_health.symmetry_error = covariance_health.finite
                                            ? (P_full_after_update -
@@ -1106,7 +1245,6 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
     of_gps_alt_coupled_diag.flush();
   }
   double z_after = p_post(2);
-  double res_after = altitude_z - z_after;
   double tilt_pre = std::acos(std::min(1.0, std::max(-1.0, R_GtoI_pre(2, 2)))) * 180.0 / M_PI;
   double tilt_post = std::acos(std::min(1.0, std::max(-1.0, R_GtoI_post(2, 2)))) * 180.0 / M_PI;
   const double yaw_after_gps_alt = current_imu_yaw_deg();
@@ -1158,8 +1296,6 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
   gps_alt_last_.large_coupled_correction = large_coupled_correction;
   gps_alt_last_.covariance_psd_checked = covariance_health.psd_checked;
   gps_alt_last_.covariance_psd = covariance_health.psd;
-  gps_alt_last_.zonly = gps_alt_coupled_mode_ == GpsAltCoupledMode::LEGACY_GUARDED &&
-                        gps_alt_zonly_update_;
   gps_alt_last_.clipped = gain_scale < 1.0 - 1e-12;
   gps_alt_last_.decision = decision;
 
@@ -1183,33 +1319,30 @@ void VioManager::feed_measurement_gps_altitude(double timestamp, double altitude
   gps_alt_stats_.sum_abs_res += std::abs(raw_res);
   gps_alt_stats_.sum_abs_dpz += std::abs(dp(2));
 
-  // --- unified EVAL log with guard diagnostics ---
-  PRINT_INFO(CYAN "[GPS-ALT-EVAL] status=%s t_cam=%.3f dt=%+.3fs meas=%.2f z_pred=%.2f z_after=%.2f "
-             "res=%+.2f chi2=%.1f P_zz=%.4f K_pz=%.5f |K_xy|=%.5f |dxy|_pred=%.4f "
-             "|dtheta|_pred=%.4f |dba|_pred=%.5f |dbg|_pred=%.5f dp_z_actual=%+.3f %s%s%s%s\n" RESET,
-             decision.c_str(),
-             t_state, dt_gps, altitude_z, z_before, z_after,
-             raw_res, chi2, P_pz, K_pz_gain, K_xy_norm, pred_dxy_norm,
-             pred_dtheta_norm, pred_dba_norm, pred_dbg_norm, dp(2),
-             gps_alt_zonly_update_ ? " ZONLY" : "",
-             use_schmidt ? " Schmidt" : "",
-             also_update_vz ? " +vz" : "",
-             P_pz_floor_applied > 0 ? " FLOOR" : "");
+  // Keep per-update detail behind debug output; normal stdout uses the compact
+  // 30-second table above and the final table below.
+  PRINT_DEBUG(CYAN "[GPS-ALT-EVAL] status=%s t_cam=%.3f dt=%+.3fs meas=%.2f z_pred=%.2f z_after=%.2f "
+              "res=%+.2f chi2=%.1f P_zz=%.4f K_pz=%.5f |K_xy|=%.5f |dxy|_pred=%.4f "
+              "|dtheta|_pred=%.4f |dba|_pred=%.5f |dbg|_pred=%.5f dp_z_actual=%+.3f %s%s\n" RESET,
+              decision.c_str(),
+              t_state, dt_gps, altitude_z, z_before, z_after,
+              raw_res, chi2, P_pz, K_pz_gain, K_xy_norm, pred_dxy_norm,
+              pred_dtheta_norm, pred_dba_norm, pred_dbg_norm, dp(2),
+              also_update_vz ? " +vz" : "",
+              P_pz_floor_applied > 0 ? " FLOOR" : "");
 
-  // --- detailed DIAG: full state delta (keep for correctness verification) ---
-  PRINT_INFO(MAGENTA "[GPS-ALT-DIAG] t=%.3f | p_pre=[%.2f %.2f %.2f] dp=[%+.3f %+.3f %+.3f] | v_pre=[%.2f %.2f %.2f] dv=[%+.3f %+.3f %+.3f] | tilt %.2f->%.2f deg | ba_pre=[%+.3f %+.3f %+.3f] dba=[%+.4f %+.4f %+.4f] | bg_pre=[%+.4f %+.4f %+.4f] dbg=[%+.5f %+.5f %+.5f]\n" RESET,
-             timestamp,
-             p_pre(0), p_pre(1), p_pre(2), dp(0), dp(1), dp(2),
-             v_pre(0), v_pre(1), v_pre(2), dv(0), dv(1), dv(2),
-             tilt_pre, tilt_post,
-             ba_pre(0), ba_pre(1), ba_pre(2), dba(0), dba(1), dba(2),
-             bg_pre(0), bg_pre(1), bg_pre(2), dbg(0), dbg(1), dbg(2));
+  PRINT_DEBUG(MAGENTA "[GPS-ALT-DIAG] t=%.3f | p_pre=[%.2f %.2f %.2f] dp=[%+.3f %+.3f %+.3f] | v_pre=[%.2f %.2f %.2f] dv=[%+.3f %+.3f %+.3f] | tilt %.2f->%.2f deg | ba_pre=[%+.3f %+.3f %+.3f] dba=[%+.4f %+.4f %+.4f] | bg_pre=[%+.4f %+.4f %+.4f] dbg=[%+.5f %+.5f %+.5f]\n" RESET,
+              timestamp,
+              p_pre(0), p_pre(1), p_pre(2), dp(0), dp(1), dp(2),
+              v_pre(0), v_pre(1), v_pre(2), dv(0), dv(1), dv(2),
+              tilt_pre, tilt_post,
+              ba_pre(0), ba_pre(1), ba_pre(2), dba(0), dba(1), dba(2),
+              bg_pre(0), bg_pre(1), bg_pre(2), dbg(0), dbg(1), dbg(2));
 
 }
 
 void VioManager::feed_measurement_gps_altitude_relative(double timestamp, double altitude_z, double sigma,
-                                                         double chi2_gate, bool use_schmidt,
-                                                         bool also_update_vz) {
+                                                         double chi2_gate, bool also_update_vz) {
 
   if (!is_initialized_vio) {
     return;
@@ -1232,12 +1365,11 @@ void VioManager::feed_measurement_gps_altitude_relative(double timestamp, double
 
   double effective_alt = altitude_z - gps_alt_rel_gps_ref_ + gps_alt_rel_vio_ref_;
 
-  feed_measurement_gps_altitude(timestamp, effective_alt, sigma, chi2_gate, use_schmidt,
-                                also_update_vz, false);
+  feed_measurement_gps_altitude(timestamp, effective_alt, sigma, chi2_gate, also_update_vz);
 }
 
-bool VioManager::feed_measurement_gps_ground_plane(double timestamp, double z_gps,
-                                                     double sigma_range, bool zonly) {
+bool VioManager::feed_measurement_gps_ground_plane(double timestamp, double height,
+                                                     double sigma, bool rangefinder) {
 
   if (!is_initialized_vio)
     return false;
@@ -1251,38 +1383,49 @@ bool VioManager::feed_measurement_gps_ground_plane(double timestamp, double z_gp
 
   // Relative-mode bootstrap: align GPS ENU-z to VIO world z on first call.
   // z_gps is near zero (ENU-relative) while p_z can be tens of meters.
-  // We compute effective_z = (z_gps - gps_ref) + vio_ref so the residual
+  // We compute effective_height = (gps_z - gps_ref) + vio_ref so the residual
   // reflects VIO drift relative to GPS, not the absolute frame offset.
-  if (!gps_alt_rel_bootstrapped_) {
-    gps_alt_rel_gps_ref_ = z_gps;
+  double effective_height = height;
+  if (!rangefinder && !gps_alt_rel_bootstrapped_) {
+    gps_alt_rel_gps_ref_ = height;
     gps_alt_rel_vio_ref_ = state->_imu->pos()(2);
     gps_alt_rel_bootstrapped_ = true;
-    PRINT_INFO(CYAN "[GPLANE-RNG] bootstrap: gps_ref=%.3f vio_ref=%.3f\n" RESET,
+    PRINT_INFO(CYAN "[GPLANE-HEIGHT] bootstrap: gps_ref=%.3f vio_ref=%.3f\n" RESET,
                gps_alt_rel_gps_ref_, gps_alt_rel_vio_ref_);
   }
-  double effective_z = z_gps - gps_alt_rel_gps_ref_ + gps_alt_rel_vio_ref_;
+  if (!rangefinder)
+    effective_height = height - gps_alt_rel_gps_ref_ + gps_alt_rel_vio_ref_;
+
+  const auto height_type = rangefinder
+      ? UpdaterGroundPlaneRange::HeightMeasurementType::RANGEFINDER
+      : UpdaterGroundPlaneRange::HeightMeasurementType::GPS_ALTITUDE;
+  if (updaterGPlaneRange != nullptr &&
+      updaterGPlaneRange->measurement_type() != height_type) {
+    PRINT_WARNING(YELLOW "[GPLANE-HEIGHT] height source changed; rebuilding updater\n" RESET);
+    updaterGPlaneRange.reset();
+  }
 
   // Lazy construction of the ground-plane range updater
   if (updaterGPlaneRange == nullptr) {
     updaterGPlaneRange = std::make_shared<UpdaterGroundPlaneRange>(
-        sigma_range,           // sigma_range
+        sigma,
         0.3,                   // min_cos_tilt (skip if tilt > 72°)
         10000.0,               // chi2_gate (permissive)
-        zonly,                 // use_zonly
         gps_alt_min_pzz_,      // P_zz floor (share with GPS altitude setting)
-        gps_alt_max_res_gate_  // innovation gate
+        gps_alt_max_res_gate_,
+        height_type
     );
     updaterGPlaneRange->set_visual_yaw_update_control(
         visual_yaw_mode_from_string(params.vio_yaw_update_mode),
         params.vio_yaw_update_scale, params.vio_global_yaw_oc_alpha);
-    PRINT_INFO(GREEN "[GPLANE-RNG] created: sigma=%.2f zonly=%d\n" RESET,
-               sigma_range, (int)zonly);
+    PRINT_INFO(GREEN "[GPLANE-HEIGHT] created: sigma=%.2f type=%s\n" RESET,
+               sigma, rangefinder ? "rangefinder" : "gps");
   }
 
   const double yaw_before = current_imu_yaw_deg();
   const double vio_course_before = course_yaw_from_velocity_deg(state->_imu->vel());
   StateHelper::reset_last_yaw_dx_projection_diag();
-  const bool applied = updaterGPlaneRange->try_update(state, state->_timestamp, effective_z, timestamp);
+  const bool applied = updaterGPlaneRange->try_update(state, state->_timestamp, effective_height, timestamp);
   if (applied) {
     const double yaw_after = current_imu_yaw_deg();
     const double vio_course_after = course_yaw_from_velocity_deg(state->_imu->vel());
@@ -1412,13 +1555,8 @@ void VioManager::set_vio_yaw_update_mode(const std::string &mode) {
 void VioManager::set_vio_yaw_update_scale(double scale) {
   params.vio_yaw_update_scale = std::max(0.0, std::min(1.0, scale));
   params.enable_vio_yaw_update = (params.vio_yaw_update_mode == "original" ||
-                                  params.vio_yaw_update_mode == "a_strict_yaw_dx0" ||
-                                  params.vio_yaw_update_mode == "strict_yaw_dx0" ||
-                                  params.vio_yaw_update_mode == "visual_yaw_schmidt_current_gauge" ||
-                                  params.vio_yaw_update_mode == "visual_yaw_schmidt_fej_gauge" ||
-                                  params.vio_yaw_update_mode == "visual_yaw_h_projection_current" ||
-                                  params.vio_yaw_update_mode == "visual_yaw_schmidt_guarded" ||
-                                  params.vio_yaw_update_mode == "constrained_yaw_nullspace" ||
+                                  params.vio_yaw_update_mode == "global_yaw_oc_projection" ||
+                                  params.vio_yaw_update_mode == "global_yaw_oc_fej_projection" ||
                                   VisualObservabilityPolicy::is_prechi2_mode_string(params.vio_yaw_update_mode) ||
                                   params.vio_yaw_update_scale > 0.0 ||
                                   params.vio_global_yaw_oc_alpha > 0.0);
@@ -1707,11 +1845,6 @@ void VioManager::configure_slam_geometry_lifecycle_refresh(bool enabled,
 void VioManager::set_slam_geometry_lifecycle_refresh_diag_path(const std::string &path) {
   if (updaterSLAM)
     updaterSLAM->set_slam_geometry_lifecycle_refresh_diag_path(path);
-}
-
-void VioManager::set_schmidt_yaw_diag_path(const std::string &path) {
-  params.schmidt_yaw_diag_path = path;
-  StateHelper::open_schmidt_yaw_diag_csv(path);
 }
 
 void VioManager::log_visual_obs_diag(double timestamp, const std::string &update_type,
@@ -2044,7 +2177,7 @@ void VioManager::log_vio_yaw_update(double timestamp, const std::string &update_
                          << accepted << "," << rejected << "," << tracking_feature_count << "\n";
 }
 
-// ── Visual update guard helpers ────────────────────────────────────────────
+// Visual update guard helpers
 void VioManager::open_visual_guard_log(const std::string &path) {
   if (of_visual_guard_log_.is_open()) of_visual_guard_log_.close();
   of_visual_guard_log_.open(path, std::ofstream::out | std::ofstream::trunc);
@@ -2076,7 +2209,6 @@ void VioManager::load_visual_reject_file(const std::string &path) {
     if (ss >> t0 >> sep >> t1 && sep == ',') {
       visual_reject_intervals_.emplace_back(t0, t1);
     } else {
-      // Single timestamp → ±5ms window
       std::istringstream ss2(line);
       double t;
       if (ss2 >> t) visual_reject_intervals_.emplace_back(t - 0.005, t + 0.005);
@@ -2115,7 +2247,7 @@ void VioManager::apply_visual_update_with_yaw_diag(const std::string &update_typ
     visual_update_counters_.msckf_features_attempted += (size_t)num_features;
   }
 
-  // ── Guard: skip window / reject file ─────────────────────────────────────
+  // Guard: skip window / reject file
   std::string guard_reason;
   if (visual_guard_should_skip(t_now, visual_skip_t0_, visual_skip_t1_,
                                 visual_reject_intervals_, guard_reason)) {
@@ -2197,28 +2329,41 @@ void VioManager::print_gps_alt_final_summary() {
   size_t n_evals = s.n_accepted + s.n_rejected;
   double rate = n_evals > 0 ? 100.0 * s.n_accepted / n_evals : 0;
   double span = s.last_eval_time - s.first_eval_time;
-  PRINT_INFO(GREEN "[GPS-ALT-FINAL] ====== GPS Altitude Fusion Summary ======\n" RESET);
-  PRINT_INFO(GREEN "[GPS-ALT-FINAL] time span: %.1f s (%.1f - %.1f)\n" RESET,
-             span, s.first_eval_time, s.last_eval_time);
-  PRINT_INFO(GREEN "[GPS-ALT-FINAL] calls=%zu  acc=%zu  rej=%zu (dxy=%zu kxy=%zu bias=%zu)  skip=%zu  rate=%.1f%%\n" RESET,
-             s.n_called, s.n_accepted, s.n_rejected,
+  PRINT_INFO(GREEN
+             "[GPS-ALT-FINAL]\n"
+             "+-------------+-------------+-------------+\n"
+             "| span_s      | first_t     | last_t      |\n"
+             "| %11.1f | %11.1f | %11.1f |\n"
+             "+-------------+-------------+-------------+\n"
+             "| calls | accepted | rejected | skipped | rate   |\n"
+             "| %5zu | %8zu | %8zu | %7zu | %5.1f%% |\n"
+             "+-------+----------+----------+---------+--------+\n"
+             "| reject_dxy | reject_kxy | reject_bias | numerical |\n"
+             "| %10zu | %10zu | %11zu | %9zu |\n"
+             "+------------+------------+-------------+-----------+\n"
+             "| large_coupled | bounded | nasa_underweight |\n"
+             "| %13zu | %7zu | %16zu |\n"
+             "+---------------+---------+------------------+\n"
+             "| K_pz_mu | K_xy_mu | dxy_mu | dtheta_mu | dba_mu  | dbg_mu  |\n"
+             "| %7.5f | %7.5f | %6.4f | %9.4f | %7.5f | %7.5f |\n"
+             "+---------+---------+--------+-----------+---------+---------+\n"
+             "| P_zz_mu | abs_res_mu | abs_dpz_mu |\n"
+             "| %7.4f | %10.2f | %10.3f |\n"
+             "+---------+------------+------------+\n" RESET,
+             span, s.first_eval_time, s.last_eval_time,
+             s.n_called, s.n_accepted, s.n_rejected, s.n_skipped, rate,
              s.n_rejected_dxy, s.n_rejected_kxy, s.n_rejected_bias,
-             s.n_skipped, rate);
-  PRINT_INFO(GREEN "[GPS-ALT-FINAL] large_coupled=%zu bounded=%zu numerical_reject=%zu\n" RESET,
-             s.n_large_coupled, s.n_bounded, s.n_rejected_numerical);
-  PRINT_INFO(GREEN "[GPS-ALT-FINAL] K_pz mean=%.5f  |K_xy| mean=%.5f  |dxy| mean=%.4f m\n" RESET,
+             s.n_rejected_numerical, s.n_large_coupled, s.n_bounded,
+             s.n_nasa_underweight,
              n_evals > 0 ? s.sum_K_pz / n_evals : 0.0,
              n_evals > 0 ? s.sum_K_xy_norm / n_evals : 0.0,
-             n_evals > 0 ? s.sum_dxy_norm / n_evals : 0.0);
-  PRINT_INFO(GREEN "[GPS-ALT-FINAL] |dtheta| mean=%.4f  |dba| mean=%.5f  |dbg| mean=%.5f\n" RESET,
+             n_evals > 0 ? s.sum_dxy_norm / n_evals : 0.0,
              n_evals > 0 ? s.sum_dtheta_norm / n_evals : 0.0,
              n_evals > 0 ? s.sum_dba_norm / n_evals : 0.0,
-             n_evals > 0 ? s.sum_dbg_norm / n_evals : 0.0);
-  PRINT_INFO(GREEN "[GPS-ALT-FINAL] P_zz mean=%.4f  |res| mean=%.2f m  |dp_z| mean=%.3f m\n" RESET,
+             n_evals > 0 ? s.sum_dbg_norm / n_evals : 0.0,
              n_evals > 0 ? s.sum_P_zz / n_evals : 0.0,
              n_evals > 0 ? s.sum_abs_res / n_evals : 0.0,
              s.n_accepted > 0 ? s.sum_abs_dpz / s.n_accepted : 0.0);
-  PRINT_INFO(GREEN "[GPS-ALT-FINAL] ==========================================\n" RESET);
 }
 
 void VioManager::feed_measurement_simulation(double timestamp, const std::vector<int> &camids,
@@ -2288,16 +2433,7 @@ void VioManager::feed_measurement_simulation(double timestamp, const std::vector
 }
 
 // =============================================================================
-// [中文] track_image_and_update
-//  相机帧的总分流器。两条主要分支:
-//    (A) 已初始化 -> 前端跟踪 -> 尝试 ZUPT -> 否则常规更新 (do_feature_propagate_update)
-//    (B) 未初始化 -> 前端跟踪 -> 调用 try_to_initialize
-//  注意两条分支都会先走前端跟踪, 这样初始化期间 FeatureDatabase 也能累积有视觉观测,
-//  供 DynamicInitializer 使用。
-// =============================================================================
 void VioManager::track_image_and_update(const ov_core::CameraData &message_const) {
-
-  // Start timing
   rT1 = boost::posix_time::microsec_clock::local_time();
 
   // Assert we have valid measurement data and ids
@@ -2308,7 +2444,6 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
   }
 
   // Downsample if we are downsampling
-  // [中文] 可选对每个相机图像+掩码做 1/2 下采样, 播冟在高分辨率设备上加速
   ov_core::CameraData message = message_const;
   for (size_t i = 0; i < message.sensor_ids.size() && params.downsample_cameras; i++) {
     cv::Mat img = message.images.at(i);
@@ -2380,7 +2515,6 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
   // TRACKING PATH (how it works):
   //   TrackKLT warps ONLY the stored last image with H = K * R_comp * K^{-1}.
   //   The current image is NOT warped. After this warp the last image appears in the
-  //   current camera orientation, so KLT sees only translational parallax — not the
   //   rotation component. pts_left_new from KLT are directly in raw current-image
   //   coordinates; no un-warp step is required. The estimator receives unmodified
   //   original-space observations.
@@ -2391,7 +2525,6 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
   //   frame. gravity_warp_R_ref_ is updated each frame to store R_GtoC_curr so the
   //   next call can compute the delta.
   //
-  // FIRST ACTIVATION: gravity_warp_R_ref_ is not yet populated → skip warp, save
   //   current R_GtoC as "prev" for the next frame.
   //
   // GYRO-AIDED KLT: suppressed above when this warp is active, to prevent the same
@@ -2410,7 +2543,6 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
         continue;
       }
       Eigen::Matrix3d R_GtoC_prev = gravity_warp_R_ref_.at(cam_id);
-      // Frame-to-frame rotation: maps a ray in last-cam frame → current-cam frame.
       // H = K * R_comp * K^{-1} warps last image to current orientation.
       Eigen::Matrix3d R_comp = R_GtoC_curr * R_GtoC_prev.transpose();
       cv::Matx33d R_comp_cv(R_comp(0, 0), R_comp(0, 1), R_comp(0, 2),
@@ -2429,7 +2561,6 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
   }
 
   // Perform our feature tracking!
-  // [中文] 视觉前端: KLT / Descriptor / SIM. 内部会更新 FeatureDatabase
   trackFEATS->feed_new_camera(message);
   visual_update_counters_.tracker_call_count++;
   if (trackFEATS && trackFEATS->get_feature_database()) {
@@ -2515,42 +2646,28 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
   }
 
   // Call on our propagate and update function
-  // [中文] 进入完整的 EKF 流程 (传播 + 克隆 + MSCKF/SLAM/ZUPT 更新 + 边缘化)
   if (landing_update_halted_) {
     // Propagate-only path: still advance time and clone window, no update.
     if (state->_timestamp < message.timestamp) {
       propagator->propagate_and_clone(state, message.timestamp);
-      // Keep clone window bounded; do_feature_propagate_update normally
-      // does this at the end.
-      StateHelper::marginalize_old_clone(state);
     }
-    PRINT_INFO(YELLOW "[LANDING-GATE] frame %.3f: skipped MSCKF/SLAM update (alt=%.2fm)\n" RESET,
-               message.timestamp, state->_imu->pos()(2));
   } else {
     do_feature_propagate_update(message);
   }
 }
 
 // =============================================================================
-// [中文] do_feature_propagate_update
-//  单帧完整的滤波主循环 (见 docs-cn/diagrams/03_vio_manager_flow.png):
-//    Step 1  propagate_and_clone : IMU 预测 + 增广一份新克隆
-//    Step 2  拉特征并分类:
-//              feats_lost       = 在当前时刻没有观测 -> MSCKF
-//              feats_marg       = 跳要随最老克隆一起消失 -> MSCKF/SLAM/DELAYED
-//              feats_maxtracks  = 轨迹太长的非 SLAM 特征   -> MSCKF
-//              feats_slam_UPDATE  = 已在状态里的 SLAM    -> SLAM update
-//              feats_slam_DELAYED = 新晔 SLAM 候选         -> SLAM delayed_init
-//    Step 3  调用三个更新器做 EKF
-//    Step 4  retriangulate + marginalize_old_clone 维持滑窗大小
+// do_feature_propagate_update
+//    Step 1  propagate_and_clone
+//    Step 2  select and classify features
+//    Step 3  run EKF feature updates
+//    Step 4  retriangulate and marginalize the oldest clone
 // =============================================================================
 void VioManager::do_feature_propagate_update(const ov_core::CameraData &message) {
 
   //===================================================================================
   // State propagation, and clone augmentation
   //===================================================================================
-  // [中文] Step 1。传播与克隆紧耦合: propagate_and_clone 把旧状态传到 message.timestamp,
-  //        同时在 _clones_IMU 里插入一个对当前位姿的克隆。
 
   // Return if the camera measurement is out of order
   if (state->_timestamp > message.timestamp) {
@@ -2571,7 +2688,6 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // If we have not reached max clones, we should just return...
   // This isn't super ideal, but it keeps the logic after this easier...
   // We can start processing things when we have at least 5 clones since we can start triangulating things...
-  // [中文] 三角化需要至少 2 个视角, 数值稳定则要求 ≥ 5 个克隆才开始走更新
   if ((int)state->_clones_IMU.size() < std::min(state->_options.max_clone_size, 5)) {
     PRINT_DEBUG("waiting for enough clone states (%d of %d)....\n", (int)state->_clones_IMU.size(),
                 std::min(state->_options.max_clone_size, 5));
@@ -2672,6 +2788,13 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
         ((visual_update_counters_.visual_update_frame_count - 1) % (size_t)visual_update_stride_ == 0);
   }
 
+  std::string visual_guard_reason;
+  if (visual_guard_should_skip(state->_timestamp, visual_skip_t0_, visual_skip_t1_,
+                               visual_reject_intervals_, visual_guard_reason)) {
+    visual_update_eligible = false;
+    visual_update_skip_reason = visual_guard_reason;
+  }
+
   if (visual_update_eligible) {
     visual_update_counters_.visual_update_eligible_count++;
   } else {
@@ -2763,11 +2886,7 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   //===================================================================================
   // MSCKF features and KLT tracks that are SLAM features
   //===================================================================================
-  // [中文] Step 2。从 FeatureDatabase 挑选本帧需要参与更新的特征, 并按"去处"分类:
-  //   - feats_lost: 本帧没有观测的特征 (跟丢), 只能用作 MSCKF
-  //   - feats_marg: 含有最老克隆观测的特征, 若不立即用掉, 协方差块会被 marg_old_clone 删
-  //   - feats_maxtracks: 轨迹已经达到 max_clone_size 的非 SLAM 特征, 晋升 SLAM 的候选
-  //   - feats_slam: 已经是 SLAM 特征, 由 Aruco 或后续 delayed_init 贡献
+  // Select features from the FeatureDatabase for this update.
 
   // Now, lets get all features that should be used for an update that are lost in the newest frame
   // We explicitly request features that have not been deleted (used) in another update step
@@ -2908,10 +3027,6 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   //===================================================================================
   // Now that we have a list of features, lets do the EKF update for MSCKF and SLAM!
   //===================================================================================
-  // [中文] Step 3。按顺序调用三类更新器:
-  //   updaterMSCKF->update        :  短轨迹特征, 左零空间投影 + 卡方 + QR 压缩 + EKF
-  //   updaterSLAM->update         :  已在状态里的 SLAM 特征 (可分批做 sequential update)
-  //   updaterSLAM->delayed_init   :  将 feats_slam_DELAYED 加入状态并初始化其协方差
 
   // Sort based on track length
   // TODO: we should have better selection logic here (i.e. even feature distribution in the FOV etc..)
@@ -2964,7 +3079,6 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     }
   }
 
-  // Stage B — ground-plane feature update (optional).  Runs BEFORE MSCKF
   // so MSCKF hasn't yet marked features for deletion; we only need to look
   // at the database, we don't consume features.
   if (updaterGPlaneFeature != nullptr && updaterGPlaneRange != nullptr &&
@@ -2993,7 +3107,6 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     }
   }
 
-  // Stage B v1 — two-clone H, dry-run + FD check (optional, mutually
   // exclusive with v0 in practice).  Same activation gate as v0: requires
   // Stage A bootstrap and Stage A delay (Stage A enforces the delay itself,
   // so once Stage A has fired, both feature updaters become eligible).
@@ -3204,7 +3317,6 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   //===================================================================================
   // Cleanup, marginalize out what we don't need any more...
   //===================================================================================
-  // [中文] Step 4。数据库清理 + SLAM 锚点切换 + 最老克隆边缘化, 将滑窗重新限制回 max_clone_size。
 
   // Remove features that where used for the update from our extractors at the last timestep
   // This allows for measurements to be used in the future if they failed to be used this time
@@ -3294,9 +3406,9 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   timelastupdate = message.timestamp;
 
   // Debug, print our current state
-  PRINT_INFO("q_GtoI = %.3f,%.3f,%.3f,%.3f | p_IinG = %.3f,%.3f,%.3f | dist = %.2f (meters)\n", state->_imu->quat()(0),
-             state->_imu->quat()(1), state->_imu->quat()(2), state->_imu->quat()(3), state->_imu->pos()(0), state->_imu->pos()(1),
-             state->_imu->pos()(2), distance);
+  PRINT_DEBUG("q_GtoI = %.3f,%.3f,%.3f,%.3f | p_IinG = %.3f,%.3f,%.3f | dist = %.2f (meters)\n", state->_imu->quat()(0),
+              state->_imu->quat()(1), state->_imu->quat()(2), state->_imu->quat()(3), state->_imu->pos()(0), state->_imu->pos()(1),
+              state->_imu->pos()(2), distance);
   // [STATS] Per-frame size diagnostics. Helps identify which structure
   // is growing if real-time degrades over a long flight. Cheap (just sizes).
   {
@@ -3326,20 +3438,20 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
     }
   }
 
-  PRINT_INFO("bg = %.4f,%.4f,%.4f | ba = %.4f,%.4f,%.4f\n", state->_imu->bias_g()(0), state->_imu->bias_g()(1), state->_imu->bias_g()(2),
-             state->_imu->bias_a()(0), state->_imu->bias_a()(1), state->_imu->bias_a()(2));
+  PRINT_DEBUG("bg = %.4f,%.4f,%.4f | ba = %.4f,%.4f,%.4f\n", state->_imu->bias_g()(0), state->_imu->bias_g()(1), state->_imu->bias_g()(2),
+              state->_imu->bias_a()(0), state->_imu->bias_a()(1), state->_imu->bias_a()(2));
 
   // Debug for camera imu offset
   if (state->_options.do_calib_camera_timeoffset) {
-    PRINT_INFO("camera-imu timeoffset = %.5f\n", state->_calib_dt_CAMtoIMU->value()(0));
+    PRINT_DEBUG("camera-imu timeoffset = %.5f\n", state->_calib_dt_CAMtoIMU->value()(0));
   }
 
   // Debug for camera intrinsics
   if (state->_options.do_calib_camera_intrinsics) {
     for (int i = 0; i < state->_options.num_cameras; i++) {
       std::shared_ptr<Vec> calib = state->_cam_intrinsics.at(i);
-      PRINT_INFO("cam%d intrinsics = %.3f,%.3f,%.3f,%.3f | %.3f,%.3f,%.3f,%.3f\n", (int)i, calib->value()(0), calib->value()(1),
-                 calib->value()(2), calib->value()(3), calib->value()(4), calib->value()(5), calib->value()(6), calib->value()(7));
+      PRINT_DEBUG("cam%d intrinsics = %.3f,%.3f,%.3f,%.3f | %.3f,%.3f,%.3f,%.3f\n", (int)i, calib->value()(0), calib->value()(1),
+                  calib->value()(2), calib->value()(3), calib->value()(4), calib->value()(5), calib->value()(6), calib->value()(7));
     }
   }
 
@@ -3347,40 +3459,40 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   if (state->_options.do_calib_camera_pose) {
     for (int i = 0; i < state->_options.num_cameras; i++) {
       std::shared_ptr<PoseJPL> calib = state->_calib_IMUtoCAM.at(i);
-      PRINT_INFO("cam%d extrinsics = %.3f,%.3f,%.3f,%.3f | %.3f,%.3f,%.3f\n", (int)i, calib->quat()(0), calib->quat()(1), calib->quat()(2),
-                 calib->quat()(3), calib->pos()(0), calib->pos()(1), calib->pos()(2));
+      PRINT_DEBUG("cam%d extrinsics = %.3f,%.3f,%.3f,%.3f | %.3f,%.3f,%.3f\n", (int)i, calib->quat()(0), calib->quat()(1), calib->quat()(2),
+                  calib->quat()(3), calib->pos()(0), calib->pos()(1), calib->pos()(2));
     }
   }
 
   // Debug for imu intrinsics
   if (state->_options.do_calib_imu_intrinsics && state->_options.imu_model == StateOptions::ImuModel::KALIBR) {
-    PRINT_INFO("q_GYROtoI = %.3f,%.3f,%.3f,%.3f\n", state->_calib_imu_GYROtoIMU->value()(0), state->_calib_imu_GYROtoIMU->value()(1),
-               state->_calib_imu_GYROtoIMU->value()(2), state->_calib_imu_GYROtoIMU->value()(3));
+    PRINT_DEBUG("q_GYROtoI = %.3f,%.3f,%.3f,%.3f\n", state->_calib_imu_GYROtoIMU->value()(0), state->_calib_imu_GYROtoIMU->value()(1),
+                state->_calib_imu_GYROtoIMU->value()(2), state->_calib_imu_GYROtoIMU->value()(3));
   }
   if (state->_options.do_calib_imu_intrinsics && state->_options.imu_model == StateOptions::ImuModel::RPNG) {
-    PRINT_INFO("q_ACCtoI = %.3f,%.3f,%.3f,%.3f\n", state->_calib_imu_ACCtoIMU->value()(0), state->_calib_imu_ACCtoIMU->value()(1),
-               state->_calib_imu_ACCtoIMU->value()(2), state->_calib_imu_ACCtoIMU->value()(3));
+    PRINT_DEBUG("q_ACCtoI = %.3f,%.3f,%.3f,%.3f\n", state->_calib_imu_ACCtoIMU->value()(0), state->_calib_imu_ACCtoIMU->value()(1),
+                state->_calib_imu_ACCtoIMU->value()(2), state->_calib_imu_ACCtoIMU->value()(3));
   }
   if (state->_options.do_calib_imu_intrinsics && state->_options.imu_model == StateOptions::ImuModel::KALIBR) {
-    PRINT_INFO("Dw = | %.4f,%.4f,%.4f | %.4f,%.4f | %.4f |\n", state->_calib_imu_dw->value()(0), state->_calib_imu_dw->value()(1),
-               state->_calib_imu_dw->value()(2), state->_calib_imu_dw->value()(3), state->_calib_imu_dw->value()(4),
-               state->_calib_imu_dw->value()(5));
-    PRINT_INFO("Da = | %.4f,%.4f,%.4f | %.4f,%.4f | %.4f |\n", state->_calib_imu_da->value()(0), state->_calib_imu_da->value()(1),
-               state->_calib_imu_da->value()(2), state->_calib_imu_da->value()(3), state->_calib_imu_da->value()(4),
-               state->_calib_imu_da->value()(5));
+    PRINT_DEBUG("Dw = | %.4f,%.4f,%.4f | %.4f,%.4f | %.4f |\n", state->_calib_imu_dw->value()(0), state->_calib_imu_dw->value()(1),
+                state->_calib_imu_dw->value()(2), state->_calib_imu_dw->value()(3), state->_calib_imu_dw->value()(4),
+                state->_calib_imu_dw->value()(5));
+    PRINT_DEBUG("Da = | %.4f,%.4f,%.4f | %.4f,%.4f | %.4f |\n", state->_calib_imu_da->value()(0), state->_calib_imu_da->value()(1),
+                state->_calib_imu_da->value()(2), state->_calib_imu_da->value()(3), state->_calib_imu_da->value()(4),
+                state->_calib_imu_da->value()(5));
   }
   if (state->_options.do_calib_imu_intrinsics && state->_options.imu_model == StateOptions::ImuModel::RPNG) {
-    PRINT_INFO("Dw = | %.4f | %.4f,%.4f | %.4f,%.4f,%.4f |\n", state->_calib_imu_dw->value()(0), state->_calib_imu_dw->value()(1),
-               state->_calib_imu_dw->value()(2), state->_calib_imu_dw->value()(3), state->_calib_imu_dw->value()(4),
-               state->_calib_imu_dw->value()(5));
-    PRINT_INFO("Da = | %.4f | %.4f,%.4f | %.4f,%.4f,%.4f |\n", state->_calib_imu_da->value()(0), state->_calib_imu_da->value()(1),
-               state->_calib_imu_da->value()(2), state->_calib_imu_da->value()(3), state->_calib_imu_da->value()(4),
-               state->_calib_imu_da->value()(5));
+    PRINT_DEBUG("Dw = | %.4f | %.4f,%.4f | %.4f,%.4f,%.4f |\n", state->_calib_imu_dw->value()(0), state->_calib_imu_dw->value()(1),
+                state->_calib_imu_dw->value()(2), state->_calib_imu_dw->value()(3), state->_calib_imu_dw->value()(4),
+                state->_calib_imu_dw->value()(5));
+    PRINT_DEBUG("Da = | %.4f | %.4f,%.4f | %.4f,%.4f,%.4f |\n", state->_calib_imu_da->value()(0), state->_calib_imu_da->value()(1),
+                state->_calib_imu_da->value()(2), state->_calib_imu_da->value()(3), state->_calib_imu_da->value()(4),
+                state->_calib_imu_da->value()(5));
   }
   if (state->_options.do_calib_imu_intrinsics && state->_options.do_calib_imu_g_sensitivity) {
-    PRINT_INFO("Tg = | %.4f,%.4f,%.4f |  %.4f,%.4f,%.4f | %.4f,%.4f,%.4f |\n", state->_calib_imu_tg->value()(0),
-               state->_calib_imu_tg->value()(1), state->_calib_imu_tg->value()(2), state->_calib_imu_tg->value()(3),
-               state->_calib_imu_tg->value()(4), state->_calib_imu_tg->value()(5), state->_calib_imu_tg->value()(6),
-               state->_calib_imu_tg->value()(7), state->_calib_imu_tg->value()(8));
+    PRINT_DEBUG("Tg = | %.4f,%.4f,%.4f |  %.4f,%.4f,%.4f | %.4f,%.4f,%.4f |\n", state->_calib_imu_tg->value()(0),
+                state->_calib_imu_tg->value()(1), state->_calib_imu_tg->value()(2), state->_calib_imu_tg->value()(3),
+                state->_calib_imu_tg->value()(4), state->_calib_imu_tg->value()(5), state->_calib_imu_tg->value()(6),
+                state->_calib_imu_tg->value()(7), state->_calib_imu_tg->value()(8));
   }
 }

@@ -130,16 +130,6 @@ State::State(StateOptions &options) {
     }
   }
 
-  // Architecture G: GPS-VIO altitude bias augmented state
-  _h_offset = std::make_shared<Vec>(1);
-  _h_offset->set_value(Eigen::Matrix<double, 1, 1>::Zero());
-  _h_offset->set_fej(Eigen::Matrix<double, 1, 1>::Zero());
-  if (options.use_gps_h_offset) {
-    _h_offset->set_local_id(current_id);
-    _variables.push_back(_h_offset);
-    current_id += _h_offset->size();
-  }
-
   // Finally initialize our covariance to small value
   _Cov = std::pow(1e-3, 2) * Eigen::MatrixXd::Identity(current_id, current_id);
 
@@ -172,8 +162,5 @@ State::State(StateOptions &options) {
       _Cov.block(_cam_intrinsics.at(i)->id() + 4, _cam_intrinsics.at(i)->id() + 4, 4, 4) =
           std::pow(0.005, 2) * Eigen::MatrixXd::Identity(4, 4);
     }
-  }
-  if (_options.use_gps_h_offset) {
-    _Cov(_h_offset->id(), _h_offset->id()) = std::pow(_options.gps_h_offset_init_sigma, 2);
   }
 }

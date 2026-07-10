@@ -56,8 +56,8 @@ class State;
  *   - |raw residual| ≤ max_residual_px
  *   - cap at max_features per update
  *
- * Anchor pose is treated as fixed (Schmidt-like).  The unmodelled anchor
- * uncertainty is absorbed by inflating the per-pixel sigma.
+ * Anchor pose is treated as fixed. The unmodelled anchor uncertainty is
+ * absorbed by inflating the per-pixel sigma.
  */
 class UpdaterGroundPlaneFeature {
 

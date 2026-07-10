@@ -34,10 +34,10 @@
 
 // OPENVINS COMPATIBILITY ADAPTATION:
 // PX4's full Functions.hpp pulls in the PX4 platform and matrix libraries.
-// LowPassFilter2p<float> only needs M_PI_F and math::isFinite(float) from this
-// header. math::max() comes from the byte-identical vendored PX4 Limits.hpp.
-// This preserves the PX4 float behavior without importing unrelated flight-
-// stack dependencies.
+// The vendored NotchFilter only needs M_PI_F and math::isFinite(float) from
+// this header. math::max() comes from the byte-identical vendored PX4
+// Limits.hpp. This preserves PX4 float behavior without importing unrelated
+// flight-stack dependencies.
 
 #include "Limits.hpp"
 #include <cmath>

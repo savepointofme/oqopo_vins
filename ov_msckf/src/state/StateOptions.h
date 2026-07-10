@@ -82,13 +82,6 @@ struct StateOptions {
   /// Number of distinct cameras that we will observe features in
   int num_cameras = 1;
 
-  // Architecture G (new_height_aid_research.md §5.3):
-  // augment state with a GPS-VIO altitude bias state h_offset.
-  // Measurement model: GPS_z = p_z + h_offset  (H = [1, 1] for p_z and h_offset)
-  bool use_gps_h_offset = false;
-  double gps_h_offset_init_sigma = 5.0;   // initial uncertainty (m)
-  double gps_h_offset_walk_sigma = 0.02;  // random walk std per sqrt(s) (m/sqrt(s))
-
   /// What representation our features are in (msckf features)
   ov_type::LandmarkRepresentation::Representation feat_rep_msckf = ov_type::LandmarkRepresentation::Representation::GLOBAL_3D;
 

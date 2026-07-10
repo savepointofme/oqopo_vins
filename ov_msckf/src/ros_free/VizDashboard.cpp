@@ -746,11 +746,11 @@ bool VizDashboard::render_and_show(int wait_ms) {
       std::chrono::steady_clock::now() - t_render_start).count();
   render_count_++;
   if (render_count_ % 50 == 0) {
-    PRINT_INFO(CYAN "[viz] render #%d: %.1f ms  fast=%d  traj_step=%d  curve_dec=%d  "
-               "snap_vio=%zu  snap_ts=%zu\n" RESET,
-               render_count_, last_render_ms_,
-               (int)opts_.fast, traj_step, curve_dec,
-               snap.vio_hist.size(), snap.ts_speed.size());
+    PRINT_DEBUG(CYAN "[viz] render #%d: %.1f ms  fast=%d  traj_step=%d  curve_dec=%d  "
+                "snap_vio=%zu  snap_ts=%zu\n" RESET,
+                render_count_, last_render_ms_,
+                (int)opts_.fast, traj_step, curve_dec,
+                snap.vio_hist.size(), snap.ts_speed.size());
   }
 
   return true;

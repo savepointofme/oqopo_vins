@@ -626,7 +626,7 @@ static TestResult test_T11_checked_update_transaction(std::mt19937 &rng) {
 // NASA/Lear measurement-underweighting tests (T12–T19)
 //
 // These exercise StateHelper::computeLearUnderweightGain — the exact shared
-// helper VioManager's NASA_LEAR coupled mode uses — and its consistency with
+// helper VioManager's NASA_LEAN coupled mode uses, and its consistency with
 // the Joseph covariance primitive.  Primary source: NASA Navigation Filter
 // Best Practices, NTRS 20180003657 Eq. 4.36/4.38 (Lear's method).
 //   M     = P H                      (gain numerator)

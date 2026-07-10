@@ -17,7 +17,6 @@
 #include <fstream>
 #include <string>
 
-#include "thirdparty/px4/Px4LowPassFilter2p.hpp"
 #include "thirdparty/px4/Px4NotchFilter.hpp"
 #include "utils/sensor_data.h"
 
@@ -31,15 +30,9 @@ struct ImuFilterOptions {
     double bandwidth_hz = 0.0;
   };
 
-  struct LowpassOptions {
-    bool enabled = false;
-    double cutoff_hz = 25.0;
-  };
-
   bool enabled = false;
   NotchOptions gyro_notch0;
   NotchOptions gyro_notch1;
-  LowpassOptions gyro_lowpass;
   /// Nominal rate. Set to zero to initialize entirely from timestamps.
   double sample_rate_hz = 0.0;
   bool log_raw_and_filtered = false;
@@ -89,7 +82,6 @@ private:
   ImuFilterOptions options_;
   std::array<px4::math::NotchFilter<float>, 3> gyro_notch0_;
   std::array<px4::math::NotchFilter<float>, 3> gyro_notch1_;
-  std::array<px4::math::LowPassFilter2p<float>, 3> gyro_lowpass_;
   ImuFilterStats stats_;
   bool initialized_ = false;
   bool warned_rate_mismatch_ = false;

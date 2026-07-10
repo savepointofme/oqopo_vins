@@ -67,6 +67,10 @@ list(APPEND LIBRARY_SOURCES
         src/update/UpdaterMSCKF.cpp
         src/update/UpdaterSLAM.cpp
         src/update/UpdaterZeroVelocity.cpp
+        src/update/UpdaterGroundPlaneRange.cpp
+        src/update/UpdaterGroundPlaneFeature.cpp
+        src/update/UpdaterGroundPlaneFeatureV1.cpp
+        src/update/VisualObservabilityPolicy.cpp
 )
 list(APPEND LIBRARY_SOURCES src/ros/ROS2Visualizer.cpp src/ros/ROSVisualizerHelper.cpp)
 file(GLOB_RECURSE LIBRARY_HEADERS "src/*.h")
@@ -110,10 +114,20 @@ ament_target_dependencies(test_sim_repeat ${ament_libraries})
 target_link_libraries(test_sim_repeat ov_msckf_lib ${thirdparty_libraries})
 install(TARGETS test_sim_repeat DESTINATION lib/${PROJECT_NAME})
 
+add_executable(test_fc_init_loader src/test_fc_init_loader.cpp)
+ament_target_dependencies(test_fc_init_loader ${ament_libraries})
+target_link_libraries(test_fc_init_loader ${thirdparty_libraries})
+install(TARGETS test_fc_init_loader DESTINATION lib/${PROJECT_NAME})
+
 add_executable(test_imu_filter src/test_imu_filter.cpp)
 ament_target_dependencies(test_imu_filter ${ament_libraries})
 target_link_libraries(test_imu_filter ov_msckf_lib ${thirdparty_libraries})
 install(TARGETS test_imu_filter DESTINATION lib/${PROJECT_NAME})
+
+add_executable(test_anchor_trust_policy src/test_anchor_trust_policy.cpp)
+ament_target_dependencies(test_anchor_trust_policy ${ament_libraries})
+target_link_libraries(test_anchor_trust_policy ov_msckf_lib ${thirdparty_libraries})
+install(TARGETS test_anchor_trust_policy DESTINATION lib/${PROJECT_NAME})
 
 # Install launch and config directories
 install(DIRECTORY launch/ DESTINATION share/${PROJECT_NAME}/launch/)

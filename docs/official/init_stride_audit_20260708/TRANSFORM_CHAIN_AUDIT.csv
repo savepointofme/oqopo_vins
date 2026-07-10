@@ -1,0 +1,22 @@
+step_id,stage,input_frame_or_data,output_frame_or_data,code_or_config,evidence,status,alignment_or_mutation
+1,dataset_load,EuRoC imu0/cam0/cam1/GPS files,in-memory IMU/camera/GPS samples,ov_msckf/src/run_serial_msckf_ros_free.cpp:1211-1229,DatasetReaderEuroc loads imu cam gt gps,current,raw load
+2,gps_time_offset,GPS timestamp,GPS timestamp in camera-time convention,ov_msckf/src/run_serial_msckf_ros_free.cpp:1231-1235,applies params.gps_time_offset when nonzero,current,time mutation only
+3,start_time_trim,full dataset,trimmed IMU/camera streams,ov_msckf/src/run_serial_msckf_ros_free.cpp:1238-1252,--start-time drops earlier samples,current,time/data crop
+4,fc_init_load,FC init CSV,FCInitState nearest start row,ov_msckf/src/run_serial_msckf_ros_free.cpp:1255-1265,load_fc_init_state_csv and reports dt,current,initial state input
+5,fc_init_apply,FCInitState,State::_imu,ov_msckf/src/core/VioManagerHelper.cpp:91-108,sets q p v bg ba and covariance,current,state mutation
+6,init_timestamp,camera timestamp,State::_timestamp/startup_time,ov_msckf/src/core/VioManagerHelper.cpp:110-118,uses camera_timestamp as init timestamp,current,time origin decision
+7,camera_extrinsic_config,T_imu_cam or fallback T_cam_imu,State::_calib_IMUtoCAM,ov_msckf/src/core/VioManagerOptions.h:352-359; ov_core/src/utils/opencv_yaml_parse.h:621-629,stores R_ItoC and p_IinC but fallback direction needs audit,open_risk,possible constant transform
+8,raw_state_read,State::_imu,p_wi/v_wi/R_wi,ov_msckf/src/run_serial_msckf_ros_free.cpp:2318-2321,reads IMU pose velocity,current,raw state
+9,raw_traj_write,p_IinW0 and R_ItoW0,traj.txt,ov_msckf/src/run_serial_msckf_ros_free.cpp:2328-2338,TUM output says VIO unaligned frame,current,no alignment
+10,bias_write,v_IinW0 bg ba,traj.txt.bias,ov_msckf/src/run_serial_msckf_ros_free.cpp:2334-2341,writes velocity and biases,current,no alignment
+11,diag_write,state/tracker/GPS latest,diag.csv/events.txt,ov_msckf/src/ros_free/DiagLogger.h:31-71; ov_msckf/src/run_serial_msckf_ros_free.cpp:2590-2760,per-frame diagnostic CSV,current,mixed raw plus latest GPS diagnostic
+12,dashboard_pairing,VIO history + GT/GPS map,paired points for visualization alignment,ov_msckf/src/run_serial_msckf_ros_free.cpp:1593-1607,one-shot XY yaw solve for dashboard,current,visualization alignment only
+13,dashboard_draw,VIO points,VIO displayed in GT/GPS frame,ov_msckf/src/ros_free/VizDashboard.cpp:90-116; 301-303,uses R_gv*p+t when aligned,current,display mutation only
+14,gps_z_fusion,GPS altitude U only,EKF Z update,ov_msckf/src/run_serial_msckf_ros_free.cpp:2040-2065,XY reference is diagnostic and not residual,current,online measurement update
+15,analysis_sampling,GPS rows + traj.txt,post-update VIO samples,analysis/full_flight_error_analysis.py:780-795,uses first VIO state at or after GPS timestamp,current,evaluation sampling
+16,analysis_alignment,raw VIO samples + GPS ENU,aligned VIO samples,analysis/full_flight_error_analysis.py:819-833,start_align returns aligned position velocity,current,evaluation alignment
+17,analysis_errors,aligned VIO + GPS,err_E/N/U along/cross/vertical,analysis/full_flight_error_analysis.py:840-857,computes VIO minus GPS errors,current,metrics
+18,analysis_outputs,aligned sample table,plots/tables/reports,analysis/full_flight_error_analysis.py:1500-1518,writes gps_time_aligned_samples and tables,current,persisted analysis aligned data
+19,baseline_runtime,manifest config and flags,runner command,baseline/latest/scripts/run_baseline_fly.sh:118-142,camera-frame stride and GPS-Z/yaw flags,current,experiment config
+20,stride_audit,processed image timestamps/visual counters,camera stride audit CSV,ov_msckf/src/run_serial_msckf_ros_free.cpp:3017-3103,writes configured/visual stride counters when requested,current,run-level stride summary
+

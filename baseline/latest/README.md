@@ -12,7 +12,7 @@ result with the canonical full-flight tool.
 - IMU noise: `config/kalibr_imu_chain.yaml`
 - Calibration lineage: `references/d455_converged/`
 - Default yaw mode: `--yaw-mode baseline`
-- Default GPS-Z: `--height-mode classic` with the guarded parameters used in the June 2026
+- Default GPS-Z: `--height-mode guarded` with the guarded parameters used in the June 2026
   reruns
 - Default run stride: `12`
 - No-thinning control stride: `1`
@@ -24,7 +24,7 @@ The estimator YAML is deliberately stride-free.  Stride is a runtime choice:
 bash baseline/latest/scripts/run_baseline_fly.sh --fly fly3 --stride 12
 bash baseline/latest/scripts/run_baseline_fly.sh --fly fly3 --stride 1
 bash baseline/latest/scripts/run_baseline_fly.sh --fly fly3 --stride 12 --yaw-mode oc-fej
-bash baseline/latest/scripts/run_baseline_fly.sh --fly fly3 --stride 12 --height-mode nasa-lear
+bash baseline/latest/scripts/run_baseline_fly.sh --fly fly3 --stride 12 --height-mode nasa-lean
 ```
 
 The run script writes a timestamped folder and snapshots the exact command and
@@ -38,9 +38,9 @@ baseline config into the output directory.
 - `--yaw-mode oc`: current-gauge yaw OC with FEJ disabled.  This is a clean
   ablation, not the recommended baseline.
 - `--yaw-mode oc-fej`: FEJ Jacobians plus FEJ-gauge yaw OC projection.
-- `--height-mode classic`: guarded GPS-Z path used by the baseline.
-- `--height-mode nasa-lear`: NASA/Lear underweighting experiment on the same
-  GPS-Z measurement model. `nasa-lean` is accepted as a typo-compatible alias.
+- `--height-mode guarded`: guarded GPS-Z path used by the baseline.
+- `--height-mode nasa-lean`: NASA underweighting experiment on the same
+  GPS-Z measurement model.
 
 ## Four Flight Examples
 

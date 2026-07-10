@@ -28,8 +28,7 @@ bool valid_positive(double value) {
 } // namespace
 
 bool ImuFilter::has_active_filters() const {
-  return options_.enabled &&
-         (options_.gyro_notch0.enabled || options_.gyro_notch1.enabled || options_.gyro_lowpass.enabled);
+  return options_.enabled && (options_.gyro_notch0.enabled || options_.gyro_notch1.enabled);
 }
 
 void ImuFilter::validate_options() const {
@@ -39,12 +38,17 @@ void ImuFilter::validate_options() const {
     return;
   if (options_.gyro_notch0.enabled && (!valid_positive(options_.gyro_notch0.frequency_hz) ||
                                       !valid_positive(options_.gyro_notch0.bandwidth_hz)))
-    return;
+    throw std::invalid_argument("imu_filter.gyro_notch0 requires positive finite frequency_hz and bandwidth_hz");
   if (options_.gyro_notch1.enabled && (!valid_positive(options_.gyro_notch1.frequency_hz) ||
                                       !valid_positive(options_.gyro_notch1.bandwidth_hz)))
-    return;
-  if (options_.gyro_lowpass.enabled && !valid_positive(options_.gyro_lowpass.cutoff_hz))
-    return;
+    throw std::invalid_argument("imu_filter.gyro_notch1 requires positive finite frequency_hz and bandwidth_hz");
+  if (options_.sample_rate_hz > 0.0) {
+    const double nyquist = 0.5 * options_.sample_rate_hz;
+    if (options_.gyro_notch0.enabled && options_.gyro_notch0.frequency_hz >= nyquist)
+      throw std::invalid_argument("imu_filter.gyro_notch0.frequency_hz must be below Nyquist");
+    if (options_.gyro_notch1.enabled && options_.gyro_notch1.frequency_hz >= nyquist)
+      throw std::invalid_argument("imu_filter.gyro_notch1.frequency_hz must be below Nyquist");
+  }
 }
 
 void ImuFilter::configure(const ImuFilterOptions &options) {
@@ -99,14 +103,6 @@ void ImuFilter::configure_axes(double sample_rate_hz, const ov_core::ImuData *re
   configure_notch(gyro_notch0_, options_.gyro_notch0);
   configure_notch(gyro_notch1_, options_.gyro_notch1);
 
-  if (options_.gyro_lowpass.enabled) {
-    for (auto &filter : gyro_lowpass_)
-      filter.set_cutoff_frequency(static_cast<float>(sample_rate_hz), static_cast<float>(options_.gyro_lowpass.cutoff_hz));
-  } else {
-    for (auto &filter : gyro_lowpass_)
-      filter.disable();
-  }
-
   active_sample_rate_hz_ = sample_rate_hz;
   stats_.active_sample_rate_hz = sample_rate_hz;
   stats_.coefficient_update_count++;
@@ -122,9 +118,6 @@ Eigen::Vector3d ImuFilter::apply_chain(const Eigen::Vector3d &gyro) {
   if (options_.gyro_notch1.enabled)
     for (Eigen::Index axis = 0; axis < 3; ++axis)
       out(axis) = static_cast<double>(gyro_notch1_[static_cast<size_t>(axis)].apply(static_cast<float>(out(axis))));
-  if (options_.gyro_lowpass.enabled)
-    for (Eigen::Index axis = 0; axis < 3; ++axis)
-      out(axis) = static_cast<double>(gyro_lowpass_[static_cast<size_t>(axis)].apply(static_cast<float>(out(axis))));
   return out;
 }
 
@@ -146,14 +139,6 @@ void ImuFilter::reset_all(const ov_core::ImuData &sample, ov_core::ImuData *rese
       gyro_notch1_[axis].reset(static_cast<float>(out(i)));
       out(static_cast<Eigen::Index>(axis)) =
           static_cast<double>(gyro_notch1_[axis].apply(static_cast<float>(out(static_cast<Eigen::Index>(axis)))));
-    }
-  }
-  if (options_.gyro_lowpass.enabled) {
-    for (size_t axis = 0; axis < 3; ++axis) {
-      const Eigen::Index i = static_cast<Eigen::Index>(axis);
-      out(i) = std::isfinite(out(i)) ? out(i) : 0.0;
-      const float output = gyro_lowpass_[axis].reset(static_cast<float>(out(i)));
-      out(i) = static_cast<double>(output);
     }
   }
   if (reset_output != nullptr)
@@ -181,9 +166,8 @@ void ImuFilter::update_sample_rate(double instantaneous_rate_hz, const ov_core::
     }
   }
 
-  const double max_freq = std::max({options_.gyro_notch0.enabled ? options_.gyro_notch0.frequency_hz : 0.0,
-                                    options_.gyro_notch1.enabled ? options_.gyro_notch1.frequency_hz : 0.0,
-                                    options_.gyro_lowpass.enabled ? options_.gyro_lowpass.cutoff_hz : 0.0});
+  const double max_freq = std::max(options_.gyro_notch0.enabled ? options_.gyro_notch0.frequency_hz : 0.0,
+                                   options_.gyro_notch1.enabled ? options_.gyro_notch1.frequency_hz : 0.0);
   if (valid_interval_count_ >= kRateWarningMinimumIntervals && max_freq >= 0.5 * measured_sample_rate_hz_)
     throw std::runtime_error("measured IMU sample rate makes configured gyro filter violate Nyquist");
 
@@ -205,7 +189,7 @@ void ImuFilter::open_log_if_requested() {
     throw std::runtime_error("unable to open IMU raw/filtered log: " + options_.log_path);
   log_stream_ << "raw_timestamp,output_timestamp,raw_wx,raw_wy,raw_wz,filtered_wx,filtered_wy,filtered_wz,"
                  "raw_ax,raw_ay,raw_az,filtered_ax,filtered_ay,filtered_az,measured_rate_hz,active_rate_hz,"
-                 "reset_count,coefficient_update_count,disable_count,nf0_enabled,nf1_enabled,lp_enabled\n";
+                 "reset_count,coefficient_update_count,disable_count,nf0_enabled,nf1_enabled\n";
   log_stream_ << std::setprecision(17);
 }
 
@@ -223,7 +207,7 @@ void ImuFilter::write_log(const ov_core::ImuData &raw, const ov_core::ImuData &f
     log_stream_ << ',' << filtered.am(i);
   log_stream_ << ',' << measured_sample_rate_hz_ << ',' << active_sample_rate_hz_ << ',' << stats_.reset_count << ','
               << stats_.coefficient_update_count << ',' << stats_.disable_count << ',' << (int)options_.gyro_notch0.enabled
-              << ',' << (int)options_.gyro_notch1.enabled << ',' << (int)options_.gyro_lowpass.enabled << '\n';
+              << ',' << (int)options_.gyro_notch1.enabled << '\n';
 }
 
 ov_core::ImuData ImuFilter::process(const ov_core::ImuData &raw) {

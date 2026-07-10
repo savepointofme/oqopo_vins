@@ -4,13 +4,13 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  bash baseline/latest/scripts/run_baseline_fly.sh --fly fly3 [--stride 12] [--yaw-mode baseline] [--height-mode classic]
+  bash baseline/latest/scripts/run_baseline_fly.sh --fly fly3 [--stride 12] [--yaw-mode baseline] [--height-mode guarded]
 
 Options:
   --fly NAME          fly1, fly2, fly3, or fly4
   --stride N          camera-frame stride, default 12
   --yaw-mode MODE     baseline, fej, oc, oc-fej, or none; default baseline
-  --height-mode MODE  classic, nasa-lear, nasa-lean, standard, or bounded; default classic
+  --height-mode MODE  guarded, nasa-lean, standard, or bounded; default guarded
   --dataset PATH      override dataset path
   --gps PATH          override GPS CSV path
   --fc-init PATH      override FC init CSV path
@@ -32,7 +32,7 @@ REPO_ROOT="$(cd "$BASELINE_DIR/../.." && pwd)"
 FLY=""
 STRIDE=12
 YAW_MODE="baseline"
-HEIGHT_MODE="classic"
+HEIGHT_MODE="guarded"
 DATASET=""
 GPS=""
 FC_INIT=""
@@ -89,7 +89,7 @@ case "$FLY" in
   fly4)
     DATASET="${DATASET:-/mnt/c/Users/baloney/Desktop/20260528_gsmq_d455_fly4/d455_20260527_090549}"
     GPS="${GPS:-/mnt/c/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/fc_rebuild_20260528/gps_from_mems_offsetm202p2_cam_time.csv}"
-    FC_INIT="${FC_INIT:-/mnt/c/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/fc_rebuild_20260528/canonical_offsetm202p2_start904p4/fc_init_state_904p4_offsetm202p2.csv}"
+    FC_INIT="${FC_INIT:-/mnt/c/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/fc_rebuild_20260528/canonical_offsetm202p2_start924p4/fc_init_state_924p4_offsetm202p2.csv}"
     START_TIME="${START_TIME:-924.4}"
     ;;
   "")
@@ -143,7 +143,11 @@ CMD=(
   --diag-csv "$OUT/diag.csv"
   --diag-events "$OUT/events.txt"
   --vio-yaw-diag "$OUT/yaw_diag.csv"
+  --dashboard-alignment-json "$OUT/dashboard_alignment.json"
   --output "$OUT/traj.txt"
+  --output-raw "$OUT/traj_raw.txt"
+  --output-nav "$OUT/traj_nav.txt"
+  --nav-frame-metadata-json "$OUT/nav_frame_metadata.json"
 )
 
 if [[ "$HEADLESS" -eq 1 ]]; then

@@ -59,128 +59,18 @@ class StateHelper {
 
 public:
   enum class VisualYawUpdateMode {
-    // ── Official modes (safe for reported results, see official_yaw_modes_20260606.md) ──
-    ORIGINAL                         =  0, // official: original_fej — FEJ Jacobians, no OC projection
-    GLOBAL_YAW_OC_PROJECTION         =  2, // official: oc_mode2    — post-chi2 OC, current gauge, alpha=1.0
-    GLOBAL_YAW_OC_FEJ_PROJECTION     = 10, // accessible: oc_legacy_fej — post-chi2 OC, FEJ gauge (fly1 Cond3)
+    ORIGINAL                         =  0, // FEJ Jacobians, no OC projection
+    PER_BLOCK_SCALE                  =  1, // internal "no yaw update" scale path
+    GLOBAL_YAW_OC_PROJECTION         =  2, // post-chi2 OC, current gauge
+    GLOBAL_YAW_OC_FEJ_PROJECTION     = 10, // post-chi2 OC, FEJ gauge
     // (msckf2_0 / oc_prechi2 is dispatched via VisualObservabilityPolicy::is_prechi2_mode_string, not this enum)
-
-    // ── Internal / infrastructure ─────────────────────────────────────────────
-    PER_BLOCK_SCALE                  =  1, // INTERNAL_ONLY: "no yaw update" placeholder (--no-vio-yaw-update)
-
-    // ── Experimental-only (not for official results, loud warning at CLI) ─────
-    HARD_GYRO_YAW                    =  4, // EXPERIMENTAL_ONLY: replaces yaw innovation with gyro integral (debug)
-    A_STRICT_YAW_DX0                 =  5, // EXPERIMENTAL_ONLY: hard dx_yaw=0 constraint
-    VISUAL_YAW_SCHMIDT_CURRENT_GAUGE =  6, // EXPERIMENTAL_ONLY: Schmidt K-projection, current-state gauge
-    VISUAL_YAW_H_PROJECTION_CURRENT  =  7, // EXPERIMENTAL_ONLY: H-projection with current gauge (superseded by mode 2)
-    VISUAL_YAW_SCHMIDT_GUARDED       =  8, // EXPERIMENTAL_ONLY: Schmidt + pre-update R-inflate guard
-    VISUAL_YAW_SCHMIDT_FEJ_GAUGE     =  9, // EXPERIMENTAL_ONLY: Schmidt K-projection, FEJ gauge
-
-    // ── Retired modes (DO NOT USE — CLI returns error) ────────────────────────
-    CURRENT_ONLY_SCALE               =  3, // RETIRED: heuristic scale mode; no principled OC basis
-    DSO_INCREMENT_ORTHO              = 11, // RETIRED: v1 K-projection (fly3 smoke fail: altitude diverges t=450s)
-                                           //   String "dso_increment_ortho"/"dso" → CLI exits with error.
-    VINS_NUMERIC_NULLSPACE           = 12, // RETIRED: n_zeroed=0 throughout; EVD on S ≠ VINS marginalization
-                                           //   String "vins_numeric_nullspace"/"vins_nullspace" → CLI exits with error.
-    CONSTRAINED_YAW_NULLSPACE        = 13, // RETIRED: smoke FAILED 2026-06-06 — P_n exhausted after ~40 calls
-                                           //   (time-varying n defeats rank-1 Schur deflation; P indefinite).
-                                           //   See constrained_yaw_nullspace_smoke_report.md.
-                                           //   CLI exits with error. Unit tests in test_constrained_yaw_nullspace.cpp preserved.
   };
-
-  // Thresholds for VISUAL_YAW_SCHMIDT_GUARDED mode (all configurable via CLI)
-  struct SchmidtGuardConfig {
-    double gauge_frac_mild   = 0.50;   // R*=r_scale_mild if gauge_frac > this
-    double gauge_frac_severe = 0.60;   // R*=r_scale_severe (or reject) if > this
-    double norm_dx_mild      = 1.0;    // also require norm_delta_dx > this for mild
-    double norm_dx_severe    = 1.5;    // for severe
-    double pas_mild          = 15.0;   // Pas_change_norm threshold for mild
-    double pas_severe        = 20.0;   // for severe
-    double r_scale_mild      = 10.0;   // R multiplier for mild suspicious
-    double r_scale_severe    = 50.0;   // R multiplier for severe (set to 0 = reject)
-    int    burst_count       = 5;      // number of suspicious updates in burst_window to trigger burst mode
-    double burst_window_s    = 0.5;    // time window for burst detection
-    bool   reject_on_severe  = false;  // if true, reject severe instead of inflating R
-  };
-
-  static void set_schmidt_guard_config(const SchmidtGuardConfig &cfg);
-  static void open_schmidt_guard_log(const std::string &path);
-
-  // DEPRECATED: VinsNullspaceConfig and set_vins_nullspace_config are no-ops since
-  // VINS_NUMERIC_NULLSPACE is retired. Kept for link compatibility; EVD path is removed.
-  struct VinsNullspaceConfig {
-    double eig_thresh = 1e-6;
-  };
-  static void set_vins_nullspace_config(const VinsNullspaceConfig &cfg);
 
   struct YawDxProjectionDiag {
     bool valid = false;
     VisualYawUpdateMode mode = VisualYawUpdateMode::ORIGINAL;
     double dx_yaw_before_projection_deg = 0.0;
     double dx_yaw_after_projection_deg = 0.0;
-  };
-
-  struct SchmidtYawDiag {
-    double timestamp = 0.0;
-    std::string update_type;
-    std::string mode = "visual_yaw_schmidt_current_gauge";
-    std::string gauge_source;   // "current" or "fej" — set by the gauge builder
-    int H_rows = 0;
-    int H_cols = 0;
-    int N_cols = 1;
-    int rank_Q = 0;
-    double norm_Q = 0.0;
-    double norm_H = 0.0;        // Frobenius norm of H
-    double condition_N = 0.0;
-    double norm_HQ = 0.0;
-    double rel_norm_HQ = 0.0;
-    double normal_dx_s_coeff_before = 0.0;
-    double schmidt_dx_s_coeff_after = 0.0;
-    double norm_dx_normal = 0.0;
-    double norm_dx_schmidt = 0.0;
-    double norm_delta_dx = 0.0;
-    double Pss_norm_before = 0.0;
-    double Pss_norm_after = 0.0;            // q_old^T P_plus q_old (same q as before)
-    double Pss_norm_after_new_q = 0.0;      // q_new^T P_plus q_new (gauge rebuilt from updated state)
-    double Pss_change_norm = 0.0;
-    double Pas_change_norm = 0.0;
-    double yaw_before_update = 0.0;
-    double yaw_after_update = 0.0;
-    double delta_yaw_update = 0.0;
-    double bg_z_before = 0.0;
-    double bg_z_after = 0.0;
-    // q-energy decomposition (fraction of ||q||^2 in each block; mix of rad/m/m/s)
-    double q_energy_imu_ori    = 0.0;
-    double q_energy_imu_pos    = 0.0;
-    double q_energy_imu_vel    = 0.0;
-    double q_energy_clone_ori  = 0.0;
-    double q_energy_clone_pos  = 0.0;
-    double q_energy_slam       = 0.0;
-    double q_energy_bias_calib = 0.0;  // remainder (bg/ba + calibration)
-    // Covariance health
-    int    neg_diag_clamp_count    = 0;
-    double min_cov_diag_before_clamp  = 0.0;
-    double min_cov_diag_after_update  = 0.0;
-    bool projection_applied = false;
-    bool schmidt_applied = false;
-    std::string skipped_reason;
-    // Cross-gauge diagnostics: "alt" = opposite source (current if FEJ mode, FEJ if current mode)
-    double rel_norm_Hq_alt    = 0.0;  // ||H q_alt_Horder|| / ||H||
-    double q_alt_dot_dx_eff   = 0.0;  // q_alt^T dx_eff (leakage into unprotected direction)
-    double angle_q_alt_deg    = 0.0;  // angle between q_used and q_alt (degrees)
-    // Three-gauge comparison: q_cur (current), q_fej (FEJ), q_mix (IMU-current + clone-FEJ)
-    double angle_q_cur_fej_deg  = 0.0; // angle(q_current, q_fej) — explicit, always current vs fej
-    double angle_q_cur_mix_deg  = 0.0; // angle(q_current, q_mixed)
-    double angle_q_fej_mix_deg  = 0.0; // angle(q_fej, q_mixed)
-    double q_mix_rel_norm_Hq    = 0.0; // ||H q_mixed|| / ||H||
-    double q_mix_dot_dx_eff     = 0.0; // q_mixed^T dx_eff
-    double q_mix_energy_imu_ori    = 0.0;
-    double q_mix_energy_imu_pos    = 0.0;
-    double q_mix_energy_imu_vel    = 0.0;
-    double q_mix_energy_clone_ori  = 0.0;
-    double q_mix_energy_clone_pos  = 0.0;
-    double q_mix_energy_slam       = 0.0;
-    double q_mix_energy_bias_calib = 0.0;
   };
 
   /**
@@ -292,121 +182,6 @@ public:
   static YawDxProjectionDiag get_last_yaw_dx_projection_diag();
 
   /**
-   * @brief Consider-Filter (Schmidt-KF) update.
-   *
-   * 在 Bierman 1977 的 "consider filter" 变体里, 状态分两块:
-   *   - active:    出现在 H_order 里的变量, 正常被 K*res 修改 mean, 正常降协方差
-   *   - nuisance:  其余所有状态变量, **mean 保持不变**, 只通过 cross-covariance
-   *                降低 (active, nuisance) 的相关性. P_NN (nuisance 自相关) **不变**.
-   *
-   * 用途: 当外部观测 (如激光测距) 精度很高但只观测少量状态 (如 p_z) 时,
-   * 标准 EKF 会通过 P_XP 把 residual 反传到 ba/bg 等弱可观测的状态, 在 mono VIO
-   * 场景下往往越拉越偏. Schmidt filter 只让 active 拿到测量的修正, 把其他状态
-   * 当 "未知常量" 保持原样 — 不乱改, 等 VIO 自己的视觉约束慢慢观测它们.
-   *
-   * 注意: 这是次优 (sub-optimal) 滤波 (与标准 EKF 相比), 但 mean 更健壮,
-   *       协方差稍微保守 (P_NN 不减小 -> 后续 update 有更大的 cross-gain).
-   *
-   * 数学:
-   *   S    = H * P_SS * H^T + R         (只用 active 块, 不用全 P)
-   *   K_S  = P_SS * H^T * S^{-1}        (active-only gain)
-   *   x_S <- x_S + K_S * res            (nuisance mean 不动)
-   *   P_SS <- P_SS - K_S * H * P_SS
-   *   P_SN <- P_SN - K_S * H * P_SN     (对每个 nuisance 块 N, 更新与 active 的 cross)
-   *   P_NN <- unchanged
-   *
-   * @param state   状态指针
-   * @param H_order 被 H 显式观测到的 active 变量序列
-   * @param H       compressed Jacobian (行=观测数, 列=sum(H_order.size()))
-   * @param res     观测残差
-   * @param R       观测噪声协方差
-   */
-  static void EKFUpdateSchmidt(std::shared_ptr<State> state,
-                               const std::vector<std::shared_ptr<ov_type::Type>> &H_order,
-                               const Eigen::MatrixXd &H, const Eigen::VectorXd &res,
-                               const Eigen::MatrixXd &R);
-
-  /**
-   * @brief Schmidt / consider-state Kalman update protecting the global-yaw gauge subspace.
-   *
-   * Builds the current-state (non-FEJ) global yaw gauge direction q_full over the
-   * FULL N-dimensional covariance state space (IMU + all clones + all SLAM features),
-   * not over the H_order-local subspace.  This ensures the protected direction is
-   * consistent with the complete filter state.
-   *
-   * The Schmidt gain is:
-   *   K_eff = (I - q_full q_full^T) K_std
-   * where K_std is the standard EKFUpdate gain.  By construction q_full^T K_eff = 0,
-   * so the yaw-gauge component of dx is zero.
-   *
-   * All state variables (including those not in H_order) receive the correction
-   * K_eff[var] * res through their cross-covariance with the observed H_order block.
-   * The covariance is updated with the full symmetric Joseph form:
-   *   P+ = P - K_eff M_a^T - M_a K_eff^T + K_eff S K_eff^T
-   * which analytically preserves q_full^T P+ q_full = q_full^T P q_full (Pss unchanged).
-   *
-   * @param state       Filter state
-   * @param H_order     Variables explicitly observed by H
-   * @param H           Compressed Jacobian (m x n_H)
-   * @param res         Residual (m x 1)
-   * @param R           Measurement noise (m x m)
-   * @param update_type Label string for diagnostics ("msckf", "slam", "slam_delayed")
-   * @param diag_out    Optional diagnostics output (may be nullptr)
-   */
-  static void EKFUpdateSchmidtYawCurrentGauge(
-      std::shared_ptr<State> state,
-      const std::vector<std::shared_ptr<ov_type::Type>> &H_order,
-      const Eigen::MatrixXd &H,
-      const Eigen::VectorXd &res,
-      const Eigen::MatrixXd &R,
-      const std::string &update_type = "visual",
-      SchmidtYawDiag *diag_out = nullptr,
-      bool use_fej = false,
-      double bgz_scale = 1.0);
-
-  /// Open (or re-open) the per-update Schmidt yaw diagnostic CSV.
-  static void open_schmidt_yaw_diag_csv(const std::string &path);
-
-  /**
-   * @brief H-space current-yaw-gauge projection update (mode C).
-   *
-   * Builds the current-state yaw gauge q restricted to the H_order subspace,
-   * then projects: H_eff = H - (H*q_H)*q_H^T  so that H_eff*q_H ≈ 0.
-   * A standard EKFUpdate is then applied with H_eff.
-   *
-   * This is the H-space counterpart of EKFUpdateSchmidtYawCurrentGauge (mode B).
-   * Unlike mode B, the measurement Jacobian itself has no yaw component;
-   * the residual cannot pull the yaw gauge direction at all.
-   *
-   * Named: visual_yaw_h_projection_current
-   */
-  static void EKFUpdateYawGaugeHProjectionCurrent(
-      std::shared_ptr<State> state,
-      const std::vector<std::shared_ptr<ov_type::Type>> &H_order,
-      const Eigen::MatrixXd &H,
-      const Eigen::VectorXd &res,
-      const Eigen::MatrixXd &R);
-
-  /**
-   * @brief Guarded Schmidt update (mode D).
-   *
-   * Pre-computes gauge_fraction = |q^T dx_normal| / ||dx_normal||.
-   * - If update is normal: applies standard Schmidt B update.
-   * - If mild suspicious (gauge_frac > mild_thresh AND norm_delta_dx > dx_thresh):
-   *     inflates R by r_scale_mild, recomputes, applies Schmidt.
-   * - If severe suspicious or burst: inflates R by r_scale_severe OR rejects.
-   * Burst detector: if >= burst_count suspicious updates within burst_window_s,
-   *     applies severe treatment to remaining burst updates.
-   */
-  static void EKFUpdateSchmidtGuarded(
-      std::shared_ptr<State> state,
-      const std::vector<std::shared_ptr<ov_type::Type>> &H_order,
-      const Eigen::MatrixXd &H,
-      const Eigen::VectorXd &res,
-      const Eigen::MatrixXd &R,
-      const std::string &update_type);
-
-  /**
    * @brief This will set the initial covaraince of the specified state elements.
    * Will also ensure that proper cross-covariances are inserted.
    * @param state Pointer to state
@@ -423,41 +198,6 @@ public:
    * @param noise Amount of noise (variance) to add to P_zz diagonal
    */
   static void inject_pz_noise(std::shared_ptr<State> state, double noise);
-
-  /// Inject noise into the h_offset diagonal element (Architecture G random walk).
-  static void inject_h_offset_noise(std::shared_ptr<State> state, double noise);
-
-  /**
-   * @brief Z-only EKF covariance update: only reduce P_zz, cross-terms unchanged.
-   *
-   * Standard Joseph-form reduction for a 1-D measurement of p_z:
-   *   P_zz_new = P_zz - P_zz^2 / S
-   *
-   * @param state Pointer to state
-   * @param S Innovation covariance (P_zz + R)
-   */
-  static void ekf_update_zonly(std::shared_ptr<State> state, double R);
-
-  /**
-   * @brief Z-only EKF update: full covariance update, only p_z state correction.
-   *
-   * Performs a standard EKF covariance update (Joseph form) for consistency,
-   * but only applies the IMU position-z component of the state correction.
-   * All other state components (px, py, v, q, bg, ba, clones, SLAM) are
-   * reverted to their pre-update values.
-   *
-   * Uses the same H_order / H / res / R interface as EKFUpdate.
-   *
-   * @param state Pointer to state
-   * @param H_order Variable ordering used in the compressed Jacobian
-   * @param H Condensed Jacobian of updating measurement
-   * @param res Residual of updating measurement
-   * @param R Updating measurement covariance
-   */
-  static void EKFUpdateZOnly(std::shared_ptr<State> state,
-                             const std::vector<std::shared_ptr<ov_type::Type>> &H_order,
-                             const Eigen::MatrixXd &H, const Eigen::VectorXd &res,
-                             const Eigen::MatrixXd &R);
 
   /**
    * @brief Pure-math Joseph-form covariance update with arbitrary gain K.

@@ -199,8 +199,10 @@ def metric_stats(v: np.ndarray) -> dict[str, float | int]:
     a = np.asarray(v, dtype=float)
     a = a[np.isfinite(a)]
     if not len(a):
-        return {k: float("nan") for k in
-                ["signed_mean", "mae", "rmse", "median", "p95", "max", "final"]} | {"n": 0}
+        out = {k: float("nan") for k in
+               ["signed_mean", "mae", "rmse", "median", "p95", "max", "final"]}
+        out["n"] = 0
+        return out
     av = np.abs(a)
     return {
         "signed_mean": float(np.mean(a)),

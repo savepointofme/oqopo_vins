@@ -1,0 +1,114 @@
+name,dtype,group,source
+run_id,string,index,run directory or manifest
+flight_id,string,index,metadata/inferred
+config_id,string,index,metadata/inferred
+frame_id,int64,index,diag.csv or row number
+timestamp_master,float64,time,camera/VIO output time
+camera_timestamp_raw,float64,time,diag.csv t
+vio_state_timestamp,float64,time,traj.txt t
+fc_timestamp_raw,float64,time,"FC source, optional"
+fc_timestamp_aligned,float64,time,"FC source, optional"
+gps_timestamp_raw,float64,time,analysis/GPS source
+gps_timestamp_aligned,float64,time,analysis/GPS source
+vio_sample_delay_ms,float64,time,analysis data
+segment_id,string,index,analysis segment index
+init_status,string,index,diag.csv initialized
+stride_input,int64,stride,run metadata or command
+stride_visual_update,int64,stride,camera stride audit or command
+stride_analysis_sample,int64,stride,analysis metadata
+overlap_theory_along,float64,stride,future footprint model
+overlap_polygon_area,float64,stride,future footprint model
+overlap_valid,bool,stride,future footprint model
+fc_q_x,float64,fc,"FC source, optional"
+fc_q_y,float64,fc,"FC source, optional"
+fc_q_z,float64,fc,"FC source, optional"
+fc_q_w,float64,fc,"FC source, optional"
+fc_roll_raw,float64,fc,"FC source, optional"
+fc_pitch_raw,float64,fc,"FC source, optional"
+fc_yaw_raw,float64,fc,"FC source, optional"
+fc_roll_calibrated,float64,fc,future FC calibration
+fc_pitch_calibrated,float64,fc,future FC calibration
+fc_yaw_calibrated,float64,fc,future FC calibration
+fc_velocity_e,float64,fc,"FC source, optional"
+fc_velocity_n,float64,fc,"FC source, optional"
+fc_velocity_u,float64,fc,"FC source, optional"
+vio_raw_q_x,float64,vio_raw,traj.txt
+vio_raw_q_y,float64,vio_raw,traj.txt
+vio_raw_q_z,float64,vio_raw,traj.txt
+vio_raw_q_w,float64,vio_raw,traj.txt
+vio_raw_position_x,float64,vio_raw,traj.txt
+vio_raw_position_y,float64,vio_raw,traj.txt
+vio_raw_position_z,float64,vio_raw,traj.txt
+vio_raw_velocity_x,float64,vio_raw,traj.txt.bias
+vio_raw_velocity_y,float64,vio_raw,traj.txt.bias
+vio_raw_velocity_z,float64,vio_raw,traj.txt.bias
+vio_gyro_bias_x,float64,vio_raw,traj.txt.bias or diag.csv
+vio_gyro_bias_y,float64,vio_raw,traj.txt.bias or diag.csv
+vio_gyro_bias_z,float64,vio_raw,traj.txt.bias or diag.csv
+vio_accel_bias_x,float64,vio_raw,traj.txt.bias or diag.csv
+vio_accel_bias_y,float64,vio_raw,traj.txt.bias or diag.csv
+vio_accel_bias_z,float64,vio_raw,traj.txt.bias or diag.csv
+vio_mapped_q_x,float64,vio_mapped,future program mapping
+vio_mapped_q_y,float64,vio_mapped,future program mapping
+vio_mapped_q_z,float64,vio_mapped,future program mapping
+vio_mapped_q_w,float64,vio_mapped,future program mapping
+vio_mapped_position_x,float64,vio_mapped,future program mapping
+vio_mapped_position_y,float64,vio_mapped,future program mapping
+vio_mapped_position_z,float64,vio_mapped,future program mapping
+vio_mapped_velocity_x,float64,vio_mapped,future program mapping
+vio_mapped_velocity_y,float64,vio_mapped,future program mapping
+vio_mapped_velocity_z,float64,vio_mapped,future program mapping
+mapping_id,string,vio_mapped,future program mapping
+mapping_applied,bool,vio_mapped,future program mapping
+vio_analysis_aligned_position_e,float64,vio_analysis_aligned,analysis/data/gps_time_aligned_samples.csv
+vio_analysis_aligned_position_n,float64,vio_analysis_aligned,analysis/data/gps_time_aligned_samples.csv
+vio_analysis_aligned_position_u,float64,vio_analysis_aligned,analysis/data/gps_time_aligned_samples.csv
+vio_analysis_aligned_velocity_e,float64,vio_analysis_aligned,analysis/data/gps_time_aligned_samples.csv
+vio_analysis_aligned_velocity_n,float64,vio_analysis_aligned,analysis/data/gps_time_aligned_samples.csv
+vio_analysis_aligned_velocity_u,float64,vio_analysis_aligned,analysis/data/gps_time_aligned_samples.csv
+alignment_id,string,alignment,analysis metadata
+alignment_mode,string,alignment,analysis metadata
+alignment_rotation_yaw_deg,float64,alignment,analysis metadata
+alignment_translation_e,float64,alignment,analysis metadata
+alignment_translation_n,float64,alignment,analysis metadata
+alignment_translation_u,float64,alignment,analysis metadata
+alignment_applied,bool,alignment,analysis data present
+truth_position_e,float64,truth,analysis GPS/reference
+truth_position_n,float64,truth,analysis GPS/reference
+truth_position_u,float64,truth,analysis GPS/reference
+truth_velocity_e,float64,truth,analysis GPS/reference
+truth_velocity_n,float64,truth,analysis GPS/reference
+truth_velocity_u,float64,truth,analysis GPS/reference
+truth_course_deg,float64,truth,analysis GPS/reference
+gps_quality,string,truth,"GPS source, optional"
+gps_velocity_source,string,truth,analysis data
+err_e,float64,error,analysis data
+err_n,float64,error,analysis data
+err_u,float64,error,analysis data
+err_xy,float64,error,analysis data
+err_3d,float64,error,analysis data
+err_along,float64,error,analysis data
+err_cross,float64,error,analysis data
+err_vertical,float64,error,analysis data
+err_v_e,float64,error,analysis data
+err_v_n,float64,error,analysis data
+err_v_u,float64,error,analysis data
+err_v_along,float64,error,analysis data
+err_v_cross,float64,error,analysis data
+err_v_vertical,float64,error,analysis data
+course_error_deg,float64,error,analysis data
+feature_klt_raw,int64,diagnostic,diag.csv
+feature_tracked,int64,diagnostic,diag.csv
+feature_msckf_accepted,int64,diagnostic,diag.csv
+feature_slam_count,int64,diagnostic,diag.csv
+mean_track_length,float64,diagnostic,future tracker summary
+visual_update_executed,bool,diagnostic,future per-frame update log
+data_missing_flags,string,diagnostic,builder
+repo_commit,string,provenance,git
+dirty_worktree,bool,provenance,git
+runner_path,string,provenance,run metadata
+config_path,string,provenance,run metadata
+config_hash,string,provenance,future hash
+calibration_id,string,provenance,config snapshot
+command_path,string,provenance,run directory
+analysis_source,string,provenance,analysis directory

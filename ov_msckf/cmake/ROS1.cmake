@@ -199,6 +199,15 @@ install(TARGETS test_joseph_update
         RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
+# FC init CSV time-selection tests (pure header logic).
+add_executable(test_fc_init_loader src/test_fc_init_loader.cpp)
+target_link_libraries(test_fc_init_loader ${thirdparty_libraries})
+install(TARGETS test_fc_init_loader
+        ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+        LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+        RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
 # Gate 2: Constrained-yaw-nullspace rank-1 projection unit tests (pure Eigen, no pipeline).
 # Some experiment snapshots contain the target declaration but not its source;
 # keep those snapshots configurable while emitting an explicit warning.
@@ -218,6 +227,15 @@ endif ()
 add_executable(test_adaptive_stride src/test_adaptive_stride.cpp)
 target_link_libraries(test_adaptive_stride ov_msckf_lib ${thirdparty_libraries})
 install(TARGETS test_adaptive_stride
+        ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+        LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+        RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+# Pure external-anchor source-quality and trust-policy tests.
+add_executable(test_anchor_trust_policy src/test_anchor_trust_policy.cpp)
+target_link_libraries(test_anchor_trust_policy ov_msckf_lib ${thirdparty_libraries})
+install(TARGETS test_anchor_trust_policy
         ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
         LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
         RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}

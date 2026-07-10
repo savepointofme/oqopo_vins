@@ -26,6 +26,14 @@ struct FCInitState {
   Eigen::Vector3d bg = Eigen::Vector3d::Zero();
   Eigen::Vector3d ba = Eigen::Vector3d::Zero();
   double source_dt = 0.0;
+  int valid_row_count = 0;
+  int duplicate_timestamp_count = 0;
+  int non_monotonic_timestamp_count = 0;
+};
+
+struct FCInitLoadOptions {
+  double max_abs_dt = 0.25;
+  bool warn_only = false;
 };
 
 inline std::string fcinit_trim(const std::string &s) {
@@ -71,7 +79,9 @@ inline bool fcinit_parse_row(const std::string &line, FCInitState &state) {
   return true;
 }
 
-inline FCInitState load_fc_init_state_csv(const std::string &path, double target_time) {
+inline FCInitState load_fc_init_state_csv(const std::string &path,
+                                          double target_time,
+                                          const FCInitLoadOptions &options = FCInitLoadOptions()) {
   std::ifstream in(path);
   if (!in.is_open())
     throw std::runtime_error("cannot open FC init CSV: " + path);
@@ -79,11 +89,29 @@ inline FCInitState load_fc_init_state_csv(const std::string &path, double target
   bool have = false;
   FCInitState best;
   double best_abs_dt = std::numeric_limits<double>::infinity();
+  int valid_row_count = 0;
+  int duplicate_timestamp_count = 0;
+  int non_monotonic_timestamp_count = 0;
+  bool have_previous = false;
+  double previous_timestamp = 0.0;
+  std::vector<double> seen_timestamps;
   std::string line;
   while (std::getline(in, line)) {
     FCInitState candidate;
     if (!fcinit_parse_row(line, candidate))
       continue;
+    valid_row_count++;
+    if (have_previous && candidate.timestamp < previous_timestamp)
+      non_monotonic_timestamp_count++;
+    have_previous = true;
+    previous_timestamp = candidate.timestamp;
+    for (double seen : seen_timestamps) {
+      if (std::fabs(seen - candidate.timestamp) < 1e-9) {
+        duplicate_timestamp_count++;
+        break;
+      }
+    }
+    seen_timestamps.push_back(candidate.timestamp);
     double abs_dt = std::fabs(candidate.timestamp - target_time);
     if (!have || abs_dt < best_abs_dt) {
       have = true;
@@ -94,6 +122,18 @@ inline FCInitState load_fc_init_state_csv(const std::string &path, double target
   if (!have)
     throw std::runtime_error("no valid FC init rows in: " + path);
   best.source_dt = best.timestamp - target_time;
+  best.valid_row_count = valid_row_count;
+  best.duplicate_timestamp_count = duplicate_timestamp_count;
+  best.non_monotonic_timestamp_count = non_monotonic_timestamp_count;
+  if (std::isfinite(options.max_abs_dt) && options.max_abs_dt >= 0.0 && best_abs_dt > options.max_abs_dt && !options.warn_only) {
+    std::ostringstream oss;
+    oss << "FC init timestamp mismatch: selected t=" << best.timestamp
+        << " target=" << target_time
+        << " dt=" << best.source_dt
+        << " exceeds max_abs_dt=" << options.max_abs_dt
+        << " from " << path;
+    throw std::runtime_error(oss.str());
+  }
   return best;
 }
 

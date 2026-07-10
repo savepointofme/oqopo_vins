@@ -1,0 +1,20 @@
+:root {
+  --color-workbench: #eceef1;
+  --color-topbar: #11171f;
+  --color-text: #1d2733;
+  --color-muted: #828c99;
+  --color-card: #ffffff;
+  --color-border: #d9dee7;
+  --color-control: #f6f7f9;
+  --color-notice: #fdf6ee;
+  --color-blue: #2563c9;
+  --color-green: #1f7a4d;
+  --color-red: #d33a35;
+  --color-orange: #d97706;
+  --color-purple: #8b5cf6;
+  --color-gray: #64748b;
+  --shadow-panel: 0 12px 28px rgba(15, 23, 42, 0.08);
+  --radius-card: 9px;
+  --font-ui: "Microsoft YaHei", "Noto Sans SC", "PingFang SC", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}

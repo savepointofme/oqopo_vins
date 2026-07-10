@@ -25,25 +25,12 @@
 
 using ov_msckf::ImuFilter;
 using ov_msckf::ImuFilterOptions;
-using Px4LowPass = px4::math::LowPassFilter2p<float>;
 using Px4Notch = px4::math::NotchFilter<float>;
 
 namespace {
 
 constexpr float kPi = 3.14159265358979323846f;
 constexpr const char *kNotchSha256 = "b7e2d2143bfdfe371546b5393bd125f25a4141c30d37d92d1f8fafd06dfa8464";
-
-class InspectableLowPass : public Px4LowPass {
-public:
-  using Px4LowPass::LowPassFilter2p;
-  float delay1() const { return _delay_element_1; }
-  float delay2() const { return _delay_element_2; }
-  float a1() const { return _a1; }
-  float a2() const { return _a2; }
-  float b0() const { return _b0; }
-  float b1() const { return _b1; }
-  float b2() const { return _b2; }
-};
 
 class InspectableNotch : public Px4Notch {
 public:
@@ -59,12 +46,10 @@ public:
   float sample_freq() const { return _sample_freq; }
 };
 
-static_assert(std::is_same_v<decltype(std::declval<const Px4LowPass &>().getMagnitudeResponse(0.f)), float>);
 static_assert(std::is_same_v<decltype(std::declval<const Px4Notch &>().getMagnitudeResponse(1.f)), float>);
 
 bool same_bits(float a, float b) { return std::memcmp(&a, &b, sizeof(float)) == 0; }
 bool same_bits(double a, double b) { return std::memcmp(&a, &b, sizeof(double)) == 0; }
-bool close(float a, float b, float tolerance = 2e-5f) { return std::fabs(a - b) <= tolerance; }
 bool close(double a, double b, double tolerance = 1e-6) { return std::abs(a - b) <= tolerance; }
 
 ov_core::ImuData sample(double t, double gyro, double accel = 9.81) {
@@ -196,33 +181,6 @@ std::vector<float> sine(float frequency_hz, float sample_rate_hz, int count) {
   return values;
 }
 
-void verify_lowpass_official_paths(const std::vector<float> &input) {
-  InspectableLowPass constructed(200.f, 25.f);
-  InspectableLowPass configured;
-  configured.set_cutoff_frequency(200.f, 25.f);
-  assert(same_bits(constructed.a1(), configured.a1()));
-  assert(same_bits(constructed.a2(), configured.a2()));
-  assert(same_bits(constructed.b0(), configured.b0()));
-  assert(same_bits(constructed.b1(), configured.b1()));
-  assert(same_bits(constructed.b2(), configured.b2()));
-  for (float value : input) {
-    const float a = constructed.apply(value);
-    const float b = configured.apply(value);
-    assert(same_bits(a, b));
-    assert(same_bits(constructed.delay1(), configured.delay1()));
-    assert(same_bits(constructed.delay2(), configured.delay2()));
-  }
-  InspectableLowPass array_filter(200.f, 25.f);
-  InspectableLowPass scalar_filter(200.f, 25.f);
-  std::vector<float> array_output = input;
-  std::vector<float> scalar_output;
-  for (float value : input)
-    scalar_output.push_back(scalar_filter.apply(value));
-  array_filter.applyArray(array_output.data(), static_cast<int>(array_output.size()));
-  for (size_t i = 0; i < input.size(); ++i)
-    assert(same_bits(array_output[i], scalar_output[i]));
-}
-
 void verify_notch_official_paths(const std::vector<float> &input) {
   InspectableNotch configured;
   assert(configured.setParameters(200.f, 40.f, 8.f));
@@ -319,15 +277,12 @@ void verify_openvins_wrapper_paths() {
   options.sample_rate_hz = 200.0;
   options.gyro_notch0 = {true, 40.0, 8.0};
   options.gyro_notch1 = {true, 72.0, 6.0};
-  options.gyro_lowpass = {true, 25.0};
   ImuFilter filter(options);
   Px4Notch nf0[3];
   Px4Notch nf1[3];
-  Px4LowPass lp[3];
   for (int axis = 0; axis < 3; ++axis) {
     assert(nf0[axis].setParameters(200.f, 40.f, 8.f));
     assert(nf1[axis].setParameters(200.f, 72.f, 6.f));
-    lp[axis].set_cutoff_frequency(200.f, 25.f);
   }
   for (int i = 0; i < 200; ++i) {
     const double t = 1.0 + 0.005 * i;
@@ -340,8 +295,6 @@ void verify_openvins_wrapper_paths() {
     for (Eigen::Index axis = 0; axis < 3; ++axis) {
       expected(axis) = nf0[axis].apply(static_cast<float>(expected(axis)));
       expected(axis) = nf1[axis].apply(static_cast<float>(expected(axis)));
-      expected(axis) = (i == 0) ? lp[axis].reset(static_cast<float>(expected(axis)))
-                                : lp[axis].apply(static_cast<float>(expected(axis)));
       assert(same_bits(static_cast<float>(out.wm(axis)), static_cast<float>(expected(axis))));
       assert(same_bits(out.am(axis), raw.am(axis)));
     }
@@ -352,11 +305,13 @@ void verify_openvins_wrapper_paths() {
 
   auto bad = options;
   bad.gyro_notch0.frequency_hz = 100.0;
-  ImuFilter invalid_filter(bad);
-  const auto raw = sample(0.0, 3.0);
-  const auto passed = invalid_filter.process(raw);
-  assert(passed.wm.allFinite());
-  assert(invalid_filter.stats().disable_count >= 3);
+  bool threw = false;
+  try {
+    ImuFilter invalid_filter(bad);
+  } catch (const std::exception &) {
+    threw = true;
+  }
+  assert(threw);
 
   auto timestamped = options;
   timestamped.sample_rate_hz = 0.0;
@@ -403,12 +358,11 @@ void verify_cascade_effect() {
 int main() {
   verify_px4_notch_source();
   const auto suite = make_signal_suite();
-  verify_lowpass_official_paths(suite);
   verify_notch_official_paths(suite);
   verify_notch_frequency_behavior();
   verify_px4_reset_disable_invalid();
   verify_cascade_effect();
   verify_openvins_wrapper_paths();
-  std::cout << "PX4 NotchFilter/LowPassFilter2p and OpenVINS IMU filter-chain tests passed\n";
+  std::cout << "PX4 NotchFilter and OpenVINS IMU notch-chain tests passed\n";
   return 0;
 }

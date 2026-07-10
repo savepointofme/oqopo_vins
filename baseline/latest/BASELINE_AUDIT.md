@@ -28,15 +28,14 @@ The clean runner now uses `--height-mode`:
 
 | Mode | Low-Level Mode | Intended Use |
 | --- | --- | --- |
-| `classic` | `legacy_guarded` | Baseline guarded GPS-Z update. |
+| `guarded` | `guarded` | Baseline guarded GPS-Z update. |
 | `standard` | `full` | Full coupled Joseph update without underweighting. |
 | `bounded` | `bounded` | Uniform gain-scale trust-region experiment. |
-| `nasa-lear` | `nasa_lear` | Measurement-space Lear underweighting experiment. |
+| `nasa-lean` | `nasa_lean` | Measurement-space NASA underweighting experiment. |
 
-`classic` and `nasa-lear` are not two different altitude measurements.  They
+`guarded` and `nasa-lean` are not two different altitude measurements.  They
 use the same GPS-Z observation model and differ in how the Kalman correction is
-protected.  `nasa-lean`/`nasa_lean` are accepted only as typo-compatible
-aliases for `nasa-lear`.
+protected.
 
 ## Local Cleanup
 
