@@ -7,6 +7,7 @@ GIT_DIR="${P4_R1_GIT_DIR:-${SOURCE_REPO}/.git/worktrees/open_vins_p4_sliding_r1}
 FC_ROOT="${P4_CALIBRATED_FC_ROOT:-${SOURCE_REPO}/readonly_audits/P4_global_baseline_fullflight_fc_board_calibration_20260714_v3/p4_inputs}"
 OUTPUT_PARENT="${P4_R1_OUTPUT_PARENT:-/mnt/c/Users/baloney/Desktop/P4_sliding_window_r1_20260714}"
 ROOT="${OUTPUT_PARENT}/$(date +%Y%m%d_%H%M%S)_short_shadow"
+FLIGHT_SET="${1:-both}"
 BINARY="${REPO}/build_p4_sliding_r1/run_serial_msckf_ros_free"
 TEST_BINARY="${REPO}/build_p4_sliding_r1/test_online_alignment_initializer"
 CONFIG="${REPO}/baseline/latest/config/estimator_config.yaml"
@@ -64,6 +65,8 @@ run_one() {
     --gps-alt-update
     --height-mode guarded
     --camera-frame-stride 12
+    --adaptive-stride-log "${out}/p4_visual_cadence.csv"
+    --camera-stride-audit "${out}/camera_stride_audit.csv"
     --diag-csv "${out}/diag.csv"
     --diag-events "${out}/events.txt"
     --output "${out}/traj.txt"
@@ -93,7 +96,12 @@ run_one() {
 }
 
 printf 'flight,exit_code\n' > "${ROOT}/batch_exit_codes.csv"
-for flight in fly1 fly3; do
+case "${FLIGHT_SET}" in
+  both) flights=(fly1 fly3) ;;
+  fly1|fly3) flights=("${FLIGHT_SET}") ;;
+  *) printf 'usage: %s [both|fly1|fly3]\n' "$0" >&2; exit 2 ;;
+esac
+for flight in "${flights[@]}"; do
   code=0
   run_one "${flight}" || code=$?
   printf '%s,%s\n' "${flight}" "${code}" >> "${ROOT}/batch_exit_codes.csv"
