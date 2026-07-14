@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO="${P4_R1_REPO:-/mnt/d/vscode_dir/open_vins_p4_sliding_r1}"
 SOURCE_REPO="${P4_SOURCE_REPO:-/mnt/d/vscode_dir/open_vins}"
-GIT_DIR="${P4_R1_GIT_DIR:-${SOURCE_REPO}/.git/worktrees/open_vins_p4_sliding_r1}"
+REPO_WINDOWS="${P4_R1_REPO_WINDOWS:-D:/vscode_dir/open_vins_p4_sliding_r1}"
 FC_ROOT="${P4_CALIBRATED_FC_ROOT:-${SOURCE_REPO}/readonly_audits/P4_global_baseline_fullflight_fc_board_calibration_20260714_v3/p4_inputs}"
 OUTPUT_PARENT="${P4_R1_OUTPUT_PARENT:-/mnt/c/Users/baloney/Desktop/P4_sliding_window_r1_20260714}"
 ROOT="${OUTPUT_PARENT}/$(date +%Y%m%d_%H%M%S)_short_shadow"
@@ -14,10 +14,8 @@ CONFIG="${REPO}/baseline/latest/config/estimator_config.yaml"
 VALIDATOR="${REPO}/analysis/validate_p4_sliding_window_r1.py"
 
 mkdir -p "${ROOT}"
-git --git-dir="${GIT_DIR}" --work-tree="${REPO}" rev-parse HEAD \
-  > "${ROOT}/git_head.txt"
-git --git-dir="${GIT_DIR}" --work-tree="${REPO}" status --short \
-  > "${ROOT}/git_status.txt"
+git.exe -C "${REPO_WINDOWS}" rev-parse HEAD > "${ROOT}/git_head.txt"
+git.exe -C "${REPO_WINDOWS}" status --short > "${ROOT}/git_status.txt"
 sha256sum "${BINARY}" "${TEST_BINARY}" "${CONFIG}" \
   "${REPO}/ov_msckf/src/core/OnlineAlignmentInitializer.h" \
   "${REPO}/ov_msckf/src/core/OnlineAlignmentInitializer.cpp" \

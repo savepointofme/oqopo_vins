@@ -46,6 +46,8 @@ def main() -> int:
     visual_counts: list[int] = []
     keyframe_counts: list[int] = []
     invocation_indices: list[int] = []
+    warm_start_flags: list[int] = []
+    state_signatures: list[tuple[float, ...]] = []
 
     for row in solved:
         begin = float(row["window_begin_timestamp_s"])
@@ -60,6 +62,7 @@ def main() -> int:
         }
         fingerprint = row["window_fingerprint"]
         invocation_indices.append(invocation)
+        warm_start_flags.append(int(row["warm_start_used"]))
         keyframe_counts.append(keyframes)
         fc_counts.append(int(row["raw_fc_count"]))
         imu_counts.append(int(row["imu_count"]))
@@ -77,6 +80,7 @@ def main() -> int:
         if fingerprint in seen_fingerprints:
             failures.append(f"window {invocation} duplicates a previous fingerprint")
         seen_fingerprints.add(fingerprint)
+        state_signature: list[float] = []
         for field, size in (
             ("q_GtoI_xyzw", 4),
             ("p_IinG_m", 3),
@@ -85,9 +89,10 @@ def main() -> int:
             ("ba_mps2", 3),
         ):
             try:
-                parse_vector(row[field], size)
+                state_signature.extend(parse_vector(row[field], size))
             except ValueError as error:
                 failures.append(f"window {invocation} {error}")
+        state_signatures.append(tuple(state_signature))
 
         if previous_end is not None:
             if end - previous_end + 1.0e-6 < args.min_advance:
@@ -102,6 +107,12 @@ def main() -> int:
 
     if invocation_indices and invocation_indices != sorted(set(invocation_indices)):
         failures.append("optimizer invocation indices are duplicated or non-monotonic")
+    if warm_start_flags and warm_start_flags[0] != 0:
+        failures.append("first sliding window unexpectedly reports a warm start")
+    if any(flag != 1 for flag in warm_start_flags[1:]):
+        failures.append("one or more later sliding windows did not use a warm start")
+    if state_signatures and len(set(state_signatures)) != len(state_signatures):
+        failures.append("one or more solved windows reused an identical q/p/v/bg/ba output")
     if len(solved) >= 2 and not stale_left_observed:
         failures.append("no selected timestamp left the moving window")
     if len(solved) >= 2 and not new_entered_observed:
@@ -127,6 +138,10 @@ def main() -> int:
         "total_window_receipts": len(all_rows),
         "solved_window_count": len(solved),
         "optimizer_invocation_indices": invocation_indices,
+        "later_windows_all_warm_started": bool(warm_start_flags) and all(
+            flag == 1 for flag in warm_start_flags[1:]
+        ),
+        "unique_state_output_count": len(set(state_signatures)),
         "first_window_begin_timestamp_s": float(solved[0]["window_begin_timestamp_s"]) if solved else None,
         "last_window_begin_timestamp_s": float(solved[-1]["window_begin_timestamp_s"]) if solved else None,
         "first_window_end_timestamp_s": float(solved[0]["window_end_timestamp_s"]) if solved else None,
