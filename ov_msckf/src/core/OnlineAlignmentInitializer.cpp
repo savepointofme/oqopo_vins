@@ -625,18 +625,29 @@ const char *estimate_source_status_name(EstimateSourceStatus status) {
 OnlineAlignmentInitializer::OnlineAlignmentInitializer(
     const OnlineAlignmentOptions &options)
     : options_(options) {
-  options_.reference_window_duration_s =
-      std::max(0.5, std::min(12.0, options_.reference_window_duration_s));
-  for (double &duration : options_.candidate_window_durations_s)
-    duration = std::max(0.5, std::min(12.0, duration));
-  options_.candidate_window_durations_s.push_back(
-      options_.reference_window_duration_s);
-  std::sort(options_.candidate_window_durations_s.begin(),
-            options_.candidate_window_durations_s.end());
-  options_.candidate_window_durations_s.erase(
-      std::unique(options_.candidate_window_durations_s.begin(),
-                  options_.candidate_window_durations_s.end()),
-      options_.candidate_window_durations_s.end());
+  if (options_.sliding_window_shadow_only) {
+    options_.sliding_window_duration_s = std::max(
+        0.5, std::min(12.0, options_.sliding_window_duration_s));
+    options_.sliding_window_min_advance_s =
+        std::max(1.0e-3, options_.sliding_window_min_advance_s);
+    options_.reference_window_duration_s =
+        options_.sliding_window_duration_s;
+    options_.candidate_window_durations_s = {
+        options_.sliding_window_duration_s};
+  } else {
+    options_.reference_window_duration_s =
+        std::max(0.5, std::min(12.0, options_.reference_window_duration_s));
+    for (double &duration : options_.candidate_window_durations_s)
+      duration = std::max(0.5, std::min(12.0, duration));
+    options_.candidate_window_durations_s.push_back(
+        options_.reference_window_duration_s);
+    std::sort(options_.candidate_window_durations_s.begin(),
+              options_.candidate_window_durations_s.end());
+    options_.candidate_window_durations_s.erase(
+        std::unique(options_.candidate_window_durations_s.begin(),
+                    options_.candidate_window_durations_s.end()),
+        options_.candidate_window_durations_s.end());
+  }
   maximum_window_duration_s_ = options_.candidate_window_durations_s.back();
   options_.window_duration_s = maximum_window_duration_s_;
   options_.min_keyframes = std::max(3, options_.min_keyframes);
@@ -671,33 +682,36 @@ OnlineAlignmentInitializer::OnlineAlignmentInitializer(
       options_.maximum_selected_alignment_frames;
   frame_selector_ = AlignmentFrameSelector(selector_config);
 
-  options_.candidate_filter_config.gravity_G = options_.gravity_G;
-  options_.candidate_filter_config.noise.sigma_w = options_.imu_sigma_w;
-  options_.candidate_filter_config.noise.sigma_wb = options_.imu_sigma_wb;
-  options_.candidate_filter_config.noise.sigma_a = options_.imu_sigma_a;
-  options_.candidate_filter_config.noise.sigma_ab = options_.imu_sigma_ab;
-  options_.candidate_filter_config.position_sigma_m =
-      options_.fc_position_sigma_m;
-  options_.candidate_filter_config.velocity_sigma_mps =
-      options_.fc_velocity_sigma_mps;
-  candidate_filter_ =
-      OnlineAlignmentCandidateFilter(options_.candidate_filter_config);
-  const auto gate_configured = [&](CandidateStateGroup group) {
-    return options_.candidate_filter_config
-        .group_gates[static_cast<std::size_t>(group)]
-        .configured;
-  };
-  const bool required_candidate_gates =
-      gate_configured(CandidateStateGroup::ATTITUDE) &&
-      gate_configured(CandidateStateGroup::POSITION) &&
-      gate_configured(CandidateStateGroup::VELOCITY) &&
-      (options_.release_policy != AlignmentReleasePolicy::STRICT_FULL_ALIGNMENT ||
-       (gate_configured(CandidateStateGroup::GYRO_BIAS) &&
-        gate_configured(CandidateStateGroup::ACCEL_BIAS)));
-  if (!required_candidate_gates) {
-    fatal_configuration_error_ = true;
-    last_rejection_ = "candidate_filter_required_group_gate_not_configured";
-    phase_ = AlignmentPhase::FATAL_CONFIGURATION_ERROR;
+  if (!options_.sliding_window_shadow_only) {
+    options_.candidate_filter_config.gravity_G = options_.gravity_G;
+    options_.candidate_filter_config.noise.sigma_w = options_.imu_sigma_w;
+    options_.candidate_filter_config.noise.sigma_wb = options_.imu_sigma_wb;
+    options_.candidate_filter_config.noise.sigma_a = options_.imu_sigma_a;
+    options_.candidate_filter_config.noise.sigma_ab = options_.imu_sigma_ab;
+    options_.candidate_filter_config.position_sigma_m =
+        options_.fc_position_sigma_m;
+    options_.candidate_filter_config.velocity_sigma_mps =
+        options_.fc_velocity_sigma_mps;
+    candidate_filter_ =
+        OnlineAlignmentCandidateFilter(options_.candidate_filter_config);
+    const auto gate_configured = [&](CandidateStateGroup group) {
+      return options_.candidate_filter_config
+          .group_gates[static_cast<std::size_t>(group)]
+          .configured;
+    };
+    const bool required_candidate_gates =
+        gate_configured(CandidateStateGroup::ATTITUDE) &&
+        gate_configured(CandidateStateGroup::POSITION) &&
+        gate_configured(CandidateStateGroup::VELOCITY) &&
+        (options_.release_policy !=
+             AlignmentReleasePolicy::STRICT_FULL_ALIGNMENT ||
+         (gate_configured(CandidateStateGroup::GYRO_BIAS) &&
+          gate_configured(CandidateStateGroup::ACCEL_BIAS)));
+    if (!required_candidate_gates) {
+      fatal_configuration_error_ = true;
+      last_rejection_ = "candidate_filter_required_group_gate_not_configured";
+      phase_ = AlignmentPhase::FATAL_CONFIGURATION_ERROR;
+    }
   }
 }
 
@@ -1167,6 +1181,54 @@ void OnlineAlignmentInitializer::reset() {
   attempt_receipts_.clear();
   candidate_gate_depth_counts_.fill(0);
   candidate_gate_depth_source_ = "explicit_gate_configuration";
+  previous_window_states_.clear();
+  latest_shadow_window_result_ = AlignmentResult();
+  latest_shadow_window_result_valid_ = false;
+  last_sliding_window_end_time_ = -1.0;
+  sliding_window_id_ = 0;
+}
+
+bool OnlineAlignmentInitializer::interpolate_previous_window_state(
+    double timestamp, SlidingWindowStateEstimate &state) const {
+  if (previous_window_states_.empty() ||
+      timestamp < previous_window_states_.front().timestamp - 1.0e-9 ||
+      timestamp > previous_window_states_.back().timestamp + 1.0e-9)
+    return false;
+  const auto after = std::lower_bound(
+      previous_window_states_.begin(), previous_window_states_.end(), timestamp,
+      [](const SlidingWindowStateEstimate &sample, double target) {
+        return sample.timestamp < target;
+      });
+  if (after == previous_window_states_.end()) {
+    state = previous_window_states_.back();
+    return true;
+  }
+  if (std::fabs(after->timestamp - timestamp) <= 1.0e-9 ||
+      after == previous_window_states_.begin()) {
+    state = *after;
+    state.timestamp = timestamp;
+    return true;
+  }
+  const auto before = std::prev(after);
+  const double span = after->timestamp - before->timestamp;
+  if (!(span > 0.0))
+    return false;
+  const double alpha = (timestamp - before->timestamp) / span;
+  state.timestamp = timestamp;
+  const Eigen::Quaterniond q0 =
+      eigen_quaternion_from_jpl(before->q_GtoI);
+  const Eigen::Quaterniond q1 = eigen_quaternion_from_jpl(after->q_GtoI);
+  const Eigen::Quaterniond qi = q0.slerp(alpha, q1).normalized();
+  state.q_GtoI << -qi.x(), -qi.y(), -qi.z(), qi.w();
+  state.p_IinG =
+      (1.0 - alpha) * before->p_IinG + alpha * after->p_IinG;
+  state.v_IinG =
+      (1.0 - alpha) * before->v_IinG + alpha * after->v_IinG;
+  state.bg = (1.0 - alpha) * before->bg + alpha * after->bg;
+  state.ba = (1.0 - alpha) * before->ba + alpha * after->ba;
+  return state.q_GtoI.allFinite() && state.p_IinG.allFinite() &&
+         state.v_IinG.allFinite() && state.bg.allFinite() &&
+         state.ba.allFinite();
 }
 
 void OnlineAlignmentInitializer::reject_candidate(
@@ -1975,7 +2037,7 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
                           : "alignment_window_closed_explicit_reset_required";
     return false;
   }
-  if (candidate_active_)
+  if (candidate_active_ && !options_.sliding_window_shadow_only)
     return validate_candidate(now, result);
   const auto wall_start = std::chrono::steady_clock::now();
   last_diagnostics_ = OnlineAlignmentDiagnostics();
@@ -2188,19 +2250,30 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
   diag.window_fingerprint = fingerprint_stream.str();
   const int new_selected_frames =
       selected_frame_serial_ - selected_frame_serial_at_last_solve_;
-  if (!force_refinement_solve_ && last_solve_stream_time_ >= 0.0 &&
-      now - last_solve_stream_time_ < options_.minimum_solve_interval_s) {
-    ++solve_eligibility_skip_count_;
-    last_rejection_ = "solve_minimum_interval";
-    copy_runtime_counters(diag);
-    return false;
-  }
-  if (!force_refinement_solve_ && last_solve_stream_time_ >= 0.0 &&
-      new_selected_frames < options_.minimum_new_selected_frames_for_resolve) {
-    ++solve_eligibility_skip_count_;
-    last_rejection_ = "solve_waiting_for_new_selected_frame";
-    copy_runtime_counters(diag);
-    return false;
+  if (options_.sliding_window_shadow_only) {
+    if (last_sliding_window_end_time_ >= 0.0 &&
+        init_time - last_sliding_window_end_time_ + 1.0e-9 <
+            options_.sliding_window_min_advance_s) {
+      ++solve_eligibility_skip_count_;
+      last_rejection_ = "sliding_window_waiting_for_time_advance";
+      copy_runtime_counters(diag);
+      return false;
+    }
+  } else {
+    if (!force_refinement_solve_ && last_solve_stream_time_ >= 0.0 &&
+        now - last_solve_stream_time_ < options_.minimum_solve_interval_s) {
+      ++solve_eligibility_skip_count_;
+      last_rejection_ = "solve_minimum_interval";
+      copy_runtime_counters(diag);
+      return false;
+    }
+    if (!force_refinement_solve_ && last_solve_stream_time_ >= 0.0 &&
+        new_selected_frames < options_.minimum_new_selected_frames_for_resolve) {
+      ++solve_eligibility_skip_count_;
+      last_rejection_ = "solve_waiting_for_new_selected_frame";
+      copy_runtime_counters(diag);
+      return false;
+    }
   }
   if (!force_refinement_solve_ &&
       diag.window_fingerprint == last_window_fingerprint_) {
@@ -2313,14 +2386,24 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
           ? std::max(0.0, now - last_solve_stream_time_)
           : std::numeric_limits<double>::infinity();
   last_solve_stream_time_ = now;
+  if (options_.sliding_window_shadow_only)
+    last_sliding_window_end_time_ = init_time;
   selected_frames_at_last_solve_ = static_cast<int>(stereo_buffer_.size());
   selected_frame_serial_at_last_solve_ = selected_frame_serial_;
   last_window_fingerprint_ = diag.window_fingerprint;
   force_refinement_solve_ = false;
   diag.nonlinear_solve_attempt_count = nonlinear_solve_attempt_count_;
   AlignmentAttemptReceipt receipt;
+  if (options_.sliding_window_shadow_only) {
+    receipt.window_id = ++sliding_window_id_;
+    receipt.optimizer_invocation_index = 0;
+  }
   receipt.attempt_timestamp = now;
-  if (refinement_attempt) {
+  if (options_.sliding_window_shadow_only) {
+    std::ostringstream trigger;
+    trigger << "fixed_time_window_advanced;window_end_s=" << init_time;
+    receipt.trigger = trigger.str();
+  } else if (refinement_attempt) {
     receipt.trigger = "single_candidate_refinement";
   } else {
     std::ostringstream trigger;
@@ -2331,6 +2414,18 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
   }
   receipt.window_fingerprint = diag.window_fingerprint;
   receipt.window_duration_s = diag.selected_window_duration_s;
+  receipt.window_begin_timestamp = diag.window_start;
+  receipt.window_end_timestamp = diag.init_time;
+  receipt.raw_fc_count = static_cast<int>(fc.size());
+  receipt.valid_fc_count = static_cast<int>(std::count_if(
+      fc.begin(), fc.end(), [](const FCNavigationSample *sample) {
+        return sample != nullptr && sample->status_valid &&
+               sample->attitude_valid &&
+               (sample->position_valid || sample->velocity_valid);
+      }));
+  receipt.imu_count = static_cast<int>(imu.size());
+  receipt.visual_frame_count = static_cast<int>(stereo.size());
+  receipt.selected_keyframe_count = static_cast<int>(usable_frames.size());
   for (const auto *frame : usable_frames)
     receipt.selected_frame_timestamps.push_back(frame->left_timestamp);
   receipt.selected_tracks = diag.feature_tracks;
@@ -2374,6 +2469,7 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
   std::vector<FCNavigationSample> fc_navigation_at_state;
   fc_attitude_at_state.reserve(usable_frames.size());
   fc_navigation_at_state.reserve(usable_frames.size());
+  bool window_warm_start_used = false;
   for (const auto *frame : usable_frames) {
     const double board_time = frame->left_timestamp +
                               options_.camera_to_imu_time_offset_s;
@@ -2413,6 +2509,24 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
                R_FtoG * omega_F.cross(options_.p_IinF));
     assign(state.bg, best_fit.bg);
     assign(state.ba, ba_seed);
+    if (options_.sliding_window_shadow_only) {
+      SlidingWindowStateEstimate warm_state;
+      if (interpolate_previous_window_state(frame->left_timestamp,
+                                            warm_state)) {
+        assign(state.q, warm_state.q_GtoI);
+        assign(state.p, warm_state.p_IinG);
+        assign(state.v, warm_state.v_IinG);
+        assign(state.bg, warm_state.bg);
+        assign(state.ba, warm_state.ba);
+        window_warm_start_used = true;
+      } else if (!previous_window_states_.empty()) {
+        // A new tail state has no previous-window timestamp support. Keep the
+        // current FC/IMU q/p/v seed but carry the latest solved biases.
+        assign(state.bg, previous_window_states_.back().bg);
+        assign(state.ba, previous_window_states_.back().ba);
+        window_warm_start_used = true;
+      }
+    }
     states.push_back(state);
     fc_attitude_at_state.push_back(fc_attitude_state);
     fc_navigation_at_state.push_back(fc_navigation_state);
@@ -2710,6 +2824,11 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
                          families.imu.size() + families.visual.size());
     attempt_receipts_.back().selected_landmarks = accepted_features;
     attempt_receipts_.back().solve_wall_time_s = ceres_solve_wall_time_s;
+    attempt_receipts_.back().optimizer_invocation_index =
+        nonlinear_solve_attempt_count_;
+    attempt_receipts_.back().initial_cost = summary.initial_cost;
+    attempt_receipts_.back().final_cost = summary.final_cost;
+    attempt_receipts_.back().warm_start_used = window_warm_start_used;
   }
   diag.initial_cost = summary.initial_cost;
   diag.final_cost = summary.final_cost;
@@ -3193,6 +3312,132 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
   const bool release_navigation =
       options_.release_policy == AlignmentReleasePolicy::PRACTICAL_NAVIGATION_START &&
       diag.navigation_quality_passed;
+  if (options_.sliding_window_shadow_only) {
+    AlignmentResult shadow_result;
+    shadow_result.timestamp = final_state.camera_time;
+    shadow_result.q_GtoI = normalized_jpl(final_state.q.data());
+    shadow_result.p_IinG = map3(final_state.p);
+    shadow_result.v_IinG = map3(final_state.v);
+    shadow_result.bg = final_bg;
+    shadow_result.ba = final_ba;
+    shadow_result.covariance = release_covariance;
+    shadow_result.R_FtoI_nominal = final_mount;
+    shadow_result.R_mount_residual =
+        final_mount * options_.R_FtoI_declared.transpose();
+    shadow_result.mount_covariance = covariance18.block<3, 3>(15, 15);
+    shadow_result.fc_to_board_time_offset_s =
+        options_.fc_navigation_to_board_time_offset_s;
+    shadow_result.fc_attitude_to_board_time_offset_s = best_offset;
+    shadow_result.fc_navigation_to_board_time_offset_s =
+        options_.fc_navigation_to_board_time_offset_s;
+    shadow_result.camera_to_imu_time_offset_s =
+        options_.camera_to_imu_time_offset_s;
+    shadow_result.readiness = AlignmentReadiness::NOT_READY;
+    shadow_result.release_policy = options_.release_policy;
+    shadow_result.released_to_openvins = false;
+
+    diag.mount_residual_deg = final_mount_residual_deg;
+    diag.decision_time = -1.0;
+    diag.quality_passed = false;
+    diag.readiness = AlignmentReadiness::NOT_READY;
+    diag.readiness_reason =
+        "p4_r1_shadow_window_solved_no_state_release";
+    diag.failed_gates =
+        options_.release_policy == AlignmentReleasePolicy::STRICT_FULL_ALIGNMENT
+            ? diag.full_alignment_failed_gates
+            : diag.navigation_failed_gates;
+    copy_runtime_counters(diag);
+
+    if (!attempt_receipts_.empty() &&
+        attempt_receipts_.back().window_id == sliding_window_id_) {
+      AlignmentAttemptReceipt &window = attempt_receipts_.back();
+      window.q_GtoI = shadow_result.q_GtoI;
+      window.p_IinG = shadow_result.p_IinG;
+      window.v_IinG = shadow_result.v_IinG;
+      window.bg = shadow_result.bg;
+      window.ba = shadow_result.ba;
+      if (release_covariance.allFinite())
+        window.state_std =
+            release_covariance.diagonal().cwiseMax(0.0).cwiseSqrt();
+      const FactorContribution *imu_contribution = find_contribution(
+          diag.factor_contributions, "imu_preintegration");
+      const FactorContribution *fc_contribution = find_contribution(
+          diag.factor_contributions, "fc_pose_velocity_attitude");
+      window.imu_residual_rms =
+          imu_contribution != nullptr
+              ? imu_contribution->residual_rms
+              : std::numeric_limits<double>::infinity();
+      window.fc_residual_rms =
+          fc_contribution != nullptr
+              ? fc_contribution->residual_rms
+              : std::numeric_limits<double>::infinity();
+      window.visual_reprojection_rmse_px =
+          diag.visual_statistics.reprojection_rmse_px;
+      window.visual_reprojection_p95_px =
+          diag.visual_statistics.reprojection_p95_px;
+      int residual_dimension = 0;
+      for (const auto &family : diag.factor_contributions)
+        residual_dimension += family.residual_dimension;
+      if (residual_dimension > 0 && std::isfinite(summary.final_cost))
+        window.joint_normalized_cost =
+            2.0 * summary.final_cost / residual_dimension;
+      window.angular_excitation_rad_s = diag.angular_excitation_rad_s;
+      window.second_axis_ratio = diag.second_axis_ratio;
+      if (latest_shadow_window_result_valid_) {
+        const Eigen::Matrix3d current_rotation =
+            ov_core::quat_2_Rot(shadow_result.q_GtoI);
+        const Eigen::Matrix3d previous_rotation =
+            ov_core::quat_2_Rot(latest_shadow_window_result_.q_GtoI);
+        window.previous_attitude_delta_deg =
+            rotation_angle(current_rotation * previous_rotation.transpose()) *
+            180.0 / kPi;
+        window.previous_position_delta_m =
+            (shadow_result.p_IinG -
+             latest_shadow_window_result_.p_IinG)
+                .norm();
+        window.previous_velocity_delta_mps =
+            (shadow_result.v_IinG -
+             latest_shadow_window_result_.v_IinG)
+                .norm();
+        window.previous_gyro_bias_delta_rad_s =
+            (shadow_result.bg - latest_shadow_window_result_.bg).norm();
+        window.previous_accel_bias_delta_mps2 =
+            (shadow_result.ba - latest_shadow_window_result_.ba).norm();
+      }
+      window.outcome = summary.IsSolutionUsable()
+                           ? "shadow_window_solved"
+                           : "shadow_window_solver_unusable";
+      window.failed_gate = join(diag.failed_gates);
+      window.next_eligible_condition =
+          "fixed_window_end_advance_s>=" +
+          std::to_string(options_.sliding_window_min_advance_s);
+    }
+
+    if (summary.IsSolutionUsable()) {
+      previous_window_states_.clear();
+      previous_window_states_.reserve(states.size());
+      for (const GraphState &state : states) {
+        SlidingWindowStateEstimate estimate;
+        estimate.timestamp = state.camera_time;
+        estimate.q_GtoI = normalized_jpl(state.q.data());
+        estimate.p_IinG = map3(state.p);
+        estimate.v_IinG = map3(state.v);
+        estimate.bg = map3(state.bg);
+        estimate.ba = map3(state.ba);
+        previous_window_states_.push_back(estimate);
+      }
+      latest_shadow_window_result_ = shadow_result;
+      latest_shadow_window_result_valid_ = true;
+    }
+    shadow_result.diagnostics = diag;
+    latest_shadow_window_result_.diagnostics = diag;
+    transition(AlignmentPhase::COLLECTING, now,
+               "p4_r1_shadow_window_recorded_waiting_for_next_window");
+    diag.state_transitions = transitions_;
+    last_diagnostics_ = diag;
+    last_rejection_ = "p4_r1_shadow_only_no_formal_release";
+    return false;
+  }
   if (!release_full && !release_navigation) {
     diag.failed_gates =
         options_.release_policy == AlignmentReleasePolicy::STRICT_FULL_ALIGNMENT

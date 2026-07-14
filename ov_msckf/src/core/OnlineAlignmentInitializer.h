@@ -181,6 +181,12 @@ struct SensorProvenance {
 };
 
 struct OnlineAlignmentOptions {
+  /// P4-R1: rebuild a bounded joint problem on every advanced fixed-time
+  /// window, retain the solution as shadow evidence, and never inject it into
+  /// OpenVINS. Candidate-filter release is bypassed while this is true.
+  bool sliding_window_shadow_only = false;
+  double sliding_window_duration_s = 8.0;
+  double sliding_window_min_advance_s = 0.5;
   /// Upstream-style reference window followed by progressively longer joint
   /// alignment windows. The shortest usable window is solved first.
   double reference_window_duration_s = 2.0;
@@ -532,16 +538,66 @@ struct AlignmentCandidate {
   SensorProvenance provenance;
 };
 
+struct SlidingWindowStateEstimate {
+  double timestamp = -1.0;
+  Eigen::Vector4d q_GtoI =
+      (Eigen::Vector4d() << 0.0, 0.0, 0.0, 1.0).finished();
+  Eigen::Vector3d p_IinG = Eigen::Vector3d::Zero();
+  Eigen::Vector3d v_IinG = Eigen::Vector3d::Zero();
+  Eigen::Vector3d bg = Eigen::Vector3d::Zero();
+  Eigen::Vector3d ba = Eigen::Vector3d::Zero();
+};
+
 struct AlignmentAttemptReceipt {
+  int window_id = 0;
+  int optimizer_invocation_index = 0;
   double attempt_timestamp = -1.0;
   std::string trigger;
   std::string window_fingerprint;
   double window_duration_s = 0.0;
+  double window_begin_timestamp = -1.0;
+  double window_end_timestamp = -1.0;
+  int raw_fc_count = 0;
+  int valid_fc_count = 0;
+  int imu_count = 0;
+  int visual_frame_count = 0;
+  int selected_keyframe_count = 0;
   std::vector<double> selected_frame_timestamps;
   int selected_tracks = 0;
   int selected_landmarks = 0;
   int factor_count = 0;
   double solve_wall_time_s = 0.0;
+  double initial_cost = std::numeric_limits<double>::infinity();
+  double final_cost = std::numeric_limits<double>::infinity();
+  Eigen::Vector4d q_GtoI =
+      (Eigen::Vector4d() << 0.0, 0.0, 0.0, 1.0).finished();
+  Eigen::Vector3d p_IinG = Eigen::Vector3d::Zero();
+  Eigen::Vector3d v_IinG = Eigen::Vector3d::Zero();
+  Eigen::Vector3d bg = Eigen::Vector3d::Zero();
+  Eigen::Vector3d ba = Eigen::Vector3d::Zero();
+  Eigen::Matrix<double, 15, 1> state_std =
+      Eigen::Matrix<double, 15, 1>::Constant(
+          std::numeric_limits<double>::infinity());
+  double imu_residual_rms = std::numeric_limits<double>::infinity();
+  double fc_residual_rms = std::numeric_limits<double>::infinity();
+  double visual_reprojection_rmse_px =
+      std::numeric_limits<double>::infinity();
+  double visual_reprojection_p95_px =
+      std::numeric_limits<double>::infinity();
+  double joint_normalized_cost = std::numeric_limits<double>::infinity();
+  double angular_excitation_rad_s = 0.0;
+  double second_axis_ratio = 0.0;
+  double previous_attitude_delta_deg =
+      std::numeric_limits<double>::quiet_NaN();
+  double previous_position_delta_m =
+      std::numeric_limits<double>::quiet_NaN();
+  double previous_velocity_delta_mps =
+      std::numeric_limits<double>::quiet_NaN();
+  double previous_gyro_bias_delta_rad_s =
+      std::numeric_limits<double>::quiet_NaN();
+  double previous_accel_bias_delta_mps2 =
+      std::numeric_limits<double>::quiet_NaN();
+  bool warm_start_used = false;
   std::string outcome;
   std::string failed_gate;
   std::string next_eligible_condition;
@@ -589,6 +645,10 @@ public:
   bool full_alignment_recorded() const { return full_alignment_recorded_; }
   bool alignment_window_closed() const { return alignment_window_closed_; }
   bool candidate_active() const { return candidate_active_; }
+  bool sliding_window_shadow_only() const {
+    return options_.sliding_window_shadow_only;
+  }
+  size_t sliding_window_solve_count() const { return attempt_receipts_.size(); }
   bool fatal_configuration_error() const { return fatal_configuration_error_; }
   const AlignmentCandidate &current_candidate() const { return candidate_record_; }
   const std::deque<AlignmentAttemptReceipt> &attempt_receipts() const {
@@ -676,6 +736,11 @@ private:
   std::array<int, 5> candidate_gate_depth_counts_{};
   std::string candidate_gate_depth_source_ =
       "explicit_gate_configuration";
+  std::vector<SlidingWindowStateEstimate> previous_window_states_;
+  AlignmentResult latest_shadow_window_result_;
+  bool latest_shadow_window_result_valid_ = false;
+  double last_sliding_window_end_time_ = -1.0;
+  int sliding_window_id_ = 0;
 
   void prune(double newest_timestamp);
   void transition(AlignmentPhase next, double stream_time,
@@ -689,6 +754,8 @@ private:
   void reject_candidate(double now, const std::string &reason,
                         bool request_refinement);
   void mark_fatal(double stream_time, const std::string &reason);
+  bool interpolate_previous_window_state(
+      double timestamp, SlidingWindowStateEstimate &state) const;
   VisualFrameSnapshot make_visual_snapshot(const StereoAlignmentFrame &frame) const;
   Eigen::Matrix3d relative_camera_rotation(double previous_camera_time,
                                            double current_camera_time) const;

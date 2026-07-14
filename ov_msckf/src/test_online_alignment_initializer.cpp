@@ -1008,6 +1008,118 @@ void test_stale_visual_tail_is_pruned() {
           "all visual frames outside the maximum solve horizon must be removed");
 }
 
+void test_r1_shadow_rebuilds_advancing_fixed_time_windows() {
+  OnlineAlignmentOptions options = make_options();
+  options.sliding_window_shadow_only = true;
+  options.sliding_window_duration_s = 5.0;
+  options.sliding_window_min_advance_s = 0.5;
+  options.candidate_window_durations_s = {5.0};
+  const SyntheticMotion motion;
+  const Eigen::Matrix3d R_mount =
+      Eigen::AngleAxisd(3.0 * kPi / 180.0, Eigen::Vector3d::UnitZ())
+          .toRotationMatrix() *
+      Eigen::AngleAxisd(-2.0 * kPi / 180.0, Eigen::Vector3d::UnitY())
+          .toRotationMatrix();
+  const Eigen::Vector3d bg(0.012, -0.008, 0.006);
+  const Eigen::Vector3d ba(0.12, -0.08, 0.05);
+  const double offset = 0.024;
+  options.R_FtoI_declared = R_mount;
+  options.fc_attitude_to_board_time_offset_s = offset;
+  options.fc_navigation_to_board_time_offset_s = 0.0;
+
+  OnlineAlignmentInitializer initializer(options);
+  int frame_index = 0;
+  for (int tick = 0; tick <= 1800; ++tick) {
+    const double board_time = 0.005 * tick;
+    if (tick % 4 == 0) {
+      FCNavigationSample fc;
+      fc.timestamp = board_time;
+      fc.position_G = position_G(board_time);
+      fc.velocity_G = velocity_G(board_time);
+      fc.q_GtoF = ov_core::rot_2_quat(motion.rotation(board_time));
+      fc.navigation_frame = "G_nav";
+      fc.body_frame = "FC_body";
+      fc.position_valid = fc.velocity_valid = fc.attitude_valid =
+          fc.status_valid = true;
+      require(initializer.feed_fc_navigation(fc), "R1 FC feed");
+    }
+    const double fc_time_for_imu = std::max(0.0, board_time - offset);
+    BoardImuSample imu;
+    imu.timestamp = board_time;
+    imu.angular_velocity = R_mount * omega_F(fc_time_for_imu) + bg;
+    const Eigen::Matrix3d R_GtoI =
+        R_mount * motion.rotation(fc_time_for_imu);
+    imu.linear_acceleration =
+        R_GtoI * (acceleration_G(fc_time_for_imu) + options.gravity_G) + ba;
+    imu.frame = "board_imu";
+    imu.status_valid = true;
+    require(initializer.feed_board_imu(imu), "R1 IMU feed");
+
+    if (tick % 20 == 0 && board_time >= 0.1) {
+      const double camera_time =
+          board_time - options.camera_to_imu_time_offset_s;
+      require(initializer.feed_stereo(make_stereo_frame(
+                  camera_time, motion, R_mount,
+                  options.camera_to_imu_time_offset_s, offset, frame_index++)),
+              "R1 visual feed");
+      OnlineAlignmentResult shadow;
+      require(!initializer.try_initialize(camera_time, shadow),
+              "R1 must never formally release a shadow solution");
+    }
+  }
+
+  const auto &windows = initializer.attempt_receipts();
+  require(windows.size() >= 3,
+          "R1 must invoke Ceres on multiple advanced windows");
+  require(!initializer.candidate_active() &&
+              !initializer.navigation_released() &&
+              !initializer.alignment_window_closed(),
+          "R1 must bypass candidate release and keep alignment active");
+  double previous_begin = -1.0;
+  double previous_end = -1.0;
+  std::vector<double> previous_selected;
+  int expected_invocation = 1;
+  bool observed_warm_start = false;
+  for (const auto &window : windows) {
+    require(window.window_id == expected_invocation &&
+                window.optimizer_invocation_index == expected_invocation,
+            "R1 window and optimizer invocation ids must be contiguous");
+    require(std::fabs((window.window_end_timestamp -
+                       window.window_begin_timestamp) -
+                      options.sliding_window_duration_s) < 1.0e-6,
+            "R1 window duration must remain fixed in time");
+    require(previous_end < 0.0 ||
+                window.window_end_timestamp > previous_end + 0.49,
+            "R1 window end must advance by the time trigger");
+    require(previous_begin < 0.0 ||
+                window.window_begin_timestamp > previous_begin + 0.49,
+            "R1 window begin must advance with the end");
+    require(!window.selected_frame_timestamps.empty() &&
+                window.selected_frame_timestamps.front() >=
+                    window.window_begin_timestamp - 1.0e-9 &&
+                window.selected_frame_timestamps.back() <=
+                    window.window_end_timestamp + 1.0e-9,
+            "R1 selected keyframes must lie inside the current window");
+    if (!previous_selected.empty())
+      require(window.selected_frame_timestamps != previous_selected,
+              "R1 must reselect keyframes for each advanced window");
+    require(window.q_GtoI.allFinite() && window.p_IinG.allFinite() &&
+                window.v_IinG.allFinite() && window.bg.allFinite() &&
+                window.ba.allFinite(),
+            "R1 must record a finite q/p/v/bg/ba estimate per window");
+    observed_warm_start = observed_warm_start || window.warm_start_used;
+    previous_begin = window.window_begin_timestamp;
+    previous_end = window.window_end_timestamp;
+    previous_selected = window.selected_frame_timestamps;
+    ++expected_invocation;
+  }
+  require(observed_warm_start,
+          "R1 later windows must warm start from the previous solution");
+  require(initializer.last_diagnostics().nonlinear_solve_attempt_count ==
+              static_cast<int>(windows.size()),
+          "R1 diagnostics must expose every nonlinear invocation");
+}
+
 } // namespace
 
 int main() {
@@ -1022,6 +1134,7 @@ int main() {
   test_no_visual_navigation_control();
   test_perturbed_visual_tracks_change_decision();
   test_stale_visual_tail_is_pruned();
+  test_r1_shadow_rebuilds_advancing_fixed_time_windows();
   std::cout << "online alignment initializer tests passed" << std::endl;
   return EXIT_SUCCESS;
 }

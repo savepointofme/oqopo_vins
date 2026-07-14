@@ -203,6 +203,31 @@ void write_json_error_state(
   output << "]";
 }
 
+template <typename Derived>
+void write_json_eigen_vector(std::ostream &output,
+                             const Eigen::MatrixBase<Derived> &value) {
+  output << "[";
+  for (Eigen::Index index = 0; index < value.size(); ++index) {
+    if (index)
+      output << ", ";
+    output << json_scalar(value(index));
+  }
+  output << "]";
+}
+
+template <typename Derived>
+std::string csv_eigen_vector(const Eigen::MatrixBase<Derived> &value) {
+  std::ostringstream output;
+  output << std::setprecision(17);
+  for (Eigen::Index index = 0; index < value.size(); ++index) {
+    if (index)
+      output << ';';
+    if (std::isfinite(value(index)))
+      output << value(index);
+  }
+  return output.str();
+}
+
 template <std::size_t N>
 void write_json_int_array(std::ostream &output,
                           const std::array<int, N> &values) {
@@ -343,6 +368,7 @@ struct Args {
   std::string nav_frame_metadata_path;
   std::string canonical_init_state_path;
   std::string online_alignment_metadata_path;
+  std::string online_alignment_window_trace_path;
   bool online_alignment_disable_visual = false;
   bool online_alignment_navigation_allow_without_visual = false;
   std::string online_alignment_release_policy = "practical_navigation_start";
@@ -1249,22 +1275,76 @@ void write_online_alignment_attempt_receipts(
     throw std::runtime_error("cannot open online alignment attempt receipts: " +
                              path);
   output << std::setprecision(15)
-         << "{\n  \"schema\": \"openvins_p4_sliding_window_attempts_v1\",\n"
+         << "{\n  \"schema\": \"openvins_p4_sliding_window_attempts_v2\",\n"
          << "  \"attempts\": [\n";
   for (size_t index = 0; index < receipts.size(); ++index) {
     const auto &receipt = receipts[index];
-    output << "    {\"attempt_timestamp\": "
+    output << "    {\"window_id\": " << receipt.window_id
+           << ", \"optimizer_invocation_index\": "
+           << receipt.optimizer_invocation_index
+           << ", \"attempt_timestamp\": "
            << json_scalar(receipt.attempt_timestamp)
            << ", \"trigger\": \"" << json_escape(receipt.trigger)
            << "\", \"window_fingerprint\": \""
            << json_escape(receipt.window_fingerprint)
            << "\", \"window_duration_s\": "
            << json_scalar(receipt.window_duration_s)
+           << ", \"window_begin_timestamp\": "
+           << json_scalar(receipt.window_begin_timestamp)
+           << ", \"window_end_timestamp\": "
+           << json_scalar(receipt.window_end_timestamp)
+           << ", \"raw_fc_count\": " << receipt.raw_fc_count
+           << ", \"valid_fc_count\": " << receipt.valid_fc_count
+           << ", \"imu_count\": " << receipt.imu_count
+           << ", \"visual_frame_count\": "
+           << receipt.visual_frame_count
+           << ", \"selected_keyframe_count\": "
+           << receipt.selected_keyframe_count
            << ", \"selected_tracks\": " << receipt.selected_tracks
            << ", \"selected_landmarks\": " << receipt.selected_landmarks
            << ", \"factor_count\": " << receipt.factor_count
            << ", \"solve_wall_time_s\": "
            << json_scalar(receipt.solve_wall_time_s)
+           << ", \"initial_cost\": " << json_scalar(receipt.initial_cost)
+           << ", \"final_cost\": " << json_scalar(receipt.final_cost)
+           << ", \"q_GtoI_xyzw\": ";
+    write_json_eigen_vector(output, receipt.q_GtoI);
+    output << ", \"p_IinG_m\": ";
+    write_json_eigen_vector(output, receipt.p_IinG);
+    output << ", \"v_IinG_mps\": ";
+    write_json_eigen_vector(output, receipt.v_IinG);
+    output << ", \"bg_rad_s\": ";
+    write_json_eigen_vector(output, receipt.bg);
+    output << ", \"ba_mps2\": ";
+    write_json_eigen_vector(output, receipt.ba);
+    output << ", \"state_std\": ";
+    write_json_eigen_vector(output, receipt.state_std);
+    output << ", \"imu_residual_rms\": "
+           << json_scalar(receipt.imu_residual_rms)
+           << ", \"fc_residual_rms\": "
+           << json_scalar(receipt.fc_residual_rms)
+           << ", \"visual_reprojection_rmse_px\": "
+           << json_scalar(receipt.visual_reprojection_rmse_px)
+           << ", \"visual_reprojection_p95_px\": "
+           << json_scalar(receipt.visual_reprojection_p95_px)
+           << ", \"joint_normalized_cost\": "
+           << json_scalar(receipt.joint_normalized_cost)
+           << ", \"angular_excitation_rad_s\": "
+           << json_scalar(receipt.angular_excitation_rad_s)
+           << ", \"second_axis_ratio\": "
+           << json_scalar(receipt.second_axis_ratio)
+           << ", \"previous_attitude_delta_deg\": "
+           << json_scalar(receipt.previous_attitude_delta_deg)
+           << ", \"previous_position_delta_m\": "
+           << json_scalar(receipt.previous_position_delta_m)
+           << ", \"previous_velocity_delta_mps\": "
+           << json_scalar(receipt.previous_velocity_delta_mps)
+           << ", \"previous_gyro_bias_delta_rad_s\": "
+           << json_scalar(receipt.previous_gyro_bias_delta_rad_s)
+           << ", \"previous_accel_bias_delta_mps2\": "
+           << json_scalar(receipt.previous_accel_bias_delta_mps2)
+           << ", \"warm_start_used\": "
+           << (receipt.warm_start_used ? "true" : "false")
            << ", \"outcome\": \"" << json_escape(receipt.outcome)
            << "\", \"failed_gate\": \""
            << json_escape(receipt.failed_gate)
@@ -1298,6 +1378,111 @@ void write_online_alignment_attempt_receipts(
            << json_scalar(candidate->solve_wall_time_s) << "}\n";
   }
   output << "}\n";
+}
+
+void write_online_alignment_sliding_window_trace(
+    const std::string &path,
+    const std::deque<AlignmentAttemptReceipt> &receipts) {
+  ensure_parent_directory(path);
+  std::ofstream output(path, std::ofstream::out | std::ofstream::trunc);
+  if (!output.is_open())
+    throw std::runtime_error(
+        "cannot open online alignment sliding-window trace: " + path);
+  output << std::setprecision(17)
+         << "window_id,optimizer_invocation_index,window_begin_timestamp_s,"
+            "window_end_timestamp_s,window_duration_s,raw_fc_count,"
+            "valid_fc_count,imu_count,visual_frame_count,"
+            "selected_keyframe_count,selected_frame_timestamps_s,"
+            "solve_wall_time_s,initial_cost,final_cost,q_GtoI_xyzw,"
+            "p_IinG_m,v_IinG_mps,bg_rad_s,ba_mps2,q_std_rad,p_std_m,"
+            "v_std_mps,bg_std_rad_s,ba_std_mps2,imu_residual_rms,"
+            "fc_residual_rms,visual_reprojection_rmse_px,"
+            "visual_reprojection_p95_px,joint_normalized_cost,"
+            "angular_excitation_rad_s,second_axis_ratio,"
+            "previous_attitude_delta_deg,previous_position_delta_m,"
+            "previous_velocity_delta_mps,previous_gyro_bias_delta_rad_s,"
+            "previous_accel_bias_delta_mps2,warm_start_used,solve_status,"
+            "failed_gate,window_fingerprint\n";
+  for (const auto &receipt : receipts) {
+    if (receipt.window_id <= 0)
+      continue;
+    std::ostringstream timestamps;
+    timestamps << std::setprecision(17);
+    for (size_t index = 0; index < receipt.selected_frame_timestamps.size();
+         ++index) {
+      if (index)
+        timestamps << ';';
+      timestamps << receipt.selected_frame_timestamps[index];
+    }
+    output << receipt.window_id << ',' << receipt.optimizer_invocation_index
+           << ',' << receipt.window_begin_timestamp << ','
+           << receipt.window_end_timestamp << ',' << receipt.window_duration_s
+           << ',' << receipt.raw_fc_count << ',' << receipt.valid_fc_count
+           << ',' << receipt.imu_count << ',' << receipt.visual_frame_count
+           << ',' << receipt.selected_keyframe_count << ",\""
+           << timestamps.str() << "\"," << receipt.solve_wall_time_s << ','
+           << receipt.initial_cost << ',' << receipt.final_cost << ",\""
+           << csv_eigen_vector(receipt.q_GtoI) << "\",\""
+           << csv_eigen_vector(receipt.p_IinG) << "\",\""
+           << csv_eigen_vector(receipt.v_IinG) << "\",\""
+           << csv_eigen_vector(receipt.bg) << "\",\""
+           << csv_eigen_vector(receipt.ba) << "\",\""
+           << csv_eigen_vector(receipt.state_std.segment<3>(0)) << "\",\""
+           << csv_eigen_vector(receipt.state_std.segment<3>(3)) << "\",\""
+           << csv_eigen_vector(receipt.state_std.segment<3>(6)) << "\",\""
+           << csv_eigen_vector(receipt.state_std.segment<3>(9)) << "\",\""
+           << csv_eigen_vector(receipt.state_std.segment<3>(12)) << "\","
+           << receipt.imu_residual_rms << ',' << receipt.fc_residual_rms << ','
+           << receipt.visual_reprojection_rmse_px << ','
+           << receipt.visual_reprojection_p95_px << ','
+           << receipt.joint_normalized_cost << ','
+           << receipt.angular_excitation_rad_s << ','
+           << receipt.second_axis_ratio << ','
+           << receipt.previous_attitude_delta_deg << ','
+           << receipt.previous_position_delta_m << ','
+           << receipt.previous_velocity_delta_mps << ','
+           << receipt.previous_gyro_bias_delta_rad_s << ','
+           << receipt.previous_accel_bias_delta_mps2 << ','
+           << (receipt.warm_start_used ? 1 : 0) << ",\""
+           << receipt.outcome << "\",\"" << receipt.failed_gate << "\",\""
+           << receipt.window_fingerprint << "\"\n";
+  }
+}
+
+void write_online_alignment_shadow_metadata(
+    const std::string &path,
+    const std::deque<AlignmentAttemptReceipt> &receipts,
+    const OnlineAlignmentDiagnostics &diagnostics) {
+  ensure_parent_directory(path);
+  std::ofstream output(path, std::ofstream::out | std::ofstream::trunc);
+  if (!output.is_open())
+    throw std::runtime_error(
+        "cannot open online alignment shadow metadata: " + path);
+  int solved_windows = 0;
+  const AlignmentAttemptReceipt *last = nullptr;
+  for (const auto &receipt : receipts) {
+    if (receipt.window_id <= 0 || receipt.optimizer_invocation_index <= 0)
+      continue;
+    ++solved_windows;
+    last = &receipt;
+  }
+  output << std::setprecision(17)
+         << "{\n  \"schema\": \"openvins_p4_r1_sliding_window_shadow_v1\",\n"
+         << "  \"status\": \"SHADOW_ONLY\",\n"
+         << "  \"released_to_openvins\": false,\n"
+         << "  \"alignment_active\": true,\n"
+         << "  \"optimizer_invocation_count\": " << solved_windows << ",\n"
+         << "  \"nonlinear_solve_attempt_count\": "
+         << diagnostics.nonlinear_solve_attempt_count << ",\n"
+         << "  \"last_window_begin_timestamp_s\": "
+         << (last != nullptr ? json_scalar(last->window_begin_timestamp)
+                             : "null")
+         << ",\n  \"last_window_end_timestamp_s\": "
+         << (last != nullptr ? json_scalar(last->window_end_timestamp)
+                             : "null")
+         << ",\n  \"last_window_outcome\": \""
+         << (last != nullptr ? json_escape(last->outcome) : "none")
+         << "\"\n}\n";
 }
 
 void write_nav_metadata(const std::string &path,
@@ -2528,6 +2713,7 @@ int main(int argc, char **argv) {
   bool fc_init_pending = false;
   const bool online_alignment_mode =
       initialization_mode == InitializationMode::ONLINE_MULTISENSOR_ALIGNMENT;
+  const bool online_alignment_r1_shadow_only = online_alignment_mode;
   FCInitSeries online_fc_series;
   size_t online_fc_index = 0;
   FCInitResult fc_init_result;
@@ -2596,10 +2782,14 @@ int main(int argc, char **argv) {
         PRINT_INFO(CYAN "[ONLINE-ALIGN][DEBUG] FC row contracts validated\n" RESET);
 
         OnlineAlignmentOptions online_options;
-        // Persistent OpenVINS-style retry lifecycle with bounded candidate
-        // windows. The shortest usable graph is solved first.
-        online_options.reference_window_duration_s = params.init_options.init_window_time;
-        online_options.candidate_window_durations_s = {3.0, 5.0, 8.0, 12.0};
+        // P4-R1 is a shadow-only fixed-time sliding window. Every sufficiently
+        // advanced window rebuilds the joint graph; no candidate filter or
+        // formal OpenVINS state injection participates in this phase.
+        online_options.sliding_window_shadow_only = true;
+        online_options.sliding_window_duration_s = 8.0;
+        online_options.sliding_window_min_advance_s = 0.5;
+        online_options.reference_window_duration_s = 8.0;
+        online_options.candidate_window_durations_s = {8.0};
         online_options.min_fc_samples = 20;
         online_options.min_imu_samples = 600;
         online_options.min_stereo_frames = 12;
@@ -2610,104 +2800,6 @@ int main(int argc, char **argv) {
         online_options.max_imu_gap_s = 0.03;
         online_options.max_stereo_gap_s = 0.75;
         online_options.maximum_selected_alignment_frames = 36;
-        online_options.minimum_solve_interval_s = 0.75;
-        // Candidate release is evidence-based. Each configured group's
-        // support/history depth is resolved from valid FC measurement rows in
-        // the selected sliding window; no fixed event quota is used.
-        const auto make_candidate_gate =
-            [](bool require_graph_support, bool allow_early_feedback,
-               int post_feedback_updates,
-               double max_abs_error, double max_std, double max_std_step,
-               double max_error_peak_to_peak, double max_std_peak_to_peak,
-               double max_feedback_step,
-               double max_cumulative_feedback) {
-              CandidateGroupGate gate;
-              gate.configured = true;
-              gate.derive_depth_from_sliding_window = true;
-              gate.allow_initial_feedback_before_derived_history =
-                  allow_early_feedback;
-              gate.require_initial_graph_support = require_graph_support;
-              gate.required_post_feedback_stable_updates =
-                  post_feedback_updates;
-              gate.max_abs_error =
-                  Eigen::Vector3d::Constant(max_abs_error);
-              gate.max_std = Eigen::Vector3d::Constant(max_std);
-              gate.max_std_step = Eigen::Vector3d::Constant(max_std_step);
-              gate.max_error_peak_to_peak =
-                  Eigen::Vector3d::Constant(max_error_peak_to_peak);
-              gate.max_std_peak_to_peak =
-                  Eigen::Vector3d::Constant(max_std_peak_to_peak);
-              gate.max_feedback_step =
-                  Eigen::Vector3d::Constant(max_feedback_step);
-              gate.max_cumulative_feedback =
-                  Eigen::Vector3d::Constant(max_cumulative_feedback);
-              return gate;
-            };
-        auto &candidate_gates =
-            online_options.candidate_filter_config.group_gates;
-        const double candidate_deg = M_PI / 180.0;
-        candidate_gates[static_cast<std::size_t>(
-            CandidateStateGroup::ATTITUDE)] =
-            make_candidate_gate(
-                true, true, 2,
-                1.0 * candidate_deg,   // attitude error [rad]
-                5.0 * candidate_deg,   // attitude std [rad]
-                0.25 * candidate_deg,  // per-update std change [rad]
-                0.75 * candidate_deg,  // error peak-to-peak [rad]
-                0.50 * candidate_deg,  // std peak-to-peak [rad]
-                3.0 * candidate_deg,   // feedback step [rad]
-                3.0 * candidate_deg);  // cumulative feedback [rad]
-        candidate_gates[static_cast<std::size_t>(
-            CandidateStateGroup::POSITION)] =
-        make_candidate_gate(false, false, 0,
-                                1.0,   // position error [m]
-                                5.0,   // position std [m]
-                                0.25,  // per-update std change [m]
-                                1.0,   // error peak-to-peak [m]
-                                0.50,  // std peak-to-peak [m]
-                                5.0,   // feedback step [m]
-                                5.0);  // cumulative feedback [m]
-        candidate_gates[static_cast<std::size_t>(
-            CandidateStateGroup::VELOCITY)] =
-        make_candidate_gate(false, false, 0,
-                                0.50,  // velocity error [m/s]
-                                2.0,   // velocity std [m/s]
-                                0.10,  // per-update std change [m/s]
-                                0.50,  // error peak-to-peak [m/s]
-                                0.20,  // std peak-to-peak [m/s]
-                                3.0,   // feedback step [m/s]
-                                3.0);  // cumulative feedback [m/s]
-        candidate_gates[static_cast<std::size_t>(
-            CandidateStateGroup::GYRO_BIAS)] =
-            make_candidate_gate(true, true, 2,
-                                0.010,  // gyro-bias error [rad/s]
-                                0.100,  // gyro-bias std [rad/s]
-                                0.005,  // per-update std change [rad/s]
-                                0.010,  // error peak-to-peak [rad/s]
-                                0.010,  // std peak-to-peak [rad/s]
-                                0.020,  // feedback step [rad/s]
-                                0.020); // cumulative feedback [rad/s]
-        candidate_gates[static_cast<std::size_t>(
-            CandidateStateGroup::ACCEL_BIAS)] =
-            make_candidate_gate(true, true, 2,
-                                0.20,  // accel-bias error [m/s^2]
-                                2.00,  // accel-bias std [m/s^2]
-                                0.05,  // per-update std change [m/s^2]
-                                0.20,  // error peak-to-peak [m/s^2]
-                                0.20,  // std peak-to-peak [m/s^2]
-                                0.50,  // feedback step [m/s^2]
-                                0.50); // cumulative feedback [m/s^2]
-        // 99% chi-square gate for each three-dimensional FC p/v update.
-        online_options.candidate_filter_config.nis_gate_3d = 11.345;
-        online_options.candidate_max_closed_loop_attitude_correction_deg =
-            3.0;
-        online_options.candidate_max_closed_loop_position_correction_m = 5.0;
-        online_options.candidate_max_closed_loop_velocity_correction_mps =
-            3.0;
-        online_options.candidate_max_closed_loop_gyro_bias_correction_rad_s =
-            0.020;
-        online_options.candidate_max_closed_loop_accel_bias_correction_mps2 =
-            0.50;
         online_options.max_gyro_bias_norm_rad_s = args.init_max_bg_norm_rad_s;
         online_options.max_accel_bias_norm_mps2 = args.init_max_ba_norm_mps2;
         // Motion is used only to check the accepted external calibration and
@@ -2767,8 +2859,7 @@ int main(int argc, char **argv) {
         PRINT_INFO(CYAN "[ONLINE-ALIGN] frames G=%s F=%s I=%s; shared target-parallax visual scheduler, T_C_I locked, manual 7deg/4.089deg corrections absent\n" RESET,
                    navigation_frame.c_str(), fc_body_frame.c_str(),
                    board_imu_frame.c_str());
-        PRINT_INFO(CYAN "[ONLINE-ALIGN] release policy=%s, persistent retry windows=reference/3/5/8/12s; release requires persistent q/p/v convergence, p/v feedback is immediate, q/bg/ba feedback is observability-gated\n" RESET,
-                   args.online_alignment_release_policy.c_str());
+        PRINT_INFO(CYAN "[ONLINE-ALIGN] P4-R1 shadow-only fixed 8s sliding window; solve trigger requires 0.5s window-end advance; candidate filter and formal state feedback are disabled\n" RESET);
       } else {
       if (cam0.empty())
         throw std::runtime_error("no camera frames remain after --start-time trim; cannot choose FC init by camera time");
@@ -2933,6 +3024,9 @@ int main(int argc, char **argv) {
   if (args.online_alignment_metadata_path.empty())
     args.online_alignment_metadata_path =
         sibling_path(args.output_path, "online_alignment_metadata.json");
+  if (args.online_alignment_window_trace_path.empty())
+    args.online_alignment_window_trace_path = sibling_path(
+        args.output_path, "online_alignment_sliding_windows.csv");
 
   // -------------------- output files --------------------
   std::ofstream out(args.output_path);
@@ -5647,12 +5741,15 @@ int main(int argc, char **argv) {
   }
 
   if (online_alignment_mode) {
+    const auto &alignment_receipts = sys->online_alignment_attempt_receipts();
     try {
       write_online_alignment_attempt_receipts(
           sibling_path(args.output_path,
                        "online_alignment_attempt_receipts.json"),
-          sys->online_alignment_attempt_receipts(),
+          alignment_receipts,
           sys->online_alignment_candidate());
+      write_online_alignment_sliding_window_trace(
+          args.online_alignment_window_trace_path, alignment_receipts);
     } catch (const std::exception &error) {
       PRINT_ERROR(RED "[ONLINE-ALIGN] attempt receipt write failed: %s\n" RESET,
                   error.what());
@@ -5670,6 +5767,30 @@ int main(int argc, char **argv) {
                     error.what());
         return EXIT_FAILURE;
       }
+    } else if (online_alignment_r1_shadow_only) {
+      int solved_window_count = 0;
+      for (const auto &receipt : alignment_receipts)
+        if (receipt.window_id > 0 &&
+            receipt.optimizer_invocation_index > 0)
+          ++solved_window_count;
+      try {
+        write_online_alignment_shadow_metadata(
+            args.online_alignment_metadata_path, alignment_receipts,
+            sys->online_alignment_diagnostics());
+      } catch (const std::exception &error) {
+        PRINT_ERROR(RED "[ONLINE-ALIGN] shadow metadata write failed: %s\n" RESET,
+                    error.what());
+        return EXIT_FAILURE;
+      }
+      if (solved_window_count < 2) {
+        PRINT_ERROR(RED "[ONLINE-ALIGN] P4-R1 failed: only %d sliding-window optimizer invocation(s); trace=%s\n" RESET,
+                    solved_window_count,
+                    args.online_alignment_window_trace_path.c_str());
+        return EXIT_FAILURE;
+      }
+      PRINT_INFO(GREEN "[ONLINE-ALIGN] P4-R1 shadow completed with %d sliding-window optimizer invocations; no state was released; trace=%s\n" RESET,
+                 solved_window_count,
+                 args.online_alignment_window_trace_path.c_str());
     } else {
       try {
         write_online_alignment_failure_metadata(

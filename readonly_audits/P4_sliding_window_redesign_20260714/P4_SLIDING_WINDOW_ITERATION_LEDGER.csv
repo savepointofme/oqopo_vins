@@ -1,0 +1,2 @@
+iteration,phase,snapshot_commit,branch,architecture_change,build_status,test_status,fly1_status,fly3_status,disposition,evidence,next_action
+00,R1,e1f6c2b153f373619a638917ff5efd75aa36b331,redesign/p4-sliding-window-r1-20260714,"isolated pre-R1 snapshot; no architecture change","PASS: independent build_p4_sliding_r1 with -j6","PASS: candidate filter and initializer tests",NOT_RUN,NOT_RUN,KEEP,"build completed in 320.3 s; both tests passed","implement shadow-only repeated fixed-time window solve"
