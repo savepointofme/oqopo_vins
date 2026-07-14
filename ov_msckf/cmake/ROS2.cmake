@@ -61,6 +61,8 @@ list(APPEND LIBRARY_SOURCES
         src/state/StateHelper.cpp
         src/state/Propagator.cpp
         src/core/ImuFilter.cpp
+        src/core/OnlineAlignmentCandidateFilter.cpp
+        src/core/OnlineAlignmentInitializer.cpp
         src/core/VioManager.cpp
         src/core/VioManagerHelper.cpp
         src/update/UpdaterHelper.cpp
@@ -104,6 +106,16 @@ ament_target_dependencies(run_simulation ${ament_libraries})
 target_link_libraries(run_simulation ov_msckf_lib ${thirdparty_libraries})
 install(TARGETS run_simulation DESTINATION lib/${PROJECT_NAME})
 
+add_executable(run_serial_msckf_ros_free
+        src/run_serial_msckf_ros_free.cpp
+        src/ros_free/VizDashboard.cpp
+        src/ros_free/DiagPrinter.cpp
+        src/ros_free/DiagLogger.cpp
+)
+ament_target_dependencies(run_serial_msckf_ros_free ${ament_libraries})
+target_link_libraries(run_serial_msckf_ros_free ov_msckf_lib ${thirdparty_libraries})
+install(TARGETS run_serial_msckf_ros_free DESTINATION lib/${PROJECT_NAME})
+
 add_executable(test_sim_meas src/test_sim_meas.cpp)
 ament_target_dependencies(test_sim_meas ${ament_libraries})
 target_link_libraries(test_sim_meas ov_msckf_lib ${thirdparty_libraries})
@@ -114,10 +126,42 @@ ament_target_dependencies(test_sim_repeat ${ament_libraries})
 target_link_libraries(test_sim_repeat ov_msckf_lib ${thirdparty_libraries})
 install(TARGETS test_sim_repeat DESTINATION lib/${PROJECT_NAME})
 
+add_executable(test_joseph_update src/test_joseph_update.cpp)
+ament_target_dependencies(test_joseph_update ${ament_libraries})
+target_link_libraries(test_joseph_update ov_msckf_lib ${thirdparty_libraries})
+install(TARGETS test_joseph_update DESTINATION lib/${PROJECT_NAME})
+
 add_executable(test_fc_init_loader src/test_fc_init_loader.cpp)
 ament_target_dependencies(test_fc_init_loader ${ament_libraries})
 target_link_libraries(test_fc_init_loader ${thirdparty_libraries})
 install(TARGETS test_fc_init_loader DESTINATION lib/${PROJECT_NAME})
+
+add_executable(test_online_alignment_initializer src/test_online_alignment_initializer.cpp)
+ament_target_dependencies(test_online_alignment_initializer ${ament_libraries})
+target_link_libraries(test_online_alignment_initializer ov_msckf_lib ${thirdparty_libraries})
+add_test(NAME test_online_alignment_initializer COMMAND test_online_alignment_initializer)
+install(TARGETS test_online_alignment_initializer DESTINATION lib/${PROJECT_NAME})
+
+add_executable(test_online_alignment_candidate_filter src/test_online_alignment_candidate_filter.cpp)
+ament_target_dependencies(test_online_alignment_candidate_filter ${ament_libraries})
+target_link_libraries(test_online_alignment_candidate_filter ov_msckf_lib ${thirdparty_libraries})
+add_test(NAME test_online_alignment_candidate_filter COMMAND test_online_alignment_candidate_filter)
+install(TARGETS test_online_alignment_candidate_filter DESTINATION lib/${PROJECT_NAME})
+
+add_executable(test_camera_extrinsic_parser src/test_camera_extrinsic_parser.cpp)
+ament_target_dependencies(test_camera_extrinsic_parser ${ament_libraries})
+target_link_libraries(test_camera_extrinsic_parser ov_msckf_lib ${thirdparty_libraries})
+install(TARGETS test_camera_extrinsic_parser DESTINATION lib/${PROJECT_NAME})
+
+add_executable(test_adaptive_stride src/test_adaptive_stride.cpp)
+ament_target_dependencies(test_adaptive_stride ${ament_libraries})
+target_link_libraries(test_adaptive_stride ov_msckf_lib ${thirdparty_libraries})
+install(TARGETS test_adaptive_stride DESTINATION lib/${PROJECT_NAME})
+
+add_executable(p5_shadow_state_replay src/p5_shadow_state_replay.cpp)
+ament_target_dependencies(p5_shadow_state_replay ${ament_libraries})
+target_link_libraries(p5_shadow_state_replay ${thirdparty_libraries})
+install(TARGETS p5_shadow_state_replay DESTINATION lib/${PROJECT_NAME})
 
 add_executable(test_imu_filter src/test_imu_filter.cpp)
 ament_target_dependencies(test_imu_filter ${ament_libraries})
@@ -128,6 +172,24 @@ add_executable(test_anchor_trust_policy src/test_anchor_trust_policy.cpp)
 ament_target_dependencies(test_anchor_trust_policy ${ament_libraries})
 target_link_libraries(test_anchor_trust_policy ov_msckf_lib ${thirdparty_libraries})
 install(TARGETS test_anchor_trust_policy DESTINATION lib/${PROJECT_NAME})
+
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/test_constrained_yaw_nullspace.cpp")
+    add_executable(test_constrained_yaw_nullspace src/test_constrained_yaw_nullspace.cpp)
+    ament_target_dependencies(test_constrained_yaw_nullspace ${ament_libraries})
+    target_link_libraries(test_constrained_yaw_nullspace ov_msckf_lib ${thirdparty_libraries})
+    install(TARGETS test_constrained_yaw_nullspace DESTINATION lib/${PROJECT_NAME})
+else ()
+    message(WARNING "test_constrained_yaw_nullspace.cpp is absent; its target is not rebuilt")
+endif ()
+
+if (BUILD_TESTING)
+    add_test(NAME test_fc_init_loader COMMAND test_fc_init_loader)
+    add_test(NAME test_camera_extrinsic_parser COMMAND test_camera_extrinsic_parser)
+    add_test(NAME test_adaptive_stride COMMAND test_adaptive_stride)
+    add_test(NAME test_anchor_trust_policy COMMAND test_anchor_trust_policy)
+    add_test(NAME test_imu_filter COMMAND test_imu_filter)
+    add_test(NAME test_joseph_update COMMAND test_joseph_update)
+endif ()
 
 # Install launch and config directories
 install(DIRECTORY launch/ DESTINATION share/${PROJECT_NAME}/launch/)

@@ -29,6 +29,7 @@
 #include <unordered_set>
 
 #include "feat/Feature.h"
+#include "cam/CamEqui.h"
 #include "feat/FeatureDatabase.h"
 #include "feat/FeatureInitializer.h"
 #include "track/TrackAruco.h"
@@ -209,6 +210,119 @@ void apply_yaw_control_to_updaters(
   }
 }
 
+bool feature_observation_at(const std::shared_ptr<ov_core::Feature> &feature,
+                            size_t camera_id, double timestamp,
+                            Eigen::Vector2d &raw, Eigen::Vector2d &normalized,
+                            int &track_length) {
+  const auto times_it = feature->timestamps.find(camera_id);
+  const auto raw_it = feature->uvs.find(camera_id);
+  const auto norm_it = feature->uvs_norm.find(camera_id);
+  if (times_it == feature->timestamps.end() || raw_it == feature->uvs.end() ||
+      norm_it == feature->uvs_norm.end())
+    return false;
+  const auto &times = times_it->second;
+  const auto &raw_values = raw_it->second;
+  const auto &norm_values = norm_it->second;
+  if (times.size() != raw_values.size() || times.size() != norm_values.size())
+    return false;
+  for (size_t i = 0; i < times.size(); ++i) {
+    if (std::fabs(times[i] - timestamp) > 1e-8 || raw_values[i].size() < 2 ||
+        norm_values[i].size() < 2)
+      continue;
+    raw = raw_values[i].head<2>().cast<double>();
+    normalized = norm_values[i].head<2>().cast<double>();
+    track_length = static_cast<int>(times.size());
+    return raw.allFinite() && normalized.allFinite();
+  }
+  return false;
+}
+
+StereoAlignmentFrame make_online_stereo_frame(
+    const ov_core::CameraData &message,
+    const std::shared_ptr<ov_core::TrackBase> &tracker,
+    const std::shared_ptr<ov_msckf::State> &state) {
+  StereoAlignmentFrame frame;
+  frame.left_timestamp = message.timestamp;
+  frame.right_timestamp = message.timestamp;
+  for (size_t i = 0; i < message.sensor_ids.size(); ++i) {
+    const double sensor_time =
+        message.sensor_timestamps.size() == message.sensor_ids.size()
+            ? message.sensor_timestamps[i]
+            : message.timestamp;
+    if (message.sensor_ids[i] == 0)
+      frame.left_timestamp = sensor_time;
+    if (message.sensor_ids[i] == 1)
+      frame.right_timestamp = sensor_time;
+  }
+  frame.tracking_valid = tracker != nullptr;
+  const bool have_left = std::find(message.sensor_ids.begin(),
+                                   message.sensor_ids.end(), 0) !=
+                             message.sensor_ids.end();
+  frame.stereo_valid = have_left &&
+                       std::find(message.sensor_ids.begin(),
+                                 message.sensor_ids.end(), 1) !=
+                           message.sensor_ids.end();
+  if (!frame.tracking_valid || !have_left)
+    return frame;
+
+  const auto features =
+      tracker->get_feature_database()->features_containing(message.timestamp,
+                                                           false, false);
+  const Eigen::Matrix3d R_ItoC0 = state->_calib_IMUtoCAM.at(0)->Rot();
+  const Eigen::Vector3d p_IinC0 = state->_calib_IMUtoCAM.at(0)->pos();
+  const Eigen::Vector3d p_C0inI = -R_ItoC0.transpose() * p_IinC0;
+  Eigen::Matrix3d R_ItoC1 = Eigen::Matrix3d::Identity();
+  Eigen::Vector3d p_C1inI = Eigen::Vector3d::Zero();
+  if (frame.stereo_valid) {
+    R_ItoC1 = state->_calib_IMUtoCAM.at(1)->Rot();
+    const Eigen::Vector3d p_IinC1 = state->_calib_IMUtoCAM.at(1)->pos();
+    p_C1inI = -R_ItoC1.transpose() * p_IinC1;
+  }
+
+  for (const auto &feature : features) {
+    StereoAlignmentObservation obs;
+    obs.feature_id = feature->featid;
+    obs.left_valid = feature_observation_at(
+        feature, 0, message.timestamp, obs.raw_left, obs.normalized_left,
+        obs.track_length);
+    int right_track_length = 0;
+    obs.right_valid = frame.stereo_valid && feature_observation_at(
+        feature, 1, message.timestamp, obs.raw_right, obs.normalized_right,
+        right_track_length);
+    obs.track_length = std::max(obs.track_length, right_track_length);
+    if (!obs.left_valid)
+      continue;
+    if (obs.right_valid) {
+      Eigen::Vector3d ray0_C(obs.normalized_left.x(),
+                             obs.normalized_left.y(), 1.0);
+      Eigen::Vector3d ray1_C(obs.normalized_right.x(),
+                             obs.normalized_right.y(), 1.0);
+      const Eigen::Vector3d ray0_I =
+          (R_ItoC0.transpose() * ray0_C).normalized();
+      const Eigen::Vector3d ray1_I =
+          (R_ItoC1.transpose() * ray1_C).normalized();
+      Eigen::Matrix<double, 3, 2> A;
+      A.col(0) = ray0_I;
+      A.col(1) = -ray1_I;
+      const Eigen::Vector2d ranges =
+          A.colPivHouseholderQr().solve(p_C1inI - p_C0inI);
+      const Eigen::Vector3d point0 = p_C0inI + ranges(0) * ray0_I;
+      const Eigen::Vector3d point1 = p_C1inI + ranges(1) * ray1_I;
+      const Eigen::Vector3d midpoint = 0.5 * (point0 + point1);
+      const Eigen::Vector3d midpoint_C0 =
+          R_ItoC0 * (midpoint - p_C0inI);
+      obs.depth_m = midpoint_C0.z();
+      obs.stereo_ray_residual_m = (point0 - point1).norm();
+      if (!(obs.depth_m > 0.0) || !std::isfinite(obs.stereo_ray_residual_m)) {
+        obs.depth_m = std::numeric_limits<double>::quiet_NaN();
+        obs.right_valid = false;
+      }
+    }
+    frame.observations.push_back(obs);
+  }
+  return frame;
+}
+
 } // namespace
 
 // =============================================================================
@@ -377,9 +491,27 @@ VioManager::~VioManager() {
 // =============================================================================
 void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
 
+  BoardImuSample board;
+  board.timestamp = message.timestamp;
+  board.angular_velocity = message.wm;
+  board.linear_acceleration = message.am;
+  board.frame = "board_imu";
+  board.status_valid = true;
+  feed_measurement_board_imu(board);
+}
+
+void VioManager::feed_measurement_board_imu(const BoardImuSample &board_message) {
+
+  ov_core::ImuData message;
+  message.timestamp = board_message.timestamp;
+  message.wm = board_message.angular_velocity;
+  message.am = board_message.linear_acceleration;
+
   // This is the only filter invocation. Every downstream IMU consumer receives
   // this same sample, and the disabled path returns a value-identical copy.
   const ov_core::ImuData processed_message = imu_filter.process(message);
+  latest_board_imu_angular_rate_rad_s_ = processed_message.wm.norm();
+  latest_board_imu_timestamp_ = processed_message.timestamp;
 
   // The oldest time we need IMU with is the last clone
   // We shouldn't really need the whole window, but if we go backwards in time we will
@@ -395,6 +527,13 @@ void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
   // Push back to our initializer
   if (!is_initialized_vio) {
     initializer->feed_imu(processed_message, oldest_time);
+  }
+  if (online_alignment_initializer_ != nullptr &&
+      !online_alignment_initializer_->alignment_window_closed()) {
+    BoardImuSample processed_board = board_message;
+    processed_board.angular_velocity = processed_message.wm;
+    processed_board.linear_acceleration = processed_message.am;
+    online_alignment_initializer_->feed_board_imu(processed_board);
   }
 
   // Push back to the zero velocity updater if it is enabled
@@ -1880,8 +2019,8 @@ VioManager::VisualFlowSummary VioManager::summarize_tracker_packet(const ov_core
   out.valid = true;
   out.timestamp = pkt.t_curr;
   out.cam_id = pkt.cam_id;
-  out.image_width = pkt.curr_raw_image.cols;
-  out.image_height = pkt.curr_raw_image.rows;
+  out.image_width = pkt.image_width;
+  out.image_height = pkt.image_height;
   out.num_tracks = (int)pkt.feature_ids.size();
   out.num_features_total = (int)pkt.curr_pts_raw.size();
   out.num_klt_attempted = pkt.n_klt_attempted;
@@ -2366,6 +2505,22 @@ void VioManager::print_gps_alt_final_summary() {
              s.n_accepted > 0 ? s.sum_abs_dpz / s.n_accepted : 0.0);
 }
 
+VioManager::VisualResidualHealth
+VioManager::get_latest_visual_residual_health() const {
+  VisualResidualHealth out;
+  if (!visual_residual_diag_)
+    return out;
+  VisualResidualDiag::FrameSummary summary;
+  if (!visual_residual_diag_->get_latest_summary(summary))
+    return out;
+  out.valid = true;
+  out.timestamp = summary.time;
+  out.mean_residual_px = summary.mean_residual_norm;
+  out.p95_residual_px = summary.p95_residual_norm;
+  out.accepted_ratio = summary.accepted_ratio;
+  return out;
+}
+
 void VioManager::feed_measurement_simulation(double timestamp, const std::vector<int> &camids,
                                              const std::vector<std::vector<std::pair<size_t, Eigen::VectorXf>>> &feats) {
 
@@ -2433,7 +2588,11 @@ void VioManager::feed_measurement_simulation(double timestamp, const std::vector
 }
 
 // =============================================================================
-void VioManager::track_image_and_update(const ov_core::CameraData &message_const) {
+void VioManager::track_image_and_update(const ov_core::CameraData &message_const,
+                                        bool backend_eligible,
+                                        bool information_trigger_backend,
+                                        bool backend_safety_forced,
+                                        bool backend_visual_health_bad) {
   rT1 = boost::posix_time::microsec_clock::local_time();
 
   // Assert we have valid measurement data and ids
@@ -2589,6 +2748,138 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
   }
   rT2 = boost::posix_time::microsec_clock::local_time();
 
+  // The online alignment supervisor consumes the exact observations produced
+  // by the normal locked-calibration tracker. It is evaluated only after the
+  // current monocular frame has been inserted. A successful release closes
+  // the finite startup interval permanently; no later frame may re-enter the
+  // nonlinear alignment solver.
+  if (online_alignment_initializer_ != nullptr &&
+      !online_alignment_initializer_->alignment_window_closed()) {
+    const StereoAlignmentFrame alignment_frame =
+        make_online_stereo_frame(message, trackFEATS, state);
+    online_alignment_initializer_->feed_stereo(alignment_frame);
+    OnlineAlignmentResult alignment_result;
+    double solve_now = message.timestamp;
+    if (!message.sensor_timestamps.empty())
+      solve_now = std::max(
+          solve_now, *std::max_element(message.sensor_timestamps.begin(),
+                                      message.sensor_timestamps.end()));
+    if (online_alignment_initializer_->try_initialize(solve_now,
+                                                       alignment_result)) {
+      if (!is_initialized_vio && alignment_result.released_to_openvins) {
+        initialize_with_online_alignment(alignment_result);
+      }
+    }
+  }
+
+  VisualFrameSnapshot current_backend_snapshot;
+  Eigen::Matrix3d current_R_GtoC = Eigen::Matrix3d::Identity();
+  bool current_backend_snapshot_valid = false;
+  if (is_initialized_vio && information_trigger_backend &&
+      !message.sensor_ids.empty()) {
+    const StereoAlignmentFrame current_frame =
+        make_online_stereo_frame(message, trackFEATS, state);
+    current_backend_snapshot.timestamp = current_frame.left_timestamp;
+    current_backend_snapshot.tracks.reserve(current_frame.observations.size());
+    for (const auto &observation : current_frame.observations) {
+      VisualTrackPoint track;
+      track.feature_id = observation.feature_id;
+      track.raw = observation.raw_left;
+      track.normalized = observation.normalized_left;
+      track.track_age = observation.track_length;
+      track.valid = observation.left_valid;
+      current_backend_snapshot.tracks.push_back(track);
+    }
+    Eigen::Matrix3d R_GtoI = state->_imu->Rot();
+    double current_imu_excitation_rad_s =
+        std::isfinite(latest_board_imu_angular_rate_rad_s_)
+            ? latest_board_imu_angular_rate_rad_s_
+            : 0.0;
+    if (message.timestamp > state->_timestamp + 1e-9 && propagator != nullptr) {
+      Eigen::Matrix<double, 13, 1> propagated_state;
+      Eigen::Matrix<double, 12, 12> propagated_covariance;
+      if (propagator->fast_state_propagate(state, message.timestamp,
+                                           propagated_state,
+                                           propagated_covariance)) {
+        R_GtoI = ov_core::quat_2_Rot(propagated_state.head<4>());
+      }
+    }
+    const size_t camera_id = message.sensor_ids.front();
+    current_R_GtoC = state->_calib_IMUtoCAM.at(camera_id)->Rot() * R_GtoI;
+    current_backend_snapshot_valid =
+        current_backend_snapshot.tracks.size() >= 4;
+
+    BackendUpdateTriggerInput trigger_input;
+    trigger_input.timestamp = message.timestamp;
+    trigger_input.last_backend_timestamp = last_information_backend_timestamp_;
+    trigger_input.initialized = true;
+    trigger_input.safety_forced = backend_safety_forced;
+    trigger_input.visual_health_bad = backend_visual_health_bad;
+    trigger_input.imu_excitation_rad_s = current_imu_excitation_rad_s;
+    if (last_information_backend_timestamp_ >= 0.0 &&
+        current_backend_snapshot_valid) {
+      const Eigen::Matrix3d R_Ccurrent_Cbackend =
+          current_R_GtoC * last_backend_R_GtoC_.transpose();
+      const Eigen::VectorXd intrinsics =
+          state->_cam_intrinsics.at(camera_id)->value();
+      trigger_input.motion_from_last_backend = compute_visual_motion_metrics(
+          last_backend_visual_snapshot_, current_backend_snapshot,
+          R_Ccurrent_Cbackend, intrinsics(0), intrinsics(1));
+    }
+    last_backend_update_decision_ =
+        backend_update_trigger_.evaluate(trigger_input);
+    backend_eligible = last_backend_update_decision_.trigger;
+    if (last_backend_update_decision_.information_trigger)
+      visual_update_counters_.backend_information_trigger_count++;
+    if (last_backend_update_decision_.latency_fallback)
+      visual_update_counters_.backend_latency_fallback_count++;
+    if (last_backend_update_decision_.safety_trigger)
+      visual_update_counters_.backend_safety_trigger_count++;
+    if (backend_eligible && current_backend_snapshot_valid) {
+      last_backend_visual_snapshot_ = current_backend_snapshot;
+      last_backend_R_GtoC_ = current_R_GtoC;
+      last_information_backend_timestamp_ = message.timestamp;
+    }
+  }
+
+  // P5 tracking-only path. This must run before ZUPT and before normal visual
+  // propagation: either path can advance state time and return. The tracker
+  // has consumed the image, but exact-timestamp backend observations are
+  // removed before any clone or update can be created.
+  if (is_initialized_vio && !backend_eligible) {
+    const size_t clone_count_before = state->_clones_IMU.size();
+    size_t observations_before = 0;
+    size_t observations_after = 0;
+    if (trackFEATS && trackFEATS->get_feature_database()) {
+      observations_before =
+          trackFEATS->get_feature_database()
+              ->features_containing(message.timestamp, false, false)
+              .size();
+      trackFEATS->get_feature_database()->cleanup_measurements_exact(
+          message.timestamp);
+      observations_after =
+          trackFEATS->get_feature_database()
+              ->features_containing(message.timestamp, false, false)
+              .size();
+    }
+    if (trackARUCO != nullptr)
+      trackARUCO->get_feature_database()->cleanup_measurements_exact(
+          message.timestamp);
+    visual_update_counters_.tracking_only_frame_count++;
+    if (observations_before > observations_after)
+      visual_update_counters_.tracking_only_observation_drop_count +=
+          observations_before - observations_after;
+    if (state->_clones_IMU.size() != clone_count_before)
+      visual_update_counters_.tracking_only_clone_violation_count++;
+    visual_update_counters_.tracks_retained_final =
+        trackFEATS && trackFEATS->get_feature_database()
+            ? trackFEATS->get_feature_database()->size()
+            : 0;
+    return;
+  }
+  if (is_initialized_vio && backend_eligible)
+    visual_update_counters_.backend_frame_count++;
+
   // Check if we should do zero-velocity, if so update the state with it
   // Note that in the case that we only use in the beginning initialization phase
   // If we have since moved, then we should never try to do a zero velocity update!
@@ -2609,6 +2900,14 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
   // If we do not have VIO initialization, then try to initialize
   // TODO: Or if we are trying to reset the system, then do that here!
   if (!is_initialized_vio) {
+    // Online mode is fail-closed: never fall back to the ordinary initializer,
+    // nearest FC row, historical I1/I2, or a zero-bias seed.
+    if (online_alignment_initializer_ != nullptr) {
+      double time_track = (rT2 - rT1).total_microseconds() * 1e-6;
+      PRINT_DEBUG(BLUE "[TIME]: %.4f seconds for tracking/alignment\n" RESET,
+                  time_track);
+      return;
+    }
     is_initialized_vio = try_to_initialize(message);
     if (!is_initialized_vio) {
       double time_track = (rT2 - rT1).total_microseconds() * 1e-6;
@@ -2654,6 +2953,93 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
   } else {
     do_feature_propagate_update(message);
   }
+
+}
+
+bool VioManager::configure_online_alignment(
+    const OnlineAlignmentOptions &options) {
+  if (is_initialized_vio) {
+    PRINT_WARNING(YELLOW "[ONLINE-ALIGN] cannot enable after VIO initialization\n" RESET);
+    return false;
+  }
+  OnlineAlignmentOptions configured = options;
+  configured.imu_sigma_w = params.imu_noises.sigma_w;
+  configured.imu_sigma_wb = params.imu_noises.sigma_wb;
+  configured.imu_sigma_a = params.imu_noises.sigma_a;
+  configured.imu_sigma_ab = params.imu_noises.sigma_ab;
+  configured.camera_to_imu_time_offset_s =
+      state->_calib_dt_CAMtoIMU->value()(0);
+  const size_t configured_cameras =
+      state->_calib_IMUtoCAM.find(1) != state->_calib_IMUtoCAM.end() ? 2 : 1;
+  for (size_t camera = 0; camera < configured_cameras; ++camera) {
+    if (state->_calib_IMUtoCAM.find(camera) ==
+            state->_calib_IMUtoCAM.end() ||
+        state->_cam_intrinsics_cameras.find(camera) ==
+            state->_cam_intrinsics_cameras.end()) {
+      PRINT_ERROR(RED "[ONLINE-ALIGN] locked stereo calibration for camera %zu is unavailable\n" RESET,
+                  camera);
+      return false;
+    }
+    configured.q_ItoC[camera] =
+        state->_calib_IMUtoCAM.at(camera)->quat();
+    configured.p_IinC[camera] =
+        state->_calib_IMUtoCAM.at(camera)->pos();
+    configured.camera_intrinsics[camera] =
+        state->_cam_intrinsics_cameras.at(camera)->get_value();
+    configured.camera_fisheye[camera] =
+        std::dynamic_pointer_cast<ov_core::CamEqui>(
+            state->_cam_intrinsics_cameras.at(camera)) != nullptr;
+  }
+  configured.provenance.fc_stream = "runtime_fc_navigation_stream";
+  configured.provenance.imu_stream = "runtime_board_imu_stream";
+  configured.provenance.stereo_stream =
+      configured_cameras > 1
+          ? "openvins_stereo_feature_database"
+          : "openvins_monocular_multiframe_feature_database";
+  configured.provenance.camera_imu_calibration =
+      "locked_runtime_camera_imu_calibration_no_online_estimation";
+  configured.provenance.fc_axis_mapping =
+      "declared_axis_mapping_plus_startup_only_misalignment";
+  configured.provenance.gps_used = false;
+  configured.provenance.post_alignment_used = false;
+  configured.provenance.manual_mounting_compensation_used = false;
+  online_alignment_initializer_ =
+      std::make_shared<OnlineAlignmentInitializer>(configured);
+  online_alignment_result_valid_ = false;
+  PRINT_INFO(CYAN "[ONLINE-ALIGN] causal FC + board-IMU + monocular multi-frame visual supervisor enabled; ordinary initializer fallback disabled\n" RESET);
+  return true;
+}
+
+bool VioManager::feed_measurement_fc_navigation(
+    const FCNavigationSample &message) {
+  if (online_alignment_initializer_ == nullptr ||
+      online_alignment_initializer_->alignment_window_closed())
+    return false;
+  return online_alignment_initializer_->feed_fc_navigation(message);
+}
+
+const OnlineAlignmentDiagnostics &VioManager::online_alignment_diagnostics() const {
+  static const OnlineAlignmentDiagnostics disabled;
+  return online_alignment_initializer_ != nullptr
+             ? online_alignment_initializer_->last_diagnostics()
+             : disabled;
+}
+
+std::string VioManager::online_alignment_rejection() const {
+  return online_alignment_initializer_ != nullptr
+             ? online_alignment_initializer_->last_rejection()
+             : "online_alignment_disabled";
+}
+
+bool VioManager::get_online_alignment_result(
+    OnlineAlignmentResult &result) const {
+  if (!online_alignment_result_valid_)
+    return false;
+  result = online_alignment_result_;
+  if (online_alignment_initializer_ != nullptr &&
+      result.readiness != AlignmentReadiness::FULL_ALIGNMENT_READY)
+    result.diagnostics = online_alignment_initializer_->last_diagnostics();
+  return true;
 }
 
 // =============================================================================

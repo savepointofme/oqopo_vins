@@ -156,12 +156,16 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
     return;
   }
 
+  const double previous_timestamp = time_last[cam_id];
+
   // First we should make that the last images have enough features so we can do KLT
   // This will "top-off" our number of tracks so always have a constant number
   int pts_before_detect = (int)pts_last[cam_id].size();
   auto pts_left_old = pts_last[cam_id];
   auto ids_left_old = ids_last[cam_id];
   perform_detection_monocular(img_pyramid_last[cam_id], img_mask_last[cam_id], pts_left_old, ids_left_old);
+  const auto pts_left_old_raw = pts_left_old;
+  auto pts_left_rotation_compensated = pts_left_old_raw;
   int n_newly_detected_this = (int)pts_left_old.size() - pts_before_detect;
   rT3 = boost::posix_time::microsec_clock::local_time();
 
@@ -199,6 +203,7 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
     cv::warpPerspective(img_last[cam_id], prev_image_for_viz, cv::Mat(H_gravity), img.size(), cv::INTER_LINEAR);
     cv::buildOpticalFlowPyramid(prev_image_for_viz, imgpyr_last_klt, win_size, pyr_levels);
     apply_H_kp(pts_left_old, H_gravity); // move last-frame pts into current-orientation space
+    pts_left_rotation_compensated = pts_left_old;
     pts_left_new = pts_left_old;         // initial KLT guess ≈ current-frame location
     PRINT_DEBUG("[KLT-WARP] cam%zu img0=warped_last img1=raw_curr "
                 "R_comp=[%.3f %.3f %.3f; %.3f %.3f %.3f; %.3f %.3f %.3f] %zu pts\n",
@@ -209,6 +214,12 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
                 pts_left_old.size());
   } else {
     prev_image_for_viz = img_last[cam_id];
+    cv::Matx33d predicted_rotation;
+    if (get_predicted_rotation(cam_id, predicted_rotation)) {
+      const cv::Matx33d K = camera_calib.at(cam_id)->get_K();
+      const cv::Matx33d H = K * predicted_rotation * K.inv();
+      apply_H_kp(pts_left_rotation_compensated, H);
+    }
     PRINT_DEBUG("[KLT-WARP] cam%zu img0=raw_last img1=raw_curr (warp OFF)\n", cam_id);
   }
 
@@ -262,6 +273,8 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
   std::vector<cv::KeyPoint> good_left;
   std::vector<size_t> good_ids_left;
   std::vector<cv::Point2f> good_prev_pts; // corresponding prev points for viz packet
+  std::vector<cv::Point2f> good_prev_pts_raw;
+  std::vector<cv::Point2f> good_prev_pts_rotation_compensated;
 
   // Loop through all left points
   for (size_t i = 0; i < pts_left_new.size(); i++) {
@@ -278,6 +291,9 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
       good_left.push_back(pts_left_new[i]);
       good_ids_left.push_back(ids_left_old[i]);
       good_prev_pts.push_back(pts_left_old[i].pt); // warped prev if warp active, raw prev if off
+      good_prev_pts_raw.push_back(pts_left_old_raw[i].pt);
+      good_prev_pts_rotation_compensated.push_back(
+          pts_left_rotation_compensated[i].pt);
     }
   }
 
@@ -305,10 +321,18 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
     pkt.valid = true;
     pkt.warp_active = do_gravity_warp;
     pkt.cam_id = cam_id;
+    pkt.t_prev = previous_timestamp;
     pkt.t_curr = message.timestamp;
-    pkt.prev_image_for_viz = prev_image_for_viz.clone();
-    pkt.curr_raw_image = img.clone();
+    pkt.image_width = img.cols;
+    pkt.image_height = img.rows;
+    if (warp_viz_image_payload_enabled.load()) {
+      pkt.prev_image_for_viz = prev_image_for_viz.clone();
+      pkt.curr_raw_image = img.clone();
+    }
     pkt.prev_pts_for_viz = good_prev_pts;
+    pkt.prev_pts_raw = good_prev_pts_raw;
+    pkt.prev_pts_rotation_compensated =
+        good_prev_pts_rotation_compensated;
     // Convert current raw points to Point2f
     pkt.curr_pts_raw.reserve(good_left.size());
     for (const auto &kp : good_left)
@@ -379,6 +403,9 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
     time_last[cam_id_right] = message.timestamp;
     return;
   }
+
+  const double previous_timestamp_left = time_last[cam_id_left];
+  const double previous_timestamp_right = time_last[cam_id_right];
 
   // First we should make that the last images have enough features so we can do KLT
   // This will "top-off" our number of tracks so always have a constant number
@@ -603,9 +630,14 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
       pkt.valid = true;
       pkt.warp_active = do_warp_left;
       pkt.cam_id = cam_id_left;
+      pkt.t_prev = previous_timestamp_left;
       pkt.t_curr = message.timestamp;
-      pkt.prev_image_for_viz = prev_image_for_viz_left.clone();
-      pkt.curr_raw_image = img_left.clone();
+      pkt.image_width = img_left.cols;
+      pkt.image_height = img_left.rows;
+      if (warp_viz_image_payload_enabled.load()) {
+        pkt.prev_image_for_viz = prev_image_for_viz_left.clone();
+        pkt.curr_raw_image = img_left.clone();
+      }
       pkt.prev_pts_for_viz = good_prev_pts_left;
       pkt.curr_pts_raw.reserve(good_left.size());
       for (const auto &kp : good_left)
@@ -618,9 +650,14 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
       pkt.valid = true;
       pkt.warp_active = do_warp_right;
       pkt.cam_id = cam_id_right;
+      pkt.t_prev = previous_timestamp_right;
       pkt.t_curr = message.timestamp;
-      pkt.prev_image_for_viz = prev_image_for_viz_right.clone();
-      pkt.curr_raw_image = img_right.clone();
+      pkt.image_width = img_right.cols;
+      pkt.image_height = img_right.rows;
+      if (warp_viz_image_payload_enabled.load()) {
+        pkt.prev_image_for_viz = prev_image_for_viz_right.clone();
+        pkt.curr_raw_image = img_right.clone();
+      }
       pkt.prev_pts_for_viz = good_prev_pts_right;
       pkt.curr_pts_raw.reserve(good_right.size());
       for (const auto &kp : good_right)

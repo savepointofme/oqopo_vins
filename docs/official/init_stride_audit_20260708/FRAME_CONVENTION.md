@@ -1,8 +1,13 @@
-# OpenVINS Frame Convention Draft
+# OpenVINS Frame Convention Draft (Superseded Audit History)
 
 Date: 2026-07-08
 
 Scope: first-round P0 audit for initialization origin, logging chain, master data columns, and stride experiment indexing. This document records current evidence only; it does not approve a fixed 7 degree compensation.
+
+Normative definitions now live in `FRAME_CONTRACT.md`. This file is retained as
+the evidence snapshot that motivated that contract. Correction: the first-round
+audit missed `opencv_yaml_parse.h:661-665`, where the fallback transform is in
+fact inverted when the opposite key is used.
 
 ## 结论
 
@@ -68,7 +73,12 @@ When projecting state positions to camera centers, existing update code uses the
 p_CinW0 = p_IinW0 - R_W0toC^T * p_IinC
 ```
 
-Audit risk: `baseline/latest/config/kalibr_imucam_chain.yaml` stores `T_cam_imu`, while the parser fallback for a missing `T_imu_cam` only swaps the key name and does not visibly invert the matrix (`ov_core/src/utils/opencv_yaml_parse.h:621-629`). This is a high-priority constant-transform audit item before any attitude compensation.
+`baseline/latest/config/kalibr_imucam_chain.yaml` stores `T_cam_imu`. The parser
+falls back from the requested `T_imu_cam` key and does invert the loaded matrix at
+`ov_core/src/utils/opencv_yaml_parse.h:661-665`; the earlier review stopped at
+lines 621-629 and incorrectly left this as a suspected missing inversion. A
+numeric regression test remains required, but the production fallback direction
+is defined.
 
 ## Initialization Origin
 
@@ -101,4 +111,3 @@ Therefore, the initial output is not guaranteed to be zero. It is zero only if t
 3. Constant position offset candidates: camera/IMU lever arm, FC/GPS local origin, dashboard yaw+translation alignment, offline start translation, and possible `T_cam_imu`/`T_imu_cam` convention confusion.
 4. Constant angle offset candidates: `q_GtoI` vs `q_ItoG`, start-heading alignment, FC body convention, ENU/NED or FLU/FRD conversion, camera/IMU extrinsic direction, and FC/camera time offset.
 5. Current analysis does execute a documented second alignment for metrics. It must be stored as `vio_analysis_aligned_*`, never overwrite `vio_raw_*`.
-

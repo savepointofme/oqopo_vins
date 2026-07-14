@@ -60,3 +60,31 @@
 - Needs confirmation: WSLg/display availability before realtime visualization.
 - Needs confirmation: exact matplotlib Chinese font availability on Windows; missing CJK fonts have caused generated figures to show boxes.
 - Needs confirmation: active Git branch name and current dirty changes before making commits; preserve user changes regardless.
+
+## P5 State-Machine Result (2026-07-13)
+
+- Detected: P5 now uses one explicit causal policy state with priority `VISUAL_DEGRADED > LOW_ALTITUDE_SAFETY > TURN_SAFETY > DESCENT_SAFETY > NORMAL_CRUISE > HIGH_ALTITUDE_CRUISE` and independently publishes `tracking_stride` and `backend_update_stride`.
+- Detected: tracking-only images advance KLT identities but their exact-timestamp FeatureDatabase observations are removed before `propagate_and_clone`; fly1/fly3 active screening recorded zero clone violations.
+- Detected: registered `test_adaptive_stride` covers 16 required state/cadence/lifecycle cases and passes under CTest.
+- Detected: the new controller removed old rung-ladder chatter. Active fly1/fly3 state-transition rates were 3.54 and 2.21 per minute, with zero unnecessary reversals, dwell violations, or same-state target rewrites.
+- Detected: final short-screening status is `P5_STATE_MACHINE_ACTIVE_SCREENING_PASS`. The old `compute_saving_vs_fixed12` gate is invalid, and the old Dashboard-off wall/sensor 11.684/10.446 is also invalid because the initializer kept re-entering joint alignment after release.
+- Detected: authoritative P5 delivery is `C:/Users/baloney/Desktop/实验目录/P5_state_machine_20260713/delivery/`; authoritative active batch is `active/20260713_102754_clean_p4_compare`.
+- Detected: `--no-display` only hides the OpenCV window; it still prepares and renders the Dashboard. The new `--no-dashboard` removes Dashboard updates/rendering/history images and KLT visualization image payload clones while preserving lightweight policy points, feature IDs, timestamps, dimensions, and health counters.
+- Detected: the single-run Dashboard effect was within about +/-5% (fly1 off faster, fly3 off slower), far too small to explain the 10-12x realtime deficit. Dashboard mode did not change policy cadence; trajectory differences stayed below 1 mm.
+- Detected: P4 initialization now closes its finite causal startup window on the first successful atomic release. Later FC, board-IMU, and monocular frames cannot re-enter Ceres or dense covariance recovery; a 20 s collection timeout also closes the attempt until explicit reset.
+- Detected: one-shot single-process Dashboard-off replay measured state-machine wall/sensor 0.720 for fly1 and 0.629 for fly3; fixed stride12 measured 0.554/0.491. All four have at least 20% host-side margin despite retaining heavy diagnostics.
+- Detected: fly1/fly3 made 7/2 nonlinear solves before release because earlier visual reprojection gates failed, then each released exactly once with zero post-release calls. Navigation latency was 10.80/8.80 s.
+- Detected: the selected frontend remains monocular KLT/LK (`use_klt: true`, `use_stereo: false`) with `num_pts: 400` and `max_slam: 50`; observed KLT P95 was 337/351 points and SLAM never exceeded 50.
+- Detected: authoritative one-shot realtime evidence is `C:/Users/baloney/Desktop/实验目录/P5_state_machine_20260713/realtime_one_shot_alignment/20260713_191711_single_process`; report is under `delivery/realtime_one_shot/`.
+- Pitfall: do not use frame-count ratios, old four-process wall time, or the old 3,231-attempt run as realtime evidence. Mark the latter `invalid_realtime_evaluation_post_release_alignment_repeated`; use single-estimator sensor span versus wall time and direct solve/release counters.
+
+## P4/P5 Persistent-Window Redesign (2026-07-14)
+
+- Detected: the formal P4 initializer is the fork's FC navigation + board IMU + monocular KLT joint initializer. It must retain FC position/velocity/attitude factors, board-IMU preintegration, monocular reprojection, startup FC-to-board relation, `q/p/v/bg/ba`, covariance, observability, and `AlignmentResult` injection. Do not restore or fall back to upstream visual-IMU-only initialization or nearest-FC-row initialization.
+- Detected: upstream OpenVINS is referenced only for finite sliding windows, pruning, retry-on-new-data, and one-time state/FEJ/covariance lifecycle mechanics.
+- Detected: total P4 collection time now has no elapsed-time failure limit. The old 20 s one-shot timeout statement above is superseded. While valid streams continue, ordinary coverage, excitation, triangulation, residual, covariance, or observability failures reject only the current finite window and collection continues.
+- Detected: each solve uses bounded `{2(reference),3,5,8,12}` s candidate windows, chooses the shortest usable duration, and prunes FC, board-IMU, and selected visual snapshots outside the 12 s maximum plus interpolation/time-offset margin. Waiting longer never creates a larger graph.
+- Detected: Ceres eligibility uses a changed window fingerprint, at least three new selected frames, and a minimum 0.75 s attempt interval. Identical content is not solved twice.
+- Detected: a solved candidate is held fixed and evaluated only before release using a bounded 2–4 s FC/IMU/monocular validation interval. No shadow OpenVINS exists. Refinement is optional and limited to zero or one; the production path currently uses zero because a registered bounded local refinement is not yet enabled.
+- Detected: after one validated release, P4 closes permanently, clears high-cost buffers, stops accepting FC/IMU/image initialization inputs, and cannot be reawakened by higher P5 tracking cadence.
+- Detected: P5 no longer uses policy-state-to-fixed-stride pairs as its primary algorithm. Shared `VisualCadencePlanner` selects tracking cadence from rotation-compensated target parallax and safety caps; `BackendUpdateTrigger` uses accumulated common-track information, feature loss, latency, motion, and explicit safety triggers. Flight-state labels are safety context/caps only.

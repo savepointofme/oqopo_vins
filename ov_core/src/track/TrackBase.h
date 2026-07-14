@@ -55,9 +55,14 @@ struct TrackerWarpVizPacket {
   bool valid = false;
   bool warp_active = false;
   size_t cam_id = 0;
+  double t_prev = 0.0;
   double t_curr = 0.0;
+  int image_width = 0;
+  int image_height = 0;
   cv::Mat prev_image_for_viz;                 // warped prev if warp active, else raw prev
   cv::Mat curr_raw_image;                     // current raw image
+  std::vector<cv::Point2f> prev_pts_raw;      // previous observations before rotation compensation
+  std::vector<cv::Point2f> prev_pts_rotation_compensated; // rotation-only prediction in current image coordinates
   std::vector<cv::Point2f> prev_pts_for_viz;  // warped prev pts if warp active, else raw prev pts
   std::vector<cv::Point2f> curr_pts_raw;      // final accepted matches in raw current image
   std::vector<size_t> feature_ids;            // matching feature IDs
@@ -223,6 +228,12 @@ public:
   /// Base returns false; TrackKLT overrides with the real packet.
   virtual bool get_warp_viz_packet(size_t cam_id, TrackerWarpVizPacket &packet) { return false; }
 
+  /// Keep the lightweight points/IDs/health packet while omitting cloned
+  /// image payloads when no dashboard or camera video consumes them.
+  void set_warp_viz_image_payload_enabled(bool enabled) {
+    warp_viz_image_payload_enabled.store(enabled);
+  }
+
   /**
    * @brief Set a gravity-aligned rotation warp for the given camera.
    *
@@ -315,6 +326,9 @@ protected:
 
   /// Constant camera-fixed optical-axis curl correction rate (rad/s, positive = CCW in image).
   double curl_correction_rate_radps = 0.0;
+
+  /// Image clones are visualization payload, not estimator or policy state.
+  std::atomic<bool> warp_viz_image_payload_enabled{true};
 
   /// Per-camera previous-frame timestamp for the curl-correction dt computation.
   /// Written inside mtx_last_vars alongside pts_last.

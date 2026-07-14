@@ -146,6 +146,76 @@ void VioManager::initialize_with_fc_state(const FCInitState &fc,
              std::pow(sigma_bg, 2), std::pow(sigma_ba, 2));
 }
 
+void VioManager::initialize_with_online_alignment(
+    const OnlineAlignmentResult &result) {
+  if (is_initialized_vio) {
+    PRINT_WARNING(YELLOW "[ONLINE-ALIGN] release requested after initialization; ignoring\n" RESET);
+    return;
+  }
+  if (!result.diagnostics.quality_passed ||
+      result.diagnostics.future_data_used || !result.q_GtoI.allFinite() ||
+      !result.p_IinG.allFinite() || !result.v_IinG.allFinite() ||
+      !result.bg.allFinite() || !result.ba.allFinite() ||
+      !result.covariance.allFinite()) {
+    PRINT_ERROR(RED "[ONLINE-ALIGN] invalid or non-causal release rejected\n" RESET);
+    return;
+  }
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 15, 15>> eig(
+      result.covariance);
+  if (eig.info() != Eigen::Success || eig.eigenvalues().minCoeff() <= 0.0) {
+    PRINT_ERROR(RED "[ONLINE-ALIGN] non-positive initial covariance rejected\n" RESET);
+    return;
+  }
+
+  Eigen::Matrix<double, 16, 1> imu_state;
+  imu_state << result.q_GtoI, result.p_IinG, result.v_IinG, result.bg,
+      result.ba;
+  state->_imu->set_value(imu_state);
+  state->_imu->set_fej(imu_state);
+  std::vector<std::shared_ptr<ov_type::Type>> order = {state->_imu};
+  StateHelper::set_initial_covariance(state, result.covariance, order);
+
+  state->_timestamp = result.timestamp;
+  startup_time = result.timestamp;
+  trackFEATS->get_feature_database()->cleanup_measurements(state->_timestamp);
+  trackFEATS->set_num_features(std::floor(
+      static_cast<double>(params.num_pts) /
+      static_cast<double>(params.state_options.num_cameras)));
+  if (trackARUCO != nullptr)
+    trackARUCO->get_feature_database()->cleanup_measurements(state->_timestamp);
+  camera_queue_init.clear();
+  propagator->invalidate_cache();
+  has_moved_since_zupt = state->_imu->vel().norm() > params.zupt_max_velocity;
+  thread_init_success = true;
+  thread_init_running = false;
+  is_initialized_vio = true;
+  online_alignment_result_ = result;
+  online_alignment_result_valid_ = true;
+
+  PRINT_INFO(GREEN "[ONLINE-ALIGN] RELEASED causal state at t=%.6f, solve_t=%.6f, window=[%.6f, %.6f]\n" RESET,
+             result.timestamp, result.diagnostics.solve_time,
+             result.diagnostics.window_start, result.diagnostics.init_time);
+  PRINT_INFO(GREEN "[ONLINE-ALIGN] locked dt_att=%+.6fs dt_nav=%+.6fs mount_residual=%.3fdeg rate_rms=%.4frad/s visual_imu=%.3fdeg\n" RESET,
+             result.fc_attitude_to_board_time_offset_s,
+             result.fc_navigation_to_board_time_offset_s,
+             result.diagnostics.mount_residual_deg,
+             result.diagnostics.rate_residual_rms_rad_s,
+             result.diagnostics.visual_imu_rotation_residual_deg);
+  PRINT_INFO(GREEN "[ONLINE-ALIGN] release closed-loop updates=%d visual=%d correction=[%.3fdeg %.3fm %.3fm/s %.5frad/s %.4fm/s2], Joseph/reset=%s/%s; FC attitude is evaluation-only\n" RESET,
+             result.diagnostics.candidate_closed_loop_update_count,
+             result.diagnostics.candidate_closed_loop_visual_update_count,
+             result.diagnostics.candidate_closed_loop_attitude_correction_deg,
+             result.diagnostics.candidate_closed_loop_position_correction_m,
+             result.diagnostics.candidate_closed_loop_velocity_correction_mps,
+             result.diagnostics.candidate_closed_loop_gyro_bias_correction_rad_s,
+             result.diagnostics.candidate_closed_loop_accel_bias_correction_mps2,
+             result.diagnostics.candidate_covariance_joseph_update_applied ? "yes" : "no",
+             result.diagnostics.candidate_covariance_error_reset_applied ? "yes" : "no");
+  PRINT_INFO(GREEN "[ONLINE-ALIGN] bg=[%.5f %.5f %.5f] ba=[%.5f %.5f %.5f], no continuous FC/GPS fusion\n" RESET,
+             result.bg.x(), result.bg.y(), result.bg.z(), result.ba.x(),
+             result.ba.y(), result.ba.z());
+}
+
 // =============================================================================
 // [中文] try_to_initialize
 //  初始化全过程:

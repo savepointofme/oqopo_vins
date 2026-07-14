@@ -94,6 +94,8 @@ list(APPEND LIBRARY_SOURCES
         src/state/StateHelper.cpp
         src/state/Propagator.cpp
         src/core/ImuFilter.cpp
+        src/core/OnlineAlignmentCandidateFilter.cpp
+        src/core/OnlineAlignmentInitializer.cpp
         src/core/VioManager.cpp
         src/core/VioManagerHelper.cpp
         src/update/UpdaterHelper.cpp
@@ -208,6 +210,23 @@ install(TARGETS test_fc_init_loader
         RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
+add_executable(test_online_alignment_initializer src/test_online_alignment_initializer.cpp)
+target_link_libraries(test_online_alignment_initializer ov_msckf_lib ${thirdparty_libraries})
+add_test(NAME test_online_alignment_initializer COMMAND test_online_alignment_initializer)
+
+add_executable(test_online_alignment_candidate_filter src/test_online_alignment_candidate_filter.cpp)
+target_link_libraries(test_online_alignment_candidate_filter ov_msckf_lib ${thirdparty_libraries})
+add_test(NAME test_online_alignment_candidate_filter COMMAND test_online_alignment_candidate_filter)
+
+# Camera/IMU external-YAML extrinsic direction regression tests.
+add_executable(test_camera_extrinsic_parser src/test_camera_extrinsic_parser.cpp)
+target_link_libraries(test_camera_extrinsic_parser ov_msckf_lib ${thirdparty_libraries})
+install(TARGETS test_camera_extrinsic_parser
+        ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+        LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+        RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
 # Gate 2: Constrained-yaw-nullspace rank-1 projection unit tests (pure Eigen, no pipeline).
 # Some experiment snapshots contain the target declaration but not its source;
 # keep those snapshots configurable while emitting an explicit warning.
@@ -232,6 +251,13 @@ install(TARGETS test_adaptive_stride
         RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
+# Header-only P5 state-machine replay used to recompute shadow timelines from
+# existing estimator telemetry without rerunning fixed-stride estimators.
+add_executable(p5_shadow_state_replay src/p5_shadow_state_replay.cpp)
+target_link_libraries(p5_shadow_state_replay ${thirdparty_libraries})
+install(TARGETS p5_shadow_state_replay
+        RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
+
 # Pure external-anchor source-quality and trust-policy tests.
 add_executable(test_anchor_trust_policy src/test_anchor_trust_policy.cpp)
 target_link_libraries(test_anchor_trust_policy ov_msckf_lib ${thirdparty_libraries})
@@ -249,3 +275,12 @@ install(TARGETS test_imu_filter
         LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
         RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
+
+if (BUILD_TESTING)
+    add_test(NAME test_fc_init_loader COMMAND test_fc_init_loader)
+    add_test(NAME test_camera_extrinsic_parser COMMAND test_camera_extrinsic_parser)
+    add_test(NAME test_adaptive_stride COMMAND test_adaptive_stride)
+    add_test(NAME test_anchor_trust_policy COMMAND test_anchor_trust_policy)
+    add_test(NAME test_imu_filter COMMAND test_imu_filter)
+    add_test(NAME test_joseph_update COMMAND test_joseph_update)
+endif ()

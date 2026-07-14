@@ -48,8 +48,7 @@ Every future run-level table must carry:
 
 | ID | Risk | Evidence | Required check |
 | --- | --- | --- | --- |
-| A1 | `T_cam_imu` may be read through a `T_imu_cam` fallback without inversion. | `baseline/latest/config/kalibr_imucam_chain.yaml:7`; `ov_core/src/utils/opencv_yaml_parse.h:621-629`; `ov_msckf/src/core/VioManagerOptions.h:352-359` | Hand-compute `T_CtoI` and stored `(R_ItoC,p_IinC)` for baseline config and compare with printed startup extrinsic. |
+| A1 | Key-direction regression must stay covered, but the suspected missing inversion was disproved. | The fallback calls `Inv_se3` at `ov_core/src/utils/opencv_yaml_parse.h:661-665`; runtime conversion is at `ov_msckf/src/core/VioManagerOptions.h:352-359`. | Add a numeric test proving equivalent `T_cam_imu` and `T_imu_cam` files produce identical runtime input. |
 | A2 | Dashboard alignment may be mistaken for estimator correction. | Dashboard uses `R_gv*p+t` for display only. | Keep dashboard-aligned columns separate or do not persist them as estimator output. |
 | A3 | Analysis alignment may hide initialization yaw/translation errors. | Start-heading alignment at `analysis/full_flight_error_analysis.py:819-833`. | Store raw and aligned columns side by side; report alignment transform. |
 | A4 | FC init timestamp and first camera timestamp differ. | `dt_fc_to_camera` printed in `initialize_with_fc_state()`. | Store FC raw timestamp, aligned timestamp, camera timestamp, and `source_dt` in master table. |
-

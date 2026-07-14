@@ -166,6 +166,8 @@ public:
   }
 
   void log_summary(const FrameSummary &s) {
+    latest_summary_ = s;
+    have_latest_summary_ = true;
     if (!summary_enabled(s.time))
       return;
     summary_csv_ << std::fixed << std::setprecision(9)
@@ -179,6 +181,13 @@ public:
                  << s.high_residual_accepted_ratio << "," << s.u_mean << "," << s.left_frac << ","
                  << s.roll << "," << context_.yaw_rate << "," << context_.gpsz_residual << ","
                  << context_.course_error << "," << context_.cross_error << "\n";
+  }
+
+  bool get_latest_summary(FrameSummary &summary) const {
+    if (!have_latest_summary_)
+      return false;
+    summary = latest_summary_;
+    return true;
   }
 
   static double mean(const std::vector<double> &values) {
@@ -213,6 +222,8 @@ private:
   double t0_ = -std::numeric_limits<double>::infinity();
   double t1_ = std::numeric_limits<double>::infinity();
   Context context_;
+  FrameSummary latest_summary_;
+  bool have_latest_summary_ = false;
 };
 
 } // namespace ov_msckf

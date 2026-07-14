@@ -60,6 +60,10 @@ struct CameraData {
   /// Camera ids for each of the images collected
   std::vector<int> sensor_ids;
 
+  /// Per-image hardware timestamps. Empty preserves the historical contract
+  /// where every image uses `timestamp`; otherwise it must match sensor_ids.
+  std::vector<double> sensor_timestamps;
+
   /// Raw image we have collected for each camera
   std::vector<cv::Mat> images;
 

@@ -1,8 +1,10 @@
-# Frame Tree Draft
+# Frame Tree Draft (Superseded Audit History)
 
 Date: 2026-07-08
 
-This is the first-round frame sketch. It should be rendered to `FRAME_TREE.png` only after the `T_cam_imu` / `T_imu_cam` direction audit is closed.
+This is the first-round frame sketch. Normative names and formulas now live in
+`FRAME_CONTRACT.md`. It should be rendered to `FRAME_TREE.png` only after the
+`T_cam_imu` / `T_imu_cam` direction audit is closed.
 
 ```mermaid
 flowchart LR
@@ -39,4 +41,3 @@ FC init CSV / dynamic initializer
 - Do not compare `p_IinW0` to a camera, FC, or GPS antenna position without the correct lever arm.
 - Do not apply dashboard alignment and analysis alignment to the same stored data as if both were raw estimator output.
 - Do not convert the observed 7 degree Euler difference into a fixed installation angle until time offset and coordinate convention are separately validated.
-

@@ -65,6 +65,8 @@
 #include <unordered_set>
 
 #include "FCInitLoader.h"
+#include "BackendUpdateTrigger.h"
+#include "OnlineAlignmentInitializer.h"
 #include "VioManagerOptions.h"
 
 namespace ov_core {
@@ -137,13 +139,75 @@ public:
    */
   void feed_measurement_imu(const ov_core::ImuData &message);
 
+  /// Board-IMU entry point with explicit frame, saturation, and status flags.
+  /// This feeds the normal propagator and the online alignment supervisor once.
+  void feed_measurement_board_imu(const BoardImuSample &message);
+
+  /// Enable the causal FC + board-IMU + monocular multi-frame initializer. The
+  /// internal visual transport retains legacy stereo-named types, but the
+  /// flight path uses cam0 feature tracks and causal multi-frame triangulation.
+  /// Once enabled, the
+  /// ordinary static/dynamic initializer is not used as a fallback.
+  bool configure_online_alignment(const OnlineAlignmentOptions &options);
+
+  /// Real-time FC navigation input. It is used only before initialization.
+  bool feed_measurement_fc_navigation(const FCNavigationSample &message);
+
+  bool online_alignment_enabled() const { return online_alignment_initializer_ != nullptr; }
+  bool online_alignment_complete() const {
+    return online_alignment_initializer_ != nullptr &&
+           online_alignment_initializer_->alignment_window_closed();
+  }
+  const OnlineAlignmentDiagnostics &online_alignment_diagnostics() const;
+  std::string online_alignment_rejection() const;
+  bool get_online_alignment_result(OnlineAlignmentResult &result) const;
+  const std::deque<AlignmentAttemptReceipt> &
+  online_alignment_attempt_receipts() const {
+    static const std::deque<AlignmentAttemptReceipt> empty;
+    return online_alignment_initializer_ != nullptr
+               ? online_alignment_initializer_->attempt_receipts()
+               : empty;
+  }
+  const AlignmentCandidate *online_alignment_candidate() const {
+    return online_alignment_initializer_ != nullptr &&
+                   (online_alignment_initializer_->candidate_active() ||
+                    online_alignment_initializer_->navigation_released())
+               ? &online_alignment_initializer_->current_candidate()
+               : nullptr;
+  }
+  bool get_online_alignment_provisional(
+      double timestamp, ProvisionalNavigationOutput &output) const {
+    return online_alignment_initializer_ != nullptr &&
+           online_alignment_initializer_->provisional_navigation(timestamp,
+                                                                  output);
+  }
+
   /**
    * @brief Feed function for camera measurements
    * @param message Contains our timestamp, images, and camera ids
    *
    * [中文] 真实相机帧入口, 直接转发给 track_image_and_update。
    */
-  void feed_measurement_camera(const ov_core::CameraData &message) { track_image_and_update(message); }
+  void feed_measurement_camera(const ov_core::CameraData &message) {
+    track_image_and_update(message, true);
+  }
+
+  /// P5 cadence entry point. A tracking-only frame updates KLT identity and
+  /// health, then removes its exact-timestamp backend observations and returns
+  /// before clone augmentation or MSCKF/SLAM selection.
+  void feed_measurement_camera_cadence(const ov_core::CameraData &message,
+                                       bool backend_eligible) {
+    track_image_and_update(message, backend_eligible, false, false, false);
+  }
+
+  /// Tracking is already due. The backend decision is made after KLT from the
+  /// information accumulated since the last backend frame.
+  void feed_measurement_camera_information_cadence(
+      const ov_core::CameraData &message, bool safety_forced,
+      bool visual_health_bad) {
+    track_image_and_update(message, false, true, safety_forced,
+                           visual_health_bad);
+  }
 
   /**
    * @brief Feed function for a synchronized simulated cameras
@@ -175,6 +239,9 @@ public:
                                 double sigma_bg,
                                 double sigma_ba,
                                 double camera_timestamp);
+
+  /// Atomic release boundary for a quality-gated causal online result.
+  void initialize_with_online_alignment(const OnlineAlignmentResult &result);
 
   /**
    * @brief Feed a scalar GPS altitude (world Z) measurement, performs a 1D EKF
@@ -408,6 +475,15 @@ public:
   };
   MsckfLastStats get_last_msckf_stats() const;
 
+  struct VisualResidualHealth {
+    bool valid = false;
+    double timestamp = -1.0;
+    double mean_residual_px = std::numeric_limits<double>::quiet_NaN();
+    double p95_residual_px = std::numeric_limits<double>::quiet_NaN();
+    double accepted_ratio = std::numeric_limits<double>::quiet_NaN();
+  };
+  VisualResidualHealth get_latest_visual_residual_health() const;
+
   struct VisualUpdateCounters {
     size_t msckf_update_count = 0;
     size_t regular_slam_update_count = 0;
@@ -442,6 +518,13 @@ public:
     size_t visual_update_adaptive_first_trigger_count = 0;
     size_t visual_update_adaptive_min_dt_block_count = 0;
     size_t visual_update_adaptive_drop_current_observations_count = 0;
+    size_t backend_frame_count = 0;
+    size_t tracking_only_frame_count = 0;
+    size_t tracking_only_observation_drop_count = 0;
+    size_t tracking_only_clone_violation_count = 0;
+    size_t backend_information_trigger_count = 0;
+    size_t backend_latency_fallback_count = 0;
+    size_t backend_safety_trigger_count = 0;
     double visual_update_adaptive_last_dt_s = 0.0;
     double visual_update_adaptive_last_frame_flow_px = 0.0;
     double visual_update_adaptive_last_accum_flow_px = 0.0;
@@ -526,6 +609,12 @@ public:
     return trackFEATS->get_warp_viz_packet(cam_id, packet);
   }
 
+  /// Disable only cloned tracker image payloads; policy health points, IDs,
+  /// timestamps, and counters remain available to the adaptive controller.
+  void set_tracker_viz_image_payload_enabled(bool enabled) {
+    trackFEATS->set_warp_viz_image_payload_enabled(enabled);
+  }
+
   /// Get a nice visualization image of what tracks we have
   cv::Mat get_historical_viz_image();
 
@@ -572,7 +661,11 @@ protected:
    *      - 否则进入 do_feature_propagate_update
    *   4. 若尚未初始化: 调用 try_to_initialize, 成功后才真正开始滤波
    */
-  void track_image_and_update(const ov_core::CameraData &message);
+  void track_image_and_update(const ov_core::CameraData &message,
+                              bool backend_eligible = true,
+                              bool information_trigger_backend = false,
+                              bool backend_safety_forced = false,
+                              bool backend_visual_health_bad = false);
 
   /**
    * @brief This will do the propagation and feature updates to the state
@@ -728,6 +821,11 @@ protected:
   /// State initializer
   /// [中文] 初始化器, 内部同时持有静态和动态两种
   std::shared_ptr<ov_init::InertialInitializer> initializer;
+
+  /// Optional outer supervisor. It never performs continuous FC fusion.
+  std::shared_ptr<OnlineAlignmentInitializer> online_alignment_initializer_;
+  OnlineAlignmentResult online_alignment_result_;
+  bool online_alignment_result_valid_ = false;
 
   /// Boolean if we are initialized or not
   /// [中文] 初始化完成标记, 影响 track_image_and_update 的分支逻辑
@@ -930,6 +1028,13 @@ private:
   // Updated to R_GtoC_curr each frame after the warp is computed.
   bool gravity_warp_ref_set_ = false;
   std::unordered_map<size_t, Eigen::Matrix3d> gravity_warp_R_ref_;
+  BackendUpdateTrigger backend_update_trigger_;
+  double latest_board_imu_angular_rate_rad_s_ = 0.0;
+  double latest_board_imu_timestamp_ = -1.0;
+  VisualFrameSnapshot last_backend_visual_snapshot_;
+  Eigen::Matrix3d last_backend_R_GtoC_ = Eigen::Matrix3d::Identity();
+  double last_information_backend_timestamp_ = -1.0;
+  BackendUpdateDecision last_backend_update_decision_;
 
   /// [Landing watch] rolling (t, n_slam) for drop-rate detection
   std::deque<std::pair<double, int>> slam_count_history_;

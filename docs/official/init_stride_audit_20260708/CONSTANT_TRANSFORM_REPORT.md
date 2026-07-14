@@ -10,7 +10,7 @@ Date: 2026-07-08
 
 | Transform | Where | Applies to estimator state? | Notes |
 | --- | --- | --- | --- |
-| Camera/IMU fixed extrinsic `(R_ItoC,p_IinC)` | `ov_msckf/src/core/VioManagerOptions.h:352-359` | Yes, through visual measurement model. | Direction must be audited for configs that store `T_cam_imu`. |
+| Camera/IMU fixed extrinsic `(R_ItoC,p_IinC)` | `ov_msckf/src/core/VioManagerOptions.h:352-359` | Yes, through visual measurement model. | Fallback inversion exists at `opencv_yaml_parse.h:661-665`; keep a numeric two-key regression test. |
 | Dashboard `T_GV` yaw+translation | `ov_msckf/src/run_serial_msckf_ros_free.cpp:1593-1607` | No. | Visualization only; `traj.txt` remains raw. |
 | Offline start-heading yaw + first-sample translation | `analysis/full_flight_error_analysis.py:819-833` | No. | Official metrics alignment; must be labeled `vio_analysis_aligned_*`. |
 | GPS-Z XY diagnostic reference | `ov_msckf/src/run_serial_msckf_ros_free.cpp:2050-2058` | No XY fusion. | XY is diagnostic reference only; altitude path may update Z. |
@@ -39,4 +39,3 @@ and compare it against:
 - final plot coordinates.
 
 Only after this manual chain closes should a constant residual transform be fitted over a full flight.
-
