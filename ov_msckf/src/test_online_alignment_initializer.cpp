@@ -1014,6 +1014,8 @@ void test_r1_shadow_rebuilds_advancing_fixed_time_windows() {
   options.sliding_window_duration_s = 5.0;
   options.sliding_window_min_advance_s = 0.5;
   options.candidate_window_durations_s = {5.0};
+  options.alignment_frame_minimum_interval_s = 0.05;
+  options.alignment_target_compensated_parallax_px = 0.0;
   const SyntheticMotion motion;
   const Eigen::Matrix3d R_mount =
       Eigen::AngleAxisd(3.0 * kPi / 180.0, Eigen::Vector3d::UnitZ())
@@ -1080,6 +1082,7 @@ void test_r1_shadow_rebuilds_advancing_fixed_time_windows() {
   std::vector<double> previous_selected;
   int expected_invocation = 1;
   bool observed_warm_start = false;
+  bool observed_more_than_legacy_visual_cap = false;
   for (const auto &window : windows) {
     require(window.window_id == expected_invocation &&
                 window.optimizer_invocation_index == expected_invocation,
@@ -1108,6 +1111,8 @@ void test_r1_shadow_rebuilds_advancing_fixed_time_windows() {
                 window.ba.allFinite(),
             "R1 must record a finite q/p/v/bg/ba estimate per window");
     observed_warm_start = observed_warm_start || window.warm_start_used;
+    observed_more_than_legacy_visual_cap =
+        observed_more_than_legacy_visual_cap || window.visual_frame_count > 36;
     previous_begin = window.window_begin_timestamp;
     previous_end = window.window_end_timestamp;
     previous_selected = window.selected_frame_timestamps;
@@ -1115,6 +1120,9 @@ void test_r1_shadow_rebuilds_advancing_fixed_time_windows() {
   }
   require(observed_warm_start,
           "R1 later windows must warm start from the previous solution");
+  require(observed_more_than_legacy_visual_cap,
+          "R1 time window must retain all selected visual measurements instead "
+          "of truncating the raw buffer at the legacy 36-frame cap");
   require(initializer.last_diagnostics().nonlinear_solve_attempt_count ==
               static_cast<int>(windows.size()),
           "R1 diagnostics must expose every nonlinear invocation");

@@ -679,7 +679,15 @@ OnlineAlignmentInitializer::OnlineAlignmentInitializer(
   selector_config.minimum_common_tracks =
       std::max(4, options_.min_feature_tracks / 4);
   selector_config.maximum_selected_frames =
-      options_.maximum_selected_alignment_frames;
+      options_.sliding_window_shadow_only
+          ? std::max(
+                2, static_cast<int>(std::ceil(
+                       (maximum_window_duration_s_ + options_.buffer_margin_s +
+                        options_.max_time_offset_s) /
+                       std::max(1.0e-3,
+                                options_.alignment_frame_minimum_interval_s))) +
+                       2)
+          : options_.maximum_selected_alignment_frames;
   frame_selector_ = AlignmentFrameSelector(selector_config);
 
   if (!options_.sliding_window_shadow_only) {
@@ -1067,9 +1075,11 @@ bool OnlineAlignmentInitializer::feed_stereo(const StereoAlignmentFrame &frame) 
   if (selection.selected) {
     stereo_buffer_.push_back(std::move(buffered));
     ++selected_frame_serial_;
-    while (stereo_buffer_.size() > static_cast<size_t>(
-                                      options_.maximum_selected_alignment_frames))
-      stereo_buffer_.pop_front();
+    if (!options_.sliding_window_shadow_only) {
+      while (stereo_buffer_.size() > static_cast<size_t>(
+                                        options_.maximum_selected_alignment_frames))
+        stereo_buffer_.pop_front();
+    }
   }
   prune(frame.left_timestamp);
   return true;
