@@ -33,5 +33,7 @@ jobs:
           mkdir build
           cd build
           cmake ../ov_msckf/
-          make
-
+          cmake --build . -- -j12
+          ./test_p4_formal_factors
+          ./test_online_alignment_initializer
+          ./test_adaptive_stride
