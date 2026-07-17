@@ -26,13 +26,20 @@ jobs:
 #          cmake ..
 #          sudo make install
 #          cd ../../
+      - name: Restore compiler cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ${{ runner.os }}-rosfree-ccache-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-rosfree-ccache-
       - name: Configure and Build
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y libeigen3-dev libopencv-dev libboost-all-dev
+          sudo apt-get install -y ccache libeigen3-dev libopencv-dev libboost-all-dev
           mkdir build
           cd build
-          cmake ../ov_msckf/
+          cmake -DCMAKE_CXX_COMPILER_LAUNCHER=ccache ../ov_msckf/
           cmake --build . --parallel 4 --target \
             test_online_alignment_initializer
           ./test_online_alignment_initializer

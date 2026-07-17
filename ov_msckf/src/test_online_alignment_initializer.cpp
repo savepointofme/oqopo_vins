@@ -882,10 +882,49 @@ void test_pre_candidate_turn_flex_does_not_bias_initial_graph() {
 
   OnlineAlignmentResult result;
   const bool released = initializer.try_initialize(6.2, result);
-  require(!released && initializer.candidate_active(),
-          "pre-candidate flex stream must form a validation candidate: " +
+  require(!released && !initializer.candidate_active() &&
+              initializer.last_rejection() == "fc_residual_rms",
+          "window contaminated by pre-candidate flex must be rejected: " +
               initializer.last_rejection() + ", phase=" +
               ov_msckf::alignment_phase_name(initializer.phase()));
+
+  bool clean_candidate = false;
+  for (int tick = 1241; tick <= 2200 && !clean_candidate; ++tick) {
+    const double t = 0.005 * tick;
+    if (tick % 4 == 0) {
+      FCNavigationSample fc;
+      fc.timestamp = t;
+      fc.position_G = position_G(t);
+      fc.velocity_G = velocity_G(t);
+      fc.q_GtoF = ov_core::rot_2_quat(motion.rotation(t));
+      fc.navigation_frame = "G_nav";
+      fc.body_frame = "FC_body";
+      fc.position_valid = fc.velocity_valid = fc.attitude_valid =
+          fc.status_valid = true;
+      require(initializer.feed_fc_navigation(fc), "clean recovery FC feed");
+    }
+    BoardImuSample imu;
+    imu.timestamp = t;
+    imu.angular_velocity = omega_F(t);
+    imu.linear_acceleration =
+        motion.rotation(t) * (acceleration_G(t) + options.gravity_G);
+    imu.frame = "board_imu";
+    imu.status_valid = true;
+    require(initializer.feed_board_imu(imu), "clean recovery IMU feed");
+    if (tick % 20 == 0) {
+      const double camera_time = t - options.camera_to_imu_time_offset_s;
+      require(initializer.feed_stereo(make_stereo_frame(
+                  camera_time, motion, Eigen::Matrix3d::Identity(),
+                  options.camera_to_imu_time_offset_s, 0.0, frame_index++)),
+              "clean recovery visual feed");
+      require(!initializer.try_initialize(camera_time, result),
+              "clean recovery must freeze a candidate before release");
+      clean_candidate = initializer.candidate_active();
+    }
+  }
+  require(clean_candidate,
+          "sliding window must recover a clean validation candidate: " +
+              initializer.last_rejection());
   const auto &candidate = initializer.current_candidate().result;
   const Eigen::Matrix3d expected_R_GtoI =
       options.R_FtoI_declared *
