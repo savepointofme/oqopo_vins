@@ -33,7 +33,11 @@ jobs:
           mkdir build
           cd build
           cmake ../ov_msckf/
-          cmake --build . -- -j12
+          cmake --build . --parallel 4 --target \
+            run_serial_msckf_ros_free \
+            test_p4_formal_factors \
+            test_online_alignment_initializer \
+            test_adaptive_stride
           ./test_p4_formal_factors
           ./test_online_alignment_initializer
           ./test_adaptive_stride
