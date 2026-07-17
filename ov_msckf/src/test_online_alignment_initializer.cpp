@@ -834,6 +834,11 @@ void test_turn_flex_roll_pitch_is_diagnostic_while_yaw_is_control() {
 
 void test_pre_candidate_turn_flex_does_not_bias_initial_graph() {
   OnlineAlignmentOptions options = make_options();
+  options.formal_causal_lifecycle = true;
+  options.candidate_window_durations_s = {5.0};
+  options.reference_window_duration_s = 5.0;
+  options.max_initial_clones = 0;
+  options.max_initial_slam_features = 0;
   const SyntheticMotion motion;
   const double flex_rad = 20.0 * kPi / 180.0;
   OnlineAlignmentInitializer initializer(options);
@@ -876,10 +881,11 @@ void test_pre_candidate_turn_flex_does_not_bias_initial_graph() {
   }
 
   OnlineAlignmentResult result;
-  require(!initializer.try_initialize(6.2, result) &&
-              initializer.candidate_active(),
+  const bool released = initializer.try_initialize(6.2, result);
+  require(!released && initializer.candidate_active(),
           "pre-candidate flex stream must form a validation candidate: " +
-              initializer.last_rejection());
+              initializer.last_rejection() + ", phase=" +
+              ov_msckf::alignment_phase_name(initializer.phase()));
   const auto &candidate = initializer.current_candidate().result;
   const Eigen::Matrix3d expected_R_GtoI =
       options.R_FtoI_declared *
