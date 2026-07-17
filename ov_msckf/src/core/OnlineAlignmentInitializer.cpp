@@ -3601,7 +3601,7 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
     const double parallax_deg =
         std::acos(std::max(-1.0, std::min(
                                      1.0, previous_direction_G.dot(
-                                              current_direction_G))))) *
+                                              current_direction_G)))) *
         180.0 / kPi;
     if (!std::isfinite(baseline_m) || !std::isfinite(parallax_deg) ||
         baseline_m < options_.min_monocular_baseline_m ||
