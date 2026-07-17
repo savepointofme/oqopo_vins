@@ -322,7 +322,35 @@ int main() {
     assert(low_decision.tracking_gap < high_decision.tracking_gap);
   }
 
-  // 15. P4 frame selection remains a separate contract from P5 cadence.
+  // 15. VioManager's explicit termination input is derived from actual track
+  // survival and border occupancy, including cases where full motion geometry
+  // is unavailable.
+  {
+    VisualFrameSnapshot reference;
+    VisualFrameSnapshot healthy;
+    VisualFrameSnapshot terminating;
+    for (size_t id = 0; id < 40; ++id) {
+      VisualTrackPoint track;
+      track.feature_id = id;
+      track.raw = Eigen::Vector2d(100.0 + id, 100.0);
+      track.valid = true;
+      reference.tracks.push_back(track);
+      healthy.tracks.push_back(track);
+      if (id < 10)
+        terminating.tracks.push_back(track);
+    }
+    AdaptiveBackendScheduler scheduler;
+    assert(!backend_feature_termination_imminent(
+        reference, healthy, 640, 480, scheduler.config()));
+    assert(backend_feature_termination_imminent(
+        reference, terminating, 640, 480, scheduler.config()));
+    for (VisualTrackPoint &track : healthy.tracks)
+      track.raw = Eigen::Vector2d(2.0, 2.0);
+    assert(backend_feature_termination_imminent(
+        reference, healthy, 640, 480, scheduler.config()));
+  }
+
+  // 16. P4 frame selection remains a separate contract from P5 cadence.
   {
     AlignmentFrameSelector selector;
     AlignmentFrameSelectionInput input;

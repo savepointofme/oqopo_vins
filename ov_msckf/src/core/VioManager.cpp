@@ -3268,6 +3268,13 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
         last_information_backend_timestamp_;
     trigger_input.clone_capacity = state->_options.max_clone_size;
     trigger_input.initialized = true;
+    if (last_information_backend_timestamp_ >= 0.0) {
+      trigger_input.feature_termination_imminent =
+          backend_feature_termination_imminent(
+              last_backend_visual_snapshot_, current_backend_snapshot,
+              message.images.front().cols, message.images.front().rows,
+              backend_update_scheduler_.config());
+    }
     if (last_information_backend_timestamp_ >= 0.0 &&
         current_backend_snapshot_valid) {
       const Eigen::Matrix3d R_Ccurrent_Cbackend =
@@ -3357,9 +3364,9 @@ void VioManager::track_image_and_update(const ov_core::CameraData &message_const
   // If we do not have VIO initialization, then try to initialize
   // TODO: Or if we are trying to reset the system, then do that here!
   if (!is_initialized_vio) {
-    // The production low-dimensional P4 path deliberately starts from the
-    // upstream OpenVINS dynamic initializer. Legacy online graph modes remain
-    // fail-closed and may not fall back to an unrelated seed.
+    // Only the explicitly selected upstream-gauge experiment may use the
+    // ordinary OpenVINS initializer. Formal joint P4 remains uninitialized
+    // until its own atomic q/p/v/bg/ba plus covariance release.
     if (online_alignment_initializer_ != nullptr &&
         !online_alignment_initializer_->upstream_dynamic_init_fc_gauge()) {
       double time_track = (rT2 - rT1).total_microseconds() * 1e-6;
@@ -3501,8 +3508,10 @@ bool VioManager::configure_online_alignment(
   online_alignment_gauge_window_count_ = 0;
   if (configured.upstream_dynamic_init_fc_gauge) {
     PRINT_INFO(CYAN "[ONLINE-ALIGN] upstream OpenVINS dynamic initialization plus causal VIO/FC yaw-translation window enabled; metric scale is deferred to the independent AGL output postprocess; repeated joint Ceres disabled\n" RESET);
+  } else if (configured.formal_causal_lifecycle) {
+    PRINT_INFO(CYAN "[ONLINE-ALIGN] formal finite FC+IMU+epipolar joint initialization enabled; shared window biases, immutable causal holdout, one refinement, and atomic terminal release\n" RESET);
   } else {
-    PRINT_INFO(CYAN "[ONLINE-ALIGN] legacy causal FC + board-IMU + visual supervisor enabled; ordinary initializer fallback disabled\n" RESET);
+    PRINT_INFO(CYAN "[ONLINE-ALIGN] experimental causal FC + board-IMU + visual supervisor enabled; ordinary initializer fallback disabled\n" RESET);
   }
   return true;
 }

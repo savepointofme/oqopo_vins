@@ -371,9 +371,10 @@ void test_rejections_and_causal_recovery() {
   require(!candidate.result.released_to_openvins &&
               !candidate.selected_frame_timestamps.empty() &&
               !candidate.selected_feature_ids.empty() &&
-              !candidate.optimized_landmarks_G.empty() &&
+              candidate.optimized_landmarks_G.empty() &&
               candidate.solve_window_end > candidate.solve_window_start,
-          "AlignmentCandidate must retain its bounded solve snapshot and provenance");
+          "landmark-free AlignmentCandidate must retain its bounded solve "
+          "snapshot and provenance");
   const int solves_before_duplicate_try =
       initializer.last_diagnostics().nonlinear_solve_attempt_count;
   OnlineAlignmentResult pending_duplicate;
@@ -477,7 +478,7 @@ void test_rejections_and_causal_recovery() {
   require(!result.diagnostics.rejected_intervals.empty(),
           "high-angular-rate interval must be rejected and recorded");
   require(result.diagnostics.stereo_depths > 0,
-          "monocular multi-frame landmarks must be triangulated");
+          "monocular multi-frame epipolar pairs must be accepted");
   require(std::fabs(result.diagnostics.selected_window_duration_s - 5.0) <
               1e-9 &&
               result.diagnostics.keyframes <= options.max_keyframes,
@@ -603,6 +604,130 @@ void test_rejections_and_causal_recovery() {
           "one-shot counters must distinguish solve, release, and rejected post-release call");
 }
 
+void test_formal_candidate_holdout_and_single_refinement_release() {
+  OnlineAlignmentOptions options = make_options();
+  options.formal_causal_lifecycle = true;
+  options.candidate_window_durations_s = {5.0};
+  options.reference_window_duration_s = 5.0;
+  options.candidate_short_validation_duration_s = 2.0;
+  options.sliding_window_min_advance_s = 0.5;
+  options.max_initial_clones = 0;
+  options.max_initial_slam_features = 0;
+  const SyntheticMotion motion;
+  const Eigen::Matrix3d R_mount =
+      Eigen::AngleAxisd(3.0 * kPi / 180.0, Eigen::Vector3d::UnitZ())
+          .toRotationMatrix() *
+      Eigen::AngleAxisd(-2.0 * kPi / 180.0, Eigen::Vector3d::UnitY())
+          .toRotationMatrix();
+  const Eigen::Vector3d bg(0.012, -0.008, 0.006);
+  const Eigen::Vector3d ba(0.12, -0.08, 0.05);
+  const double attitude_offset = 0.024;
+  options.fc_board_calibration_locked = true;
+  options.R_FtoI_declared = R_mount;
+  options.fc_attitude_to_board_time_offset_s = attitude_offset;
+  options.fc_navigation_to_board_time_offset_s = 0.0;
+
+  OnlineAlignmentInitializer initializer(options);
+  int frame_index = 0;
+  const auto feed_tick = [&](int tick) {
+    const double board_time = 0.005 * tick;
+    if (tick % 4 == 0) {
+      FCNavigationSample fc;
+      fc.timestamp = board_time;
+      fc.position_G = position_G(board_time);
+      fc.velocity_G = velocity_G(board_time);
+      fc.q_GtoF = ov_core::rot_2_quat(motion.rotation(board_time));
+      fc.navigation_frame = "G_nav";
+      fc.body_frame = "FC_body";
+      fc.position_valid = fc.velocity_valid = fc.attitude_valid =
+          fc.status_valid = true;
+      require(initializer.feed_fc_navigation(fc), "formal FC feed");
+    }
+    const double fc_attitude_time =
+        std::max(0.0, board_time - attitude_offset);
+    BoardImuSample imu;
+    imu.timestamp = board_time;
+    imu.angular_velocity =
+        R_mount * omega_F(fc_attitude_time) + bg;
+    const Eigen::Matrix3d R_GtoI =
+        R_mount * motion.rotation(fc_attitude_time);
+    imu.linear_acceleration =
+        R_GtoI * (acceleration_G(fc_attitude_time) + options.gravity_G) + ba;
+    imu.frame = "board_imu";
+    imu.status_valid = true;
+    require(initializer.feed_board_imu(imu), "formal IMU feed");
+    if (tick % 20 == 0 && board_time >= 0.1) {
+      const double camera_time =
+          board_time - options.camera_to_imu_time_offset_s;
+      require(initializer.feed_stereo(make_stereo_frame(
+                  camera_time, motion, R_mount,
+                  options.camera_to_imu_time_offset_s, attitude_offset,
+                  frame_index++)),
+              "formal visual feed");
+    }
+  };
+
+  for (int tick = 0; tick <= 1240; ++tick)
+    feed_tick(tick);
+  OnlineAlignmentResult result;
+  require(!initializer.try_initialize(6.2, result) &&
+              initializer.candidate_active(),
+          "formal finite graph must freeze a candidate before release");
+  const double candidate_camera_time =
+      initializer.current_candidate().result.timestamp;
+  const int solves_at_candidate =
+      initializer.last_diagnostics().nonlinear_solve_attempt_count;
+  bool released = false;
+  for (int tick = 1241; tick <= 2200 && !released; ++tick) {
+    feed_tick(tick);
+    if (tick % 20 == 0) {
+      const double camera_time =
+          0.005 * tick - options.camera_to_imu_time_offset_s;
+      released = initializer.try_initialize(camera_time, result);
+    }
+  }
+
+  require(released && result.released_to_openvins,
+          "passed causal holdout must release the single refined graph");
+  require(result.diagnostics.formal_candidate_holdout_passed &&
+              result.diagnostics.formal_candidate_holdout_duration_s +
+                      1.0e-9 >=
+                  options.candidate_short_validation_duration_s &&
+              result.diagnostics.formal_refinement_release &&
+              result.diagnostics.candidate_refinement_count == 1,
+          "formal receipt must prove two-second holdout and exactly one "
+          "refinement: passed=" +
+              std::to_string(
+                  result.diagnostics.formal_candidate_holdout_passed) +
+              ", duration=" +
+              std::to_string(
+                  result.diagnostics.formal_candidate_holdout_duration_s) +
+              ", release=" +
+              std::to_string(result.diagnostics.formal_refinement_release) +
+              ", refinements=" +
+              std::to_string(
+                  result.diagnostics.candidate_refinement_count));
+  require(result.diagnostics.nonlinear_solve_attempt_count ==
+                  solves_at_candidate + 1 &&
+              !result.diagnostics.candidate_closed_loop_correction_applied &&
+              result.diagnostics.candidate_closed_loop_update_count == 0,
+          "holdout must not perform sequential FC feedback or extra solves");
+  require(result.timestamp > candidate_camera_time + 1.5 &&
+              result.diagnostics.decision_time >= result.timestamp,
+          "release must move to the current causal camera horizon");
+  require(result.diagnostics.shared_window_bias_model &&
+              result.diagnostics.visual_statistics
+                      .triangulated_landmark_count == 0 &&
+              result.diagnostics.visual_pairing_policy ==
+                  "one_maximum_time_baseline_pair_per_feature_no_pixel_reuse" &&
+              result.diagnostics.fc_terminal_increment_max_correlation > 0.0,
+          "formal graph topology and correlated FC model must be observable in diagnostics");
+  require(!initializer.attempt_receipts().empty() &&
+              initializer.attempt_receipts().back().outcome ==
+                  "formal_refined_release",
+          "final receipt must identify the one refined atomic release");
+}
+
 void feed_minimal_nonvisual_streams(OnlineAlignmentInitializer &initializer,
                                     const OnlineAlignmentOptions &options,
                                     bool include_stereo) {
@@ -707,8 +832,13 @@ void test_turn_flex_roll_pitch_is_diagnostic_while_yaw_is_control() {
           "FC yaw graph and holdout contract");
 }
 
-void test_pre_candidate_turn_flex_does_not_bias_initial_graph() {
+void test_pre_candidate_turn_flex_requires_clean_refinement_before_release() {
   OnlineAlignmentOptions options = make_options();
+  options.formal_causal_lifecycle = true;
+  options.candidate_window_durations_s = {5.0};
+  options.reference_window_duration_s = 5.0;
+  options.max_initial_clones = 0;
+  options.max_initial_slam_features = 0;
   const SyntheticMotion motion;
   const double flex_rad = 20.0 * kPi / 180.0;
   OnlineAlignmentInitializer initializer(options);
@@ -751,11 +881,75 @@ void test_pre_candidate_turn_flex_does_not_bias_initial_graph() {
   }
 
   OnlineAlignmentResult result;
-  require(!initializer.try_initialize(6.2, result) &&
-              initializer.candidate_active(),
-          "pre-candidate flex stream must form a validation candidate: " +
-              initializer.last_rejection());
-  const auto &candidate = initializer.current_candidate().result;
+  const bool released = initializer.try_initialize(6.2, result);
+  require(!released && !initializer.candidate_active() &&
+              initializer.last_rejection() == "fc_residual_rms",
+          "window contaminated by pre-candidate flex must be rejected: " +
+              initializer.last_rejection() + ", phase=" +
+              ov_msckf::alignment_phase_name(initializer.phase()));
+
+  bool saw_contaminated_frozen_candidate = false;
+  bool final_release = false;
+  for (int tick = 1241; tick <= 4000 && !final_release; ++tick) {
+    const double t = 0.005 * tick;
+    if (tick % 4 == 0) {
+      FCNavigationSample fc;
+      fc.timestamp = t;
+      fc.position_G = position_G(t);
+      fc.velocity_G = velocity_G(t);
+      fc.q_GtoF = ov_core::rot_2_quat(motion.rotation(t));
+      fc.navigation_frame = "G_nav";
+      fc.body_frame = "FC_body";
+      fc.position_valid = fc.velocity_valid = fc.attitude_valid =
+          fc.status_valid = true;
+      require(initializer.feed_fc_navigation(fc), "clean recovery FC feed");
+    }
+    BoardImuSample imu;
+    imu.timestamp = t;
+    imu.angular_velocity = omega_F(t);
+    imu.linear_acceleration =
+        motion.rotation(t) * (acceleration_G(t) + options.gravity_G);
+    imu.frame = "board_imu";
+    imu.status_valid = true;
+    require(initializer.feed_board_imu(imu), "clean recovery IMU feed");
+    if (tick % 20 == 0) {
+      const double camera_time = t - options.camera_to_imu_time_offset_s;
+      require(initializer.feed_stereo(make_stereo_frame(
+                  camera_time, motion, Eigen::Matrix3d::Identity(),
+                  options.camera_to_imu_time_offset_s, 0.0, frame_index++)),
+              "clean recovery visual feed");
+      final_release = initializer.try_initialize(camera_time, result);
+      if (initializer.candidate_active()) {
+        const auto &record = initializer.current_candidate();
+        saw_contaminated_frozen_candidate =
+            saw_contaminated_frozen_candidate ||
+            record.solve_window_start <= 3.5 + 1.0e-9;
+      }
+    }
+  }
+  require(saw_contaminated_frozen_candidate,
+          "test must exercise a frozen candidate whose solve window still "
+          "contains the transient flex");
+  require(final_release,
+          "formal holdout and refinement must eventually release from a "
+          "clean advanced window: " + initializer.last_rejection());
+  require(result.diagnostics.window_start > 3.5,
+          "released refinement window must no longer contain the transient "
+          "flex: window_start=" +
+              std::to_string(result.diagnostics.window_start));
+  require(result.diagnostics.formal_candidate_holdout_passed &&
+              result.diagnostics.formal_refinement_release &&
+              result.diagnostics.candidate_refinement_count == 1,
+          "transient recovery must use one immutable holdout and exactly one "
+          "advanced refinement");
+  const double released_mount_error_deg =
+      Eigen::AngleAxisd(result.R_FtoI_nominal *
+                        options.R_FtoI_declared.transpose())
+          .angle() *
+      180.0 / kPi;
+  require(released_mount_error_deg < 1.0e-9,
+          "transient FC flex must never modify the accepted external mount");
+  const auto &candidate = result;
   const Eigen::Matrix3d expected_R_GtoI =
       options.R_FtoI_declared *
       motion.rotation(candidate.timestamp + options.camera_to_imu_time_offset_s);
@@ -764,6 +958,33 @@ void test_pre_candidate_turn_flex_does_not_bias_initial_graph() {
   const double attitude_error_deg =
       Eigen::AngleAxisd(candidate_R_GtoI * expected_R_GtoI.transpose()).angle() *
       180.0 / kPi;
+  if (!(attitude_error_deg < 3.0)) {
+    const Eigen::AngleAxisd attitude_error(
+        candidate_R_GtoI * expected_R_GtoI.transpose());
+    const FactorContribution *fc_factor =
+        find_factor(candidate.diagnostics, "fc_pose_velocity_attitude");
+    const FactorContribution *imu_factor =
+        find_factor(candidate.diagnostics, "imu_preintegration");
+    const FactorContribution *visual_factor =
+        find_factor(candidate.diagnostics, "visual_reprojection");
+    std::cerr << "formal clean-window attitude diagnostics: release_t="
+              << candidate.timestamp
+              << " window=[" << candidate.diagnostics.window_start << ","
+              << candidate.diagnostics.init_time << "] error_axis="
+              << attitude_error.axis().transpose()
+              << " error_deg=" << attitude_error_deg
+              << " fc_rms="
+              << (fc_factor != nullptr ? fc_factor->residual_rms : -1.0)
+              << " imu_rms="
+              << (imu_factor != nullptr ? imu_factor->residual_rms : -1.0)
+              << " visual_rms="
+              << (visual_factor != nullptr ? visual_factor->residual_rms
+                                           : -1.0)
+              << " terminal_fc_norm="
+              << candidate.diagnostics.fc_terminal_max_normalized_residual
+              << " bg=" << candidate.bg.transpose()
+              << " ba=" << candidate.ba.transpose() << std::endl;
+  }
   require(attitude_error_deg < 3.0,
           "turn flex before candidate formation must not bias initial graph "
           "attitude: " + std::to_string(attitude_error_deg) + " deg");
@@ -1206,8 +1427,9 @@ void test_r1_shadow_rebuilds_advancing_fixed_time_windows() {
         const auto &receipt = initializer.attempt_receipts().back();
         require(
             fc_factor != nullptr &&
-                fc_factor->residual_blocks ==
-                    2 * receipt.selected_keyframe_count &&
+                fc_factor->residual_blocks == 1 &&
+                fc_factor->residual_dimension ==
+                    9 * receipt.selected_keyframe_count &&
                 shadow.diagnostics.fc_attitude_gauge_factor_count == 1 &&
                 shadow.diagnostics.fc_position_velocity_factor_count ==
                     receipt.selected_keyframe_count &&
@@ -1215,7 +1437,7 @@ void test_r1_shadow_rebuilds_advancing_fixed_time_windows() {
                               .fc_position_velocity_time_weight_sum -
                           1.0) < 1.0e-12 &&
                 shadow.diagnostics.fc_position_velocity_weight_model ==
-                    "terminal_absolute_plus_density_invariant_increments" &&
+                    "single_dense_terminal_plus_correlated_increments" &&
                 std::fabs(
                     shadow.diagnostics.fc_attitude_gauge_anchor_timestamp_s -
                     receipt.selected_frame_timestamps.back()) < 1.0e-9 &&
@@ -1223,8 +1445,8 @@ void test_r1_shadow_rebuilds_advancing_fixed_time_windows() {
                     shadow.diagnostics.fc_terminal_max_normalized_residual) &&
                 shadow.diagnostics.fc_terminal_max_normalized_residual <=
                     options.navigation_max_fc_residual_rms,
-            "each R1 graph must preserve a full terminal FC boundary and use "
-            "density-invariant FC trajectory increments");
+            "each R1 graph must preserve one dense FC trajectory factor with "
+            "a full terminal boundary and correlated increments");
       }
     }
   }
@@ -1251,10 +1473,9 @@ void test_r1_shadow_rebuilds_advancing_fixed_time_windows() {
                 window.optimizer_invocation_index == expected_invocation &&
                 window.optimizer_invocation_count == 1,
             "R1 windows must contain one standard dynamic graph solve");
-    require(!window.shared_window_bias_model &&
+    require(window.shared_window_bias_model &&
                 !window.staged_solver_enabled,
-            "R1 receipts must prove per-keyframe bias topology replaced the "
-            "shared-bias staged solve");
+            "R1 receipts must prove one shared bg/ba pair and one joint solve");
     require(std::fabs((window.window_end_timestamp -
                        window.window_begin_timestamp) -
                       options.sliding_window_duration_s) < 1.0e-6,
@@ -1401,8 +1622,8 @@ void test_direct_sliding_release_uses_overlap_time_not_event_count() {
           "serial copies of the same maturation duration");
   require(released.initial_clones.size() >= 4,
           "direct release must carry a mature historical pose window");
-  require(!released.initial_landmarks.empty(),
-          "direct release must carry persistent graph landmarks");
+  require(released.initial_landmarks.empty(),
+          "landmark-free graph must not transfer nuisance visual states");
   require(released.initial_joint_covariance.rows() ==
               15 + 6 * static_cast<Eigen::Index>(
                            released.initial_clones.size()) +
@@ -1512,13 +1733,14 @@ void test_upstream_dynamic_mode_builds_only_causal_fc_gauge_targets() {
 
 int main() {
   test_rejections_and_causal_recovery();
+  test_formal_candidate_holdout_and_single_refinement_release();
   test_no_visual_fail_closed();
   test_practical_navigation_start_with_weak_alignment();
   test_missing_full_flight_calibration_fails_closed();
   test_collection_persists_beyond_sixty_seconds_with_bounded_buffers();
   test_strict_policy_accepts_external_mount_calibration();
   test_turn_flex_roll_pitch_is_diagnostic_while_yaw_is_control();
-  test_pre_candidate_turn_flex_does_not_bias_initial_graph();
+  test_pre_candidate_turn_flex_requires_clean_refinement_before_release();
   test_candidate_deadline_refines_only_on_new_window();
   test_no_visual_navigation_control();
   test_perturbed_visual_tracks_change_decision();

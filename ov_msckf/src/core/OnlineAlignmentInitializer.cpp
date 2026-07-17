@@ -4,6 +4,9 @@
 #include "ceres/Factor_ImageReprojCalib.h"
 #include "ceres/Factor_ImuCPIv1.h"
 #include "ceres/State_JPLQuatLocal.h"
+#include "core/p4/factors/Factor_P4Epipolar.h"
+#include "core/p4/factors/Factor_P4FcTrajectory.h"
+#include "core/p4/factors/Factor_P4ImuSharedBias.h"
 #include "cpi/CpiV1.h"
 #include "utils/quat_ops.h"
 
@@ -799,6 +802,29 @@ OnlineAlignmentInitializer::OnlineAlignmentInitializer(
     last_rejection_ = "locked_full_flight_fc_board_calibration_required";
     phase_ = AlignmentPhase::FATAL_CONFIGURATION_ERROR;
   }
+  if (options_.formal_causal_lifecycle &&
+      (!(options_.fc_process_variance_fraction > 0.0) ||
+       !(options_.fc_process_variance_fraction < 1.0))) {
+    fatal_configuration_error_ = true;
+    last_rejection_ =
+        "formal_fc_process_variance_fraction_must_be_between_zero_and_one";
+    phase_ = AlignmentPhase::FATAL_CONFIGURATION_ERROR;
+  }
+  if (options_.formal_causal_lifecycle &&
+      (options_.upstream_dynamic_init_fc_gauge ||
+       options_.sliding_window_shadow_only ||
+       options_.sliding_window_direct_state_release ||
+       options_.sliding_window_deferred_release_certification ||
+       options_.diagnostic_release_attitude_from_fc ||
+       options_.diagnostic_release_graph_attitude_fc_pv_zero_bias ||
+       !options_.candidate_refinement_enabled ||
+       options_.max_initial_clones != 0 ||
+       options_.max_initial_slam_features != 0)) {
+    fatal_configuration_error_ = true;
+    last_rejection_ =
+        "formal_lifecycle_must_be_terminal_only_and_mutually_exclusive";
+    phase_ = AlignmentPhase::FATAL_CONFIGURATION_ERROR;
+  }
   options_.max_time_offset_s = std::max(
       std::fabs(options_.fc_attitude_to_board_time_offset_s),
       std::fabs(options_.fc_navigation_to_board_time_offset_s));
@@ -820,7 +846,8 @@ OnlineAlignmentInitializer::OnlineAlignmentInitializer(
              2);
   frame_selector_ = AlignmentFrameSelector(selector_config);
 
-  if (!options_.sliding_window_shadow_only &&
+  if (!options_.formal_causal_lifecycle &&
+      !options_.sliding_window_shadow_only &&
       !options_.upstream_dynamic_init_fc_gauge) {
     options_.candidate_filter_config.gravity_G = options_.gravity_G;
     options_.candidate_filter_config.noise.sigma_w = options_.imu_sigma_w;
@@ -906,6 +933,21 @@ void OnlineAlignmentInitializer::copy_runtime_counters(
 
 void OnlineAlignmentInitializer::fail_retry(double stream_time,
                                             const std::string &reason) {
+  // Once a formal refinement enters the nonlinear solver, it is the one
+  // bounded refinement allowed by the lifecycle. A failed solve returns to a
+  // fresh sliding-window candidate; it must not become a second refinement of
+  // the old candidate. While force_refinement_solve_ remains true we are only
+  // waiting for an advanced, support-complete window, so nothing is consumed.
+  if (options_.formal_causal_lifecycle && formal_refinement_pending_ &&
+      !force_refinement_solve_) {
+    formal_refinement_pending_ = false;
+    formal_candidate_camera_time_ = -1.0;
+    formal_candidate_holdout_fc_samples_ = 0;
+    formal_candidate_holdout_imu_samples_ = 0;
+    formal_candidate_holdout_visual_frames_ = 0;
+    formal_candidate_holdout_duration_s_ = 0.0;
+    ++candidate_rejected_count_;
+  }
   last_rejection_ = reason;
   ++retry_count_;
   if (navigation_released_)
@@ -1166,8 +1208,15 @@ bool OnlineAlignmentInitializer::feed_stereo(const StereoAlignmentFrame &frame) 
           options_.visual_perturbation_px * std::sin(phase),
           options_.visual_perturbation_px * std::cos(1.7 * phase));
       observation.raw_left += perturbation;
-      if (observation.right_valid)
+      observation.normalized_left += Eigen::Vector2d(
+          perturbation.x() / options_.camera_intrinsics[0](0),
+          perturbation.y() / options_.camera_intrinsics[0](1));
+      if (observation.right_valid) {
         observation.raw_right += perturbation;
+        observation.normalized_right += Eigen::Vector2d(
+            perturbation.x() / options_.camera_intrinsics[1](0),
+            perturbation.y() / options_.camera_intrinsics[1](1));
+      }
     }
   }
   const VisualFrameSnapshot snapshot = make_visual_snapshot(buffered);
@@ -1269,6 +1318,12 @@ void OnlineAlignmentInitializer::reset() {
   previous_tracking_snapshot_ = VisualFrameSnapshot();
   previous_tracking_snapshot_valid_ = false;
   candidate_active_ = false;
+  formal_refinement_pending_ = false;
+  formal_candidate_camera_time_ = -1.0;
+  formal_candidate_holdout_fc_samples_ = 0;
+  formal_candidate_holdout_imu_samples_ = 0;
+  formal_candidate_holdout_visual_frames_ = 0;
+  formal_candidate_holdout_duration_s_ = 0.0;
   candidate_filter_.reset();
   candidate_record_ = AlignmentCandidate();
   candidate_result_ = AlignmentResult();
@@ -1379,6 +1434,12 @@ void OnlineAlignmentInitializer::reject_candidate(
   candidate_filter_.reset();
   candidate_record_ = AlignmentCandidate();
   candidate_visual_snapshots_.clear();
+  formal_refinement_pending_ = false;
+  formal_candidate_camera_time_ = -1.0;
+  formal_candidate_holdout_fc_samples_ = 0;
+  formal_candidate_holdout_imu_samples_ = 0;
+  formal_candidate_holdout_visual_frames_ = 0;
+  formal_candidate_holdout_duration_s_ = 0.0;
   ++candidate_rejected_count_;
   last_rejection_ = reason;
   if (request_refinement && options_.candidate_refinement_enabled &&
@@ -1510,6 +1571,290 @@ bool OnlineAlignmentInitializer::advance_candidate_filter(
   }
 
   return propagate_to(target_board_time);
+}
+
+bool OnlineAlignmentInitializer::validate_formal_candidate(
+    double now, AlignmentResult &result) {
+  (void)result;
+  if (!candidate_active_ || !std::isfinite(formal_candidate_camera_time_))
+    return false;
+
+  OnlineAlignmentDiagnostics diagnostics = candidate_result_.diagnostics;
+  const double earliest_fc_offset =
+      std::min(candidate_result_.fc_attitude_to_board_time_offset_s,
+               candidate_result_.fc_navigation_to_board_time_offset_s);
+  double supported_camera_time = now;
+  if (!imu_buffer_.empty())
+    supported_camera_time = std::min(
+        supported_camera_time,
+        imu_buffer_.back().timestamp - options_.camera_to_imu_time_offset_s);
+  if (!fc_buffer_.empty())
+    supported_camera_time = std::min(
+        supported_camera_time,
+        fc_buffer_.back().timestamp + earliest_fc_offset -
+            options_.camera_to_imu_time_offset_s);
+  if (!candidate_visual_snapshots_.empty())
+    supported_camera_time =
+        std::min(supported_camera_time,
+                 candidate_visual_snapshots_.back().timestamp);
+
+  const double candidate_board_time =
+      formal_candidate_camera_time_ + options_.camera_to_imu_time_offset_s;
+  const double supported_board_time =
+      supported_camera_time + options_.camera_to_imu_time_offset_s;
+  std::vector<const FCNavigationSample *> holdout_fc;
+  std::vector<const BoardImuSample *> holdout_imu;
+  std::vector<const StereoAlignmentFrame *> holdout_visual;
+  for (const auto &sample : fc_buffer_) {
+    const double board_time =
+        sample.timestamp + options_.fc_navigation_to_board_time_offset_s;
+    if (board_time > candidate_board_time + 1.0e-9 &&
+        board_time <= supported_board_time + 1.0e-9)
+      holdout_fc.push_back(&sample);
+  }
+  for (const auto &sample : imu_buffer_)
+    if (sample.timestamp > candidate_board_time + 1.0e-9 &&
+        sample.timestamp <= supported_board_time + 1.0e-9)
+      holdout_imu.push_back(&sample);
+  for (const auto &frame : stereo_buffer_)
+    if (frame.left_timestamp > formal_candidate_camera_time_ + 1.0e-9 &&
+        frame.left_timestamp <= supported_camera_time + 1.0e-9)
+      holdout_visual.push_back(&frame);
+
+  formal_candidate_holdout_fc_samples_ =
+      static_cast<int>(holdout_fc.size());
+  formal_candidate_holdout_imu_samples_ =
+      static_cast<int>(holdout_imu.size());
+  formal_candidate_holdout_visual_frames_ =
+      static_cast<int>(holdout_visual.size());
+  diagnostics.formal_candidate_holdout_fc_samples =
+      formal_candidate_holdout_fc_samples_;
+  diagnostics.formal_candidate_holdout_imu_samples =
+      formal_candidate_holdout_imu_samples_;
+  diagnostics.formal_candidate_holdout_visual_frames =
+      formal_candidate_holdout_visual_frames_;
+  diagnostics.formal_candidate_holdout_duration_s =
+      std::max(0.0, supported_camera_time - formal_candidate_camera_time_);
+  formal_candidate_holdout_duration_s_ =
+      diagnostics.formal_candidate_holdout_duration_s;
+
+  bool visual_tracking_health = false;
+  if (!candidate_visual_snapshots_.empty()) {
+    const VisualFrameSnapshot &latest = candidate_visual_snapshots_.back();
+    const Eigen::Matrix3d relative_rotation = relative_camera_rotation(
+        candidate_reference_snapshot_.timestamp, latest.timestamp);
+    const VisualMotionMetrics motion = compute_visual_motion_metrics(
+        candidate_reference_snapshot_, latest, relative_rotation,
+        options_.camera_intrinsics[0](0), options_.camera_intrinsics[0](1));
+    const int minimum_common_tracks =
+        std::max(8, options_.min_feature_tracks / 4);
+    visual_tracking_health =
+        motion.valid && motion.common_tracks >= minimum_common_tracks &&
+        std::isfinite(motion.compensated_p95_px);
+    diagnostics.candidate_visual_compensated_p95_px =
+        motion.compensated_p95_px;
+    diagnostics.candidate_validation_frames =
+        static_cast<int>(candidate_visual_snapshots_.size());
+  }
+
+  // Propagate the frozen candidate with held-out IMU only.  FC samples are
+  // evaluated at the causal endpoint but are never fed back into the state.
+  // This makes the holdout a real candidate check rather than merely a stream
+  // availability timer.
+  bool state_health = false;
+  CandidateNominalState propagated;
+  propagated.R_GtoI = ov_core::quat_2_Rot(candidate_result_.q_GtoI);
+  propagated.p_IinG = candidate_result_.p_IinG;
+  propagated.v_IinG = candidate_result_.v_IinG;
+  propagated.bg = candidate_result_.bg;
+  propagated.ba = candidate_result_.ba;
+  std::vector<BoardImuSample> propagation_imu;
+  if (supported_board_time > candidate_board_time + 1.0e-9 &&
+      interval_imu_samples(imu_buffer_, candidate_board_time,
+                           supported_board_time, propagation_imu)) {
+    bool propagation_valid = true;
+    for (std::size_t index = 1; index < propagation_imu.size(); ++index) {
+      const BoardImuSample &previous = propagation_imu[index - 1];
+      const BoardImuSample &current = propagation_imu[index];
+      const double dt = current.timestamp - previous.timestamp;
+      if (!(dt > 0.0) || dt > options_.max_imu_gap_s + 1.0e-9) {
+        propagation_valid = false;
+        break;
+      }
+      const Eigen::Vector3d omega =
+          0.5 * (previous.angular_velocity + current.angular_velocity) -
+          propagated.bg;
+      const Eigen::Vector3d specific_force =
+          0.5 * (previous.linear_acceleration + current.linear_acceleration) -
+          propagated.ba;
+      const Eigen::Matrix3d midpoint_rotation =
+          ov_core::exp_so3(-0.5 * omega * dt) * propagated.R_GtoI;
+      const Eigen::Vector3d acceleration_G =
+          midpoint_rotation.transpose() * specific_force - options_.gravity_G;
+      propagated.p_IinG +=
+          propagated.v_IinG * dt + 0.5 * acceleration_G * dt * dt;
+      propagated.v_IinG += acceleration_G * dt;
+      propagated.R_GtoI =
+          ov_core::exp_so3(-omega * dt) * propagated.R_GtoI;
+    }
+
+    FCNavigationSample fc_attitude;
+    FCNavigationSample fc_navigation;
+    Eigen::Vector3d omega_F = Eigen::Vector3d::Zero();
+    const double fc_attitude_time =
+        supported_board_time -
+        candidate_result_.fc_attitude_to_board_time_offset_s;
+    const double fc_navigation_time =
+        supported_board_time -
+        candidate_result_.fc_navigation_to_board_time_offset_s;
+    if (propagation_valid &&
+        interpolate_fc(fc_buffer_, fc_attitude_time, fc_attitude) &&
+        interpolate_fc(fc_buffer_, fc_navigation_time, fc_navigation) &&
+        fc_angular_rate_at(fc_buffer_, fc_attitude_time,
+                           options_.max_fc_gap_s, omega_F)) {
+      const Eigen::Matrix3d R_GtoF =
+          ov_core::quat_2_Rot(fc_attitude.q_GtoF);
+      const Eigen::Matrix3d fc_implied_R =
+          candidate_result_.R_FtoI_nominal * R_GtoF;
+      const Eigen::Vector3d target_position =
+          fc_navigation.position_G +
+          R_GtoF.transpose() * options_.p_IinF;
+      const Eigen::Vector3d target_velocity =
+          fc_navigation.velocity_G +
+          R_GtoF.transpose() * omega_F.cross(options_.p_IinF);
+      const double attitude_residual_deg =
+          rotation_angle(propagated.R_GtoI * fc_implied_R.transpose()) *
+          180.0 / kPi;
+      const double position_residual_m =
+          (propagated.p_IinG - target_position).norm();
+      const double velocity_residual_mps =
+          (propagated.v_IinG - target_velocity).norm();
+      diagnostics.candidate_fc_imu_rotation_residual_deg =
+          attitude_residual_deg;
+      diagnostics.candidate_relative_position_residual_m =
+          position_residual_m;
+      diagnostics.candidate_relative_velocity_residual_mps =
+          velocity_residual_mps;
+      last_candidate_rotation_residual_deg_ = attitude_residual_deg;
+      last_candidate_position_residual_m_ = position_residual_m;
+      last_candidate_velocity_residual_mps_ = velocity_residual_mps;
+      state_health =
+          std::isfinite(attitude_residual_deg) &&
+          std::isfinite(position_residual_m) &&
+          std::isfinite(velocity_residual_mps) &&
+          attitude_residual_deg <=
+              options_.candidate_max_fc_imu_rotation_residual_deg &&
+          position_residual_m <=
+              options_.candidate_max_relative_position_residual_m &&
+          velocity_residual_mps <=
+              options_.candidate_max_relative_velocity_residual_mps;
+    }
+  }
+
+  bool visual_health = false;
+  if (visual_tracking_health && !candidate_visual_snapshots_.empty()) {
+    const VisualFrameSnapshot &latest = candidate_visual_snapshots_.back();
+    std::map<size_t, const VisualTrackPoint *> latest_tracks;
+    for (const auto &track : latest.tracks)
+      if (track.valid && track.normalized.allFinite())
+        latest_tracks[track.feature_id] = &track;
+    const double average_focal = std::sqrt(std::max(
+        1.0, options_.camera_intrinsics[0](0) *
+                 options_.camera_intrinsics[0](1)));
+    const double normalized_sigma =
+        options_.visual_pixel_sigma / average_focal;
+    Eigen::Vector4d q_start = candidate_result_.q_GtoI;
+    Eigen::Vector3d p_start = candidate_result_.p_IinG;
+    Eigen::Vector4d q_end = ov_core::rot_2_quat(propagated.R_GtoI);
+    Eigen::Vector3d p_end = propagated.p_IinG;
+    const double *parameters[4] = {q_start.data(), p_start.data(),
+                                   q_end.data(), p_end.data()};
+    std::vector<double> epipolar_residuals_px;
+    for (const auto &reference : candidate_reference_snapshot_.tracks) {
+      const auto found = latest_tracks.find(reference.feature_id);
+      if (!reference.valid || !reference.normalized.allFinite() ||
+          found == latest_tracks.end())
+        continue;
+      p4::Factor_P4Epipolar factor(
+          reference.normalized, found->second->normalized,
+          ov_core::quat_2_Rot(options_.q_ItoC[0]), options_.p_IinC[0],
+          normalized_sigma);
+      double residual = 0.0;
+      if (factor.Evaluate(parameters, &residual, nullptr) &&
+          std::isfinite(residual))
+        epipolar_residuals_px.push_back(
+            std::fabs(residual) * options_.visual_pixel_sigma);
+    }
+    const double epipolar_p95_px =
+        percentile(epipolar_residuals_px, 0.95);
+    diagnostics.candidate_visual_reprojection_p95_px = epipolar_p95_px;
+    candidate_latest_visual_reprojection_p95_px_ = epipolar_p95_px;
+    last_candidate_visual_p95_px_ = epipolar_p95_px;
+    visual_health =
+        epipolar_residuals_px.size() >=
+            static_cast<std::size_t>(
+                std::max(8, options_.min_feature_tracks / 4)) &&
+        std::isfinite(epipolar_p95_px) &&
+        epipolar_p95_px <=
+            options_.candidate_reject_visual_reprojection_p95_px;
+  }
+
+  const bool duration_complete =
+      diagnostics.formal_candidate_holdout_duration_s + 1.0e-9 >=
+      options_.candidate_short_validation_duration_s;
+  const bool stream_support =
+      holdout_fc.size() >= 2 && holdout_imu.size() >= 2 &&
+      holdout_visual.size() >= 2 &&
+      max_gap(holdout_fc) <= options_.max_fc_gap_s &&
+      max_gap(holdout_imu) <= options_.max_imu_gap_s &&
+      stereo_max_gap(holdout_visual) <= options_.max_stereo_gap_s;
+  const bool holdout_passed =
+      duration_complete && stream_support && visual_health && state_health;
+  diagnostics.formal_candidate_holdout_passed = holdout_passed;
+  copy_runtime_counters(diagnostics);
+
+  if (!holdout_passed) {
+    const double deadline =
+        options_.candidate_short_validation_duration_s +
+        std::max(options_.max_fc_gap_s, options_.max_stereo_gap_s);
+    if (diagnostics.formal_candidate_holdout_duration_s + 1.0e-9 >=
+        deadline) {
+      reject_candidate(now, "formal_candidate_causal_holdout_failed", false);
+      diagnostics.readiness_reason =
+          "formal_candidate_causal_holdout_failed";
+    } else {
+      diagnostics.readiness = AlignmentReadiness::NOT_READY;
+      diagnostics.readiness_reason = duration_complete
+                                         ? "formal_candidate_waiting_for_holdout_quality"
+                                         : "formal_candidate_short_causal_hold_pending";
+      transition(AlignmentPhase::CANDIDATE_VALIDATING, now,
+                 diagnostics.readiness_reason);
+      last_rejection_ = diagnostics.readiness_reason;
+    }
+    diagnostics.state_transitions = transitions_;
+    last_diagnostics_ = diagnostics;
+    return false;
+  }
+
+  // Validation never mutates the candidate and never performs sequential FC
+  // feedback.  Its only success action is to permit one solve on the newly
+  // advanced current window.  That refinement owns the release covariance and
+  // moves the injected state to the current camera horizon.
+  candidate_active_ = false;
+  formal_refinement_pending_ = true;
+  force_refinement_solve_ = true;
+  ++candidate_refinement_count_;
+  diagnostics.candidate_closed_loop_refinement_applied = false;
+  diagnostics.readiness = AlignmentReadiness::NOT_READY;
+  diagnostics.readiness_reason =
+      "formal_candidate_holdout_passed_refinement_pending";
+  transition(AlignmentPhase::CANDIDATE_REFINING, now,
+             diagnostics.readiness_reason);
+  diagnostics.state_transitions = transitions_;
+  copy_runtime_counters(diagnostics);
+  last_diagnostics_ = diagnostics;
+  last_rejection_ = diagnostics.readiness_reason;
+  return false;
 }
 
 bool OnlineAlignmentInitializer::validate_candidate(double now,
@@ -2503,8 +2848,11 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
                           : "alignment_window_closed_explicit_reset_required";
     return false;
   }
-  if (candidate_active_ && !options_.sliding_window_shadow_only)
+  if (candidate_active_ && !options_.sliding_window_shadow_only) {
+    if (options_.formal_causal_lifecycle)
+      return validate_formal_candidate(now, result);
     return validate_candidate(now, result);
+  }
   const auto wall_start = std::chrono::steady_clock::now();
   last_diagnostics_ = OnlineAlignmentDiagnostics();
   last_diagnostics_.solve_time = now;
@@ -2959,8 +3307,8 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
         window_warm_start_used = true;
       } else if (!previous_window_states_.empty()) {
         // A new tail state has no previous-window timestamp support. Its
-        // The new tail state retains the current FC q/p/v seed and the previous
-        // terminal bias seed; the IMU chain will refine both endpoint biases.
+        // q/p/v retain the current FC seed; the complete CPI chain refines the
+        // one shared window bg/ba pair declared below.
         window_warm_start_used = true;
       }
     }
@@ -2969,6 +3317,11 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
     fc_navigation_at_state.push_back(fc_navigation_state);
   }
 
+  std::array<double, 3> shared_bg;
+  std::array<double, 3> shared_ba;
+  assign(shared_bg, bg_seed);
+  assign(shared_ba, ba_seed);
+
   ceres::Problem problem;
   FactorFamilies families;
   for (auto &state : states) {
@@ -2976,9 +3329,9 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
                               new ov_init::State_JPLQuatLocal());
     problem.AddParameterBlock(state.p.data(), 3);
     problem.AddParameterBlock(state.v.data(), 3);
-    problem.AddParameterBlock(state.bg.data(), 3);
-    problem.AddParameterBlock(state.ba.data(), 3);
   }
+  problem.AddParameterBlock(shared_bg.data(), 3);
+  problem.AddParameterBlock(shared_ba.data(), 3);
   std::array<double, 4> mount_q;
   assign(mount_q, ov_core::rot_2_quat(best_fit.R_FtoI));
   problem.AddParameterBlock(mount_q.data(), 4,
@@ -2996,9 +3349,9 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
   auto *ba_prior = new VectorPriorCost(new VectorPriorFunctor(
       Eigen::Vector3d::Zero(), options_.accel_bias_prior_sigma_mps2));
   families.prior.push_back(problem.AddResidualBlock(
-      bg_prior, nullptr, states.front().bg.data()));
+      bg_prior, nullptr, shared_bg.data()));
   families.prior.push_back(problem.AddResidualBlock(
-      ba_prior, nullptr, states.front().ba.data()));
+      ba_prior, nullptr, shared_ba.data()));
 
   // Preserve the synchronized terminal navigation row with its full declared
   // uncertainty. Earlier FC rows are outputs of the same navigation filter and
@@ -3047,92 +3400,111 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
     fc_target_rates.push_back(omega_F);
   }
 
-  if (options_.fc_attitude_gauge_factor_enabled) {
-    auto *terminal_attitude_cost = new QuaternionPriorCost(
-        new QuaternionPriorFunctor(
-            fc_target_rotations.back(),
-            options_.fc_attitude_sigma_deg * kPi / 180.0));
-    families.fc.push_back(problem.AddResidualBlock(
-        terminal_attitude_cost, nullptr, states.back().q.data()));
-    const double terminal_board_time =
-        states.back().camera_time + options_.camera_to_imu_time_offset_s;
-    BoardImuSample terminal_imu;
-    double terminal_rate_residual =
-        std::numeric_limits<double>::infinity();
-    if (interpolate_imu(causal_imu_buffer, terminal_board_time,
-                        terminal_imu)) {
-      terminal_rate_residual =
-          (terminal_imu.angular_velocity -
-           best_fit.R_FtoI * fc_target_rates.back() - best_fit.bg)
-              .norm();
-    }
-    diag.fc_attitude_gauge_factor_enabled = true;
-    diag.fc_attitude_gauge_factor_count = 1;
-    diag.fc_attitude_gauge_anchor_timestamp_s =
-        states.back().camera_time;
-    diag.fc_attitude_gauge_anchor_rate_rad_s =
-        fc_target_rates.back().norm();
-    diag.fc_attitude_gauge_anchor_rate_residual_rad_s =
-        terminal_rate_residual;
-    diag.fc_attitude_gauge_sigma_deg = options_.fc_attitude_sigma_deg;
+  const double terminal_board_time =
+      states.back().camera_time + options_.camera_to_imu_time_offset_s;
+  BoardImuSample terminal_imu;
+  double terminal_rate_residual = std::numeric_limits<double>::infinity();
+  if (interpolate_imu(causal_imu_buffer, terminal_board_time, terminal_imu)) {
+    terminal_rate_residual =
+        (terminal_imu.angular_velocity -
+         best_fit.R_FtoI * fc_target_rates.back() - best_fit.bg)
+            .norm();
   }
 
-  auto *terminal_navigation_cost = new FCObservationCost(
-      new FCObservationFunctor(
-          fc_target_positions.back(), fc_target_velocities.back(),
-          options_.fc_position_sigma_m, options_.fc_velocity_sigma_mps));
-  families.fc.push_back(problem.AddResidualBlock(
-      terminal_navigation_cost, nullptr, states.back().p.data(),
-      states.back().v.data()));
-
-  double increment_time_fraction_sum = 0.0;
-  for (size_t i = 1; i < states.size(); ++i) {
-    const double dt = states[i].camera_time - states[i - 1].camera_time;
-    const double time_fraction = dt / fc_window_span_s;
-    if (!(dt > 1.0e-9) || !std::isfinite(time_fraction) ||
-        !(time_fraction > 0.0)) {
-      fail_retry(now, "fc_increment_interval");
-      return false;
-    }
-    increment_time_fraction_sum += time_fraction;
-    const double sqrt_fraction = std::sqrt(time_fraction);
-    if (options_.fc_attitude_gauge_factor_enabled) {
-      auto *attitude_increment_cost = new FCAttitudeIncrementCost(
-          new FCAttitudeIncrementFunctor(
-              fc_target_rotations[i - 1], fc_target_rotations[i],
-              options_.fc_attitude_sigma_deg * kPi / 180.0 *
-                  sqrt_fraction));
-      families.fc.push_back(problem.AddResidualBlock(
-          attitude_increment_cost, new ceres::CauchyLoss(2.0),
-          states[i - 1].q.data(), states[i].q.data()));
-    }
-    auto *navigation_increment_cost = new FCNavigationIncrementCost(
-        new FCNavigationIncrementFunctor(
-            fc_target_positions[i] - fc_target_positions[i - 1],
-            fc_target_velocities[i] - fc_target_velocities[i - 1],
-            options_.fc_position_sigma_m * sqrt_fraction,
-            options_.fc_velocity_sigma_mps * sqrt_fraction));
-    families.fc.push_back(problem.AddResidualBlock(
-        navigation_increment_cost, new ceres::CauchyLoss(2.0),
-        states[i - 1].p.data(), states[i - 1].v.data(),
-        states[i].p.data(), states[i].v.data()));
+  std::vector<double> fc_state_timestamps;
+  std::vector<double *> fc_parameter_blocks;
+  fc_state_timestamps.reserve(states.size());
+  fc_parameter_blocks.reserve(3 * states.size());
+  for (GraphState &state : states) {
+    fc_state_timestamps.push_back(state.camera_time);
+    fc_parameter_blocks.push_back(state.q.data());
+    fc_parameter_blocks.push_back(state.p.data());
+    fc_parameter_blocks.push_back(state.v.data());
   }
-  if (!std::isfinite(increment_time_fraction_sum) ||
-      std::fabs(increment_time_fraction_sum - 1.0) > 1.0e-9) {
-    fail_retry(now, "fc_increment_time_fraction");
+  Eigen::Matrix<double, 9, 9> fc_terminal_covariance =
+      Eigen::Matrix<double, 9, 9>::Zero();
+  const double attitude_sigma_rad =
+      options_.fc_attitude_gauge_factor_enabled
+          ? options_.fc_attitude_sigma_deg * kPi / 180.0
+          : 1.0e6;
+  fc_terminal_covariance.block<3, 3>(0, 0) =
+      attitude_sigma_rad * attitude_sigma_rad * Eigen::Matrix3d::Identity();
+  // P3's accepted mount and attitude-time mapping remain fixed optimization
+  // inputs, but their declared uncertainties are not zero.  Isotropic mount
+  // uncertainty enters the FC-implied attitude directly; time uncertainty is
+  // propagated through the terminal angular rate. Navigation timing and the
+  // lever arm have no separate uncertainty declarations in the current stream
+  // contract and are therefore explicitly treated as fixed.
+  const double mount_sigma_rad =
+      options_.fc_board_mount_sigma_deg * kPi / 180.0;
+  fc_terminal_covariance.block<3, 3>(0, 0) +=
+      mount_sigma_rad * mount_sigma_rad * Eigen::Matrix3d::Identity();
+  const Eigen::Vector3d terminal_omega_I =
+      best_fit.R_FtoI * fc_target_rates.back();
+  fc_terminal_covariance.block<3, 3>(0, 0) +=
+      options_.fc_attitude_to_board_time_offset_sigma_s *
+      options_.fc_attitude_to_board_time_offset_sigma_s *
+      terminal_omega_I * terminal_omega_I.transpose();
+  fc_terminal_covariance.block<3, 3>(3, 3) =
+      options_.fc_position_sigma_m * options_.fc_position_sigma_m *
+      Eigen::Matrix3d::Identity();
+  fc_terminal_covariance.block<3, 3>(6, 6) =
+      options_.fc_velocity_sigma_mps * options_.fc_velocity_sigma_mps *
+      Eigen::Matrix3d::Identity();
+  p4::Factor_P4FcTrajectory *fc_trajectory_factor = nullptr;
+  try {
+    fc_trajectory_factor = new p4::Factor_P4FcTrajectory(
+        fc_state_timestamps, fc_target_rotations, fc_target_positions,
+        fc_target_velocities, fc_terminal_covariance,
+        options_.fc_process_variance_fraction);
+  } catch (const std::exception &error) {
+    fail_retry(now, std::string("fc_covariance_model:") + error.what());
     return false;
   }
-  diag.fc_position_velocity_factor_count =
-      static_cast<int>(states.size());
-  diag.fc_position_velocity_time_weight_sum =
-      increment_time_fraction_sum;
-  diag.fc_position_velocity_weight_model =
-      "terminal_absolute_plus_density_invariant_increments";
+  families.fc.push_back(problem.AddResidualBlock(
+      fc_trajectory_factor, nullptr, fc_parameter_blocks));
 
-  // Match the upstream dynamic initializer: every keyframe owns bg/ba and the
-  // complete 15-D CPI factor connects adjacent states, including bias random
-  // walk. This prevents one shared bias from absorbing window-wide motion or
-  // FC model disagreement.
+  const Eigen::MatrixXd &fc_joint_covariance =
+      fc_trajectory_factor->residual_covariance();
+  double maximum_terminal_increment_correlation = 0.0;
+  for (Eigen::Index row = 0; row < 9; ++row) {
+    for (Eigen::Index column = 9; column < fc_joint_covariance.cols();
+         ++column) {
+      const double variance_product =
+          fc_joint_covariance(row, row) *
+          fc_joint_covariance(column, column);
+      if (variance_product > 0.0)
+        maximum_terminal_increment_correlation = std::max(
+            maximum_terminal_increment_correlation,
+            std::fabs(fc_joint_covariance(row, column)) /
+                std::sqrt(variance_product));
+    }
+  }
+  diag.fc_attitude_gauge_factor_enabled =
+      options_.fc_attitude_gauge_factor_enabled;
+  diag.fc_attitude_gauge_factor_count =
+      options_.fc_attitude_gauge_factor_enabled ? 1 : 0;
+  diag.fc_attitude_gauge_anchor_timestamp_s = states.back().camera_time;
+  diag.fc_attitude_gauge_anchor_rate_rad_s = fc_target_rates.back().norm();
+  diag.fc_attitude_gauge_anchor_rate_residual_rad_s =
+      terminal_rate_residual;
+  diag.fc_attitude_gauge_sigma_deg = options_.fc_attitude_sigma_deg;
+  diag.fc_position_velocity_factor_count = static_cast<int>(states.size());
+  diag.fc_position_velocity_time_weight_sum = 1.0;
+  diag.fc_position_velocity_weight_model =
+      "single_dense_terminal_plus_correlated_increments";
+  diag.fc_error_state_transition_model =
+      "e=[dtheta,dp,dv];Phi=I9;Qd=fraction*Pterminal*dt/window;"
+      "Ptheta_includes_declared_mount_and_attitude_time_uncertainty;"
+      "navigation_time_and_lever_arm_treated_fixed_without_declared_sigma";
+  diag.fc_process_variance_fraction =
+      options_.fc_process_variance_fraction;
+  diag.fc_terminal_increment_max_correlation =
+      maximum_terminal_increment_correlation;
+
+  // P4 owns one bg/ba pair for the finite startup window.  The adapter ties
+  // both endpoints of the complete upstream 15-D CPI factor to those shared
+  // variables; it does not discard bias rows or covariance cross terms.
   for (size_t i = 1; i < states.size(); ++i) {
     const double t0 = states[i - 1].camera_time +
                       options_.camera_to_imu_time_offset_s;
@@ -3146,8 +3518,8 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
     auto cpi = std::make_shared<ov_core::CpiV1>(
         options_.imu_sigma_w, options_.imu_sigma_wb, options_.imu_sigma_a,
         options_.imu_sigma_ab, true);
-    Eigen::Vector3d bg_linearization = map3(states[i - 1].bg);
-    Eigen::Vector3d ba_linearization = map3(states[i - 1].ba);
+    Eigen::Vector3d bg_linearization = map3(shared_bg);
+    Eigen::Vector3d ba_linearization = map3(shared_ba);
     cpi->setLinearizationPoints(bg_linearization, ba_linearization);
     for (size_t j = 1; j < segment.size(); ++j)
       cpi->feed_IMU(segment[j - 1].timestamp, segment[j].timestamp,
@@ -3157,40 +3529,15 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
                     segment[j].linear_acceleration);
     cpi->P_meas += Eigen::Matrix<double, 15, 15>::Identity() * 1e-12;
     Eigen::Vector3d gravity = options_.gravity_G;
-    auto *factor = new ov_init::Factor_ImuCPIv1(
+    auto *factor = new p4::Factor_P4ImuSharedBias(
         cpi->DT, gravity, cpi->alpha_tau, cpi->beta_tau, cpi->q_k2tau,
         cpi->b_a_lin, cpi->b_w_lin, cpi->J_q, cpi->J_b, cpi->J_a,
         cpi->H_b, cpi->H_a, cpi->P_meas);
     families.imu.push_back(problem.AddResidualBlock(
-        factor, nullptr, states[i - 1].q.data(), states[i - 1].bg.data(),
-        states[i - 1].v.data(), states[i - 1].ba.data(),
-        states[i - 1].p.data(), states[i].q.data(), states[i].bg.data(),
-        states[i].v.data(), states[i].ba.data(), states[i].p.data()));
-  }
-
-  bool have_right_observations = false;
-  for (const auto *frame : usable_frames)
-    for (const auto &observation : frame->observations)
-      have_right_observations = have_right_observations ||
-                                observation.right_valid;
-
-  // Locked camera calibration parameter blocks. Camera 1 is optional; the
-  // fly1/fly3 formal path is monocular and uses only camera 0.
-  std::array<std::array<double, 4>, 2> calib_q;
-  std::array<std::array<double, 3>, 2> calib_p;
-  std::array<std::array<double, 8>, 2> intrinsics;
-  for (int camera = 0; camera < (have_right_observations ? 2 : 1); ++camera) {
-    assign(calib_q[camera], options_.q_ItoC[camera]);
-    assign(calib_p[camera], options_.p_IinC[camera]);
-    for (int j = 0; j < 8; ++j)
-      intrinsics[camera][j] = options_.camera_intrinsics[camera](j);
-    problem.AddParameterBlock(calib_q[camera].data(), 4,
-                              new ov_init::State_JPLQuatLocal());
-    problem.AddParameterBlock(calib_p[camera].data(), 3);
-    problem.AddParameterBlock(intrinsics[camera].data(), 8);
-    problem.SetParameterBlockConstant(calib_q[camera].data());
-    problem.SetParameterBlockConstant(calib_p[camera].data());
-    problem.SetParameterBlockConstant(intrinsics[camera].data());
+        factor, nullptr, states[i - 1].q.data(), shared_bg.data(),
+        states[i - 1].v.data(), shared_ba.data(),
+        states[i - 1].p.data(), states[i].q.data(), states[i].v.data(),
+        states[i].p.data()));
   }
 
   struct FeatureTrackEntry {
@@ -3204,135 +3551,96 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
         tracks[observation.feature_id].push_back(
             {state_index, &observation});
 
+  // Formal P4 does not retain nuisance landmarks.  Each selected feature
+  // contributes exactly one maximum-time-baseline pair, so no pixel row is
+  // silently counted multiple times inside this initialization likelihood.
   std::vector<std::array<double, 3>> landmarks;
   std::vector<size_t> landmark_feature_ids;
-  landmarks.reserve(std::min(static_cast<int>(tracks.size()),
-                             options_.max_visual_features));
-  landmark_feature_ids.reserve(std::min(static_cast<int>(tracks.size()),
-                                        options_.max_visual_features));
   int accepted_features = 0;
   int multi_frame_tracks = 0;
+  int unique_visual_measurements = 0;
+  const Eigen::Matrix3d R_ItoC =
+      ov_core::quat_2_Rot(options_.q_ItoC[0]);
+  const double average_focal = std::sqrt(std::max(
+      1.0, options_.camera_intrinsics[0](0) *
+               options_.camera_intrinsics[0](1)));
+  const double normalized_visual_sigma =
+      options_.visual_pixel_sigma / average_focal;
   for (const auto &track : tracks) {
     if (accepted_features >= options_.max_visual_features ||
         track.second.size() < 2)
       continue;
     ++multi_frame_tracks;
-    const FeatureTrackEntry *anchor = nullptr;
-    for (const auto &entry : track.second)
-      if (entry.observation->right_valid &&
-          std::isfinite(entry.observation->depth_m) &&
-          entry.observation->depth_m > 0.0) {
-        anchor = &entry;
-        break;
-      }
-    const Eigen::Matrix3d R_ItoC =
-        ov_core::quat_2_Rot(options_.q_ItoC[0]);
-    Eigen::Vector3d p_FinG = Eigen::Vector3d::Zero();
-    if (anchor != nullptr) {
-      const auto &obs = *anchor->observation;
-      const Eigen::Vector3d p_FinC(
-          obs.normalized_left.x() * obs.depth_m,
-          obs.normalized_left.y() * obs.depth_m, obs.depth_m);
-      const Eigen::Vector3d p_FinI =
-          R_ItoC.transpose() * (p_FinC - options_.p_IinC[0]);
-      const GraphState &anchor_state = states[anchor->state_index];
-      const Eigen::Matrix3d R_GtoI =
-          ov_core::quat_2_Rot(normalized_jpl(anchor_state.q.data()));
-      p_FinG = map3(anchor_state.p) + R_GtoI.transpose() * p_FinI;
-    } else {
-      Eigen::Matrix3d normal = Eigen::Matrix3d::Zero();
-      Eigen::Vector3d rhs = Eigen::Vector3d::Zero();
-      std::vector<Eigen::Vector3d> centers;
-      std::vector<Eigen::Vector3d> directions;
-      for (const auto &entry : track.second) {
-        const GraphState &track_state = states[entry.state_index];
-        const Eigen::Matrix3d R_GtoI = ov_core::quat_2_Rot(
-            normalized_jpl(track_state.q.data()));
-        const Eigen::Vector3d p_CinI =
-            -R_ItoC.transpose() * options_.p_IinC[0];
-        const Eigen::Vector3d center_G =
-            map3(track_state.p) + R_GtoI.transpose() * p_CinI;
-        const Eigen::Vector3d ray_C(
-            entry.observation->normalized_left.x(),
-            entry.observation->normalized_left.y(), 1.0);
-        const Eigen::Vector3d direction_G =
-            (R_GtoI.transpose() * R_ItoC.transpose() * ray_C).normalized();
-        if (!center_G.allFinite() || !direction_G.allFinite())
-          continue;
-        const Eigen::Matrix3d projector =
-            Eigen::Matrix3d::Identity() - direction_G * direction_G.transpose();
-        normal += projector;
-        rhs += projector * center_G;
-        centers.push_back(center_G);
-        directions.push_back(direction_G);
-      }
-      if (centers.size() < 2)
-        continue;
-      double max_baseline = 0.0;
-      double max_parallax = 0.0;
-      for (size_t i = 0; i < centers.size(); ++i)
-        for (size_t j = i + 1; j < centers.size(); ++j) {
-          max_baseline =
-              std::max(max_baseline, (centers[i] - centers[j]).norm());
-          max_parallax = std::max(
-              max_parallax,
-              std::acos(std::max(-1.0, std::min(1.0,
-                  directions[i].dot(directions[j])))) * 180.0 / kPi);
-        }
-      Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> normal_eig(normal);
-      if (max_baseline < options_.min_monocular_baseline_m ||
-          max_parallax < options_.min_monocular_parallax_deg ||
-          normal_eig.info() != Eigen::Success ||
-          normal_eig.eigenvalues().minCoeff() <= 1e-8)
-        continue;
-      p_FinG = normal.ldlt().solve(rhs);
-      bool positive_depth = p_FinG.allFinite();
-      for (size_t i = 0; positive_depth && i < centers.size(); ++i)
-        positive_depth = directions[i].dot(p_FinG - centers[i]) > 0.0;
-      if (!positive_depth)
-        continue;
+    const FeatureTrackEntry &previous = track.second.front();
+    const FeatureTrackEntry &current = track.second.back();
+    if (previous.observation == nullptr || current.observation == nullptr ||
+        !previous.observation->normalized_left.allFinite() ||
+        !current.observation->normalized_left.allFinite())
+      continue;
+    const GraphState &previous_state = states[previous.state_index];
+    const GraphState &current_state = states[current.state_index];
+    const Eigen::Matrix3d R_GtoI_previous = ov_core::quat_2_Rot(
+        normalized_jpl(previous_state.q.data()));
+    const Eigen::Matrix3d R_GtoI_current = ov_core::quat_2_Rot(
+        normalized_jpl(current_state.q.data()));
+    const Eigen::Vector3d previous_center_G =
+        map3(previous_state.p) - R_GtoI_previous.transpose() *
+                                     R_ItoC.transpose() * options_.p_IinC[0];
+    const Eigen::Vector3d current_center_G =
+        map3(current_state.p) - R_GtoI_current.transpose() *
+                                    R_ItoC.transpose() * options_.p_IinC[0];
+    const Eigen::Vector3d previous_bearing_C(
+        previous.observation->normalized_left.x(),
+        previous.observation->normalized_left.y(), 1.0);
+    const Eigen::Vector3d current_bearing_C(
+        current.observation->normalized_left.x(),
+        current.observation->normalized_left.y(), 1.0);
+    const Eigen::Vector3d previous_direction_G =
+        (R_GtoI_previous.transpose() * R_ItoC.transpose() *
+         previous_bearing_C)
+            .normalized();
+    const Eigen::Vector3d current_direction_G =
+        (R_GtoI_current.transpose() * R_ItoC.transpose() *
+         current_bearing_C)
+            .normalized();
+    const double baseline_m =
+        (current_center_G - previous_center_G).norm();
+    const double parallax_deg =
+        std::acos(std::max(-1.0, std::min(
+                                     1.0, previous_direction_G.dot(
+                                              current_direction_G)))) *
+        180.0 / kPi;
+    if (!std::isfinite(baseline_m) || !std::isfinite(parallax_deg) ||
+        baseline_m < options_.min_monocular_baseline_m ||
+        parallax_deg < options_.min_monocular_parallax_deg)
+      continue;
+    if (options_.visual_factors_enabled) {
+      auto *factor = new p4::Factor_P4Epipolar(
+          previous.observation->normalized_left,
+          current.observation->normalized_left, R_ItoC,
+          options_.p_IinC[0], normalized_visual_sigma);
+      families.visual.push_back(problem.AddResidualBlock(
+          factor, new ceres::CauchyLoss(2.0),
+          states[previous.state_index].q.data(),
+          states[previous.state_index].p.data(),
+          states[current.state_index].q.data(),
+          states[current.state_index].p.data()));
     }
-    landmarks.push_back({p_FinG.x(), p_FinG.y(), p_FinG.z()});
-    landmark_feature_ids.push_back(track.first);
-    auto &landmark = landmarks.back();
-    if (options_.visual_factors_enabled)
-      problem.AddParameterBlock(landmark.data(), 3);
-    for (const auto &entry : track.second) {
-      const auto &measurement = *entry.observation;
-      if (options_.visual_factors_enabled &&
-          measurement.raw_left.allFinite()) {
-        auto *factor = new ov_init::Factor_ImageReprojCalib(
-            measurement.raw_left, options_.visual_pixel_sigma,
-            options_.camera_fisheye[0]);
-        families.visual.push_back(problem.AddResidualBlock(
-            factor, new ceres::CauchyLoss(2.0),
-            states[entry.state_index].q.data(),
-            states[entry.state_index].p.data(), landmark.data(),
-            calib_q[0].data(), calib_p[0].data(), intrinsics[0].data()));
-      }
-      if (options_.visual_factors_enabled && measurement.right_valid &&
-          measurement.raw_right.allFinite()) {
-        auto *factor = new ov_init::Factor_ImageReprojCalib(
-            measurement.raw_right, options_.visual_pixel_sigma,
-            options_.camera_fisheye[1]);
-        families.visual.push_back(problem.AddResidualBlock(
-            factor, new ceres::CauchyLoss(2.0),
-            states[entry.state_index].q.data(),
-            states[entry.state_index].p.data(), landmark.data(),
-            calib_q[1].data(), calib_p[1].data(), intrinsics[1].data()));
-      }
-    }
+    unique_visual_measurements += 2;
     ++accepted_features;
   }
   diag.stereo_depths = accepted_features;
   diag.visual_statistics.tracked_feature_count =
       static_cast<int>(tracks.size());
   diag.visual_statistics.multi_frame_track_count = multi_frame_tracks;
-  diag.visual_statistics.triangulated_landmark_count = accepted_features;
+  diag.visual_statistics.triangulated_landmark_count = 0;
   diag.visual_statistics.rejected_landmark_count =
       std::max(0, multi_frame_tracks - accepted_features);
   diag.visual_statistics.visual_factor_count =
       static_cast<int>(families.visual.size());
+  diag.visual_pairing_policy =
+      "one_maximum_time_baseline_pair_per_feature_no_pixel_reuse";
+  diag.visual_unique_measurement_count = unique_visual_measurements;
   if (options_.visual_factors_enabled &&
       static_cast<int>(families.visual.size()) <
           options_.min_visual_residual_blocks) {
@@ -3348,7 +3656,7 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
   solver_options.num_threads = 1;
   solver_options.function_tolerance = 1e-7;
   solver_options.gradient_tolerance = 1e-10;
-  diag.shared_window_bias_model = false;
+  diag.shared_window_bias_model = true;
   diag.staged_solver_enabled = false;
   ceres::Solver::Summary summary;
   ++nonlinear_solve_attempt_count_;
@@ -3363,12 +3671,13 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
     attempt_receipts_.back().factor_count =
         static_cast<int>(families.prior.size() + families.fc.size() +
                          families.imu.size() + families.visual.size());
-    attempt_receipts_.back().selected_landmarks = accepted_features;
+    attempt_receipts_.back().selected_landmarks = 0;
+    attempt_receipts_.back().selected_visual_pairs = accepted_features;
     attempt_receipts_.back().solve_wall_time_s = ceres_solve_wall_time_s;
     attempt_receipts_.back().optimizer_invocation_index =
         nonlinear_solve_attempt_count_;
     attempt_receipts_.back().optimizer_invocation_count = 1;
-    attempt_receipts_.back().shared_window_bias_model = false;
+    attempt_receipts_.back().shared_window_bias_model = true;
     attempt_receipts_.back().staged_solver_enabled = false;
     attempt_receipts_.back().final_stage_solve_wall_time_s =
         ceres_solve_wall_time_s;
@@ -3380,6 +3689,10 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
   diag.final_cost = summary.final_cost;
   diag.solver_iterations = static_cast<int>(summary.iterations.size());
   diag.solver_converged = summary.IsSolutionUsable();
+  for (GraphState &state : states) {
+    assign(state.bg, map3(shared_bg));
+    assign(state.ba, map3(shared_ba));
+  }
   transition(AlignmentPhase::VALIDATING, now, "joint_solver_finished");
 
   // Compare the two independently optimized trajectories at identical camera
@@ -3723,7 +4036,7 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
 
   std::vector<double *> tracked_blocks = {
       final_state.q.data(), final_state.p.data(), final_state.v.data(),
-      final_state.bg.data(), final_state.ba.data(), mount_q.data()};
+      shared_bg.data(), shared_ba.data(), mount_q.data()};
   const std::vector<std::string> tracked_names = {
       "attitude", "position", "velocity", "gyro_bias",
       "accelerometer_bias", "startup_misalignment"};
@@ -3749,7 +4062,7 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
 
   std::vector<double *> schur_blocks = {
       final_state.q.data(), final_state.p.data(), final_state.v.data(),
-      final_state.bg.data(), final_state.ba.data()};
+      shared_bg.data(), shared_ba.data()};
   int schur_target_dimension = 15;
   if (!mount_fixed_external_calibration) {
     schur_blocks.push_back(mount_q.data());
@@ -3759,8 +4072,6 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
     schur_blocks.push_back(states[state_index].q.data());
     schur_blocks.push_back(states[state_index].p.data());
     schur_blocks.push_back(states[state_index].v.data());
-    schur_blocks.push_back(states[state_index].bg.data());
-    schur_blocks.push_back(states[state_index].ba.data());
   }
   if (options_.visual_factors_enabled)
     for (auto &landmark : landmarks)
@@ -3844,7 +4155,7 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
 
   std::vector<double *> initialization_covariance_blocks = {
       final_state.q.data(), final_state.p.data(), final_state.v.data(),
-      final_state.bg.data(), final_state.ba.data()};
+      shared_bg.data(), shared_ba.data()};
   for (size_t state_index = transferred_clone_start;
        state_index + 1 < states.size(); ++state_index) {
     initialization_covariance_blocks.push_back(states[state_index].q.data());
@@ -4001,6 +4312,37 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
                 : std::numeric_limits<double>::infinity();
       }
     }
+    if (observability.state == "attitude")
+      observability.information_normalization_scale =
+          options_.max_attitude_sigma_deg * kPi / 180.0;
+    else if (observability.state == "position")
+      observability.information_normalization_scale =
+          options_.max_position_sigma_m;
+    else if (observability.state == "velocity")
+      observability.information_normalization_scale =
+          options_.max_velocity_sigma_mps;
+    else if (observability.state == "gyro_bias")
+      observability.information_normalization_scale =
+          options_.max_gyro_bias_sigma_rad_s;
+    else if (observability.state == "accelerometer_bias")
+      observability.information_normalization_scale =
+          options_.max_accel_bias_sigma_mps2;
+    else
+      observability.information_normalization_scale =
+          options_.max_mount_sigma_deg * kPi / 180.0;
+    observability.information_normalization_scale = std::max(
+        1.0e-12, observability.information_normalization_scale);
+    const double information_scale_squared =
+        observability.information_normalization_scale *
+        observability.information_normalization_scale;
+    observability.normalized_data_information_min_eigenvalue =
+        information_scale_squared *
+        observability.data_information_min_eigenvalue;
+    observability.normalized_data_information_max_eigenvalue =
+        information_scale_squared *
+        observability.data_information_max_eigenvalue;
+    observability.normalized_data_information_condition =
+        observability.data_information_condition;
     observability.prior_jacobian_norm =
         state_jacobian(prior, observability.state);
     observability.imu_jacobian_norm =
@@ -4034,9 +4376,9 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
         observability.visual_jacobian_norm <= 1e-10 &&
         !state_fc_support;
     const bool information_ok =
-        observability.data_information_min_eigenvalue >=
+        observability.normalized_data_information_min_eigenvalue >=
             options_.min_information_eigenvalue &&
-        observability.data_information_condition <=
+        observability.normalized_data_information_condition <=
             options_.max_information_condition;
     bool factor_support = false;
     double max_sigma = std::numeric_limits<double>::infinity();
@@ -4375,26 +4717,13 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
       release_covariance_valid &&
       diag.sliding_overlap_state_count >=
           options_.sliding_window_min_overlap_states) {
-    const Eigen::Matrix<double, 15, 15> combined_covariance =
-        release_covariance + previous_window_covariance_;
-    const auto normalized_group_difference =
-        [&combined_covariance](int offset, double difference) {
-          const double radial_variance =
-              combined_covariance.block<3, 3>(offset, offset).trace();
-          if (!std::isfinite(radial_variance) || radial_variance <= 0.0 ||
-              !std::isfinite(difference))
-            return std::numeric_limits<double>::infinity();
-          return difference / std::sqrt(radial_variance);
-        };
-    diag.sliding_overlap_normalized_max_sigma = std::max(
-        {normalized_group_difference(
-             0, diag.sliding_overlap_attitude_max_deg * kPi / 180.0),
-         normalized_group_difference(3, diag.sliding_overlap_position_max_m),
-         normalized_group_difference(6, diag.sliding_overlap_velocity_max_mps),
-         normalized_group_difference(
-             9, diag.sliding_overlap_gyro_bias_max_rad_s),
-         normalized_group_difference(
-             12, diag.sliding_overlap_accel_bias_max_mps2)});
+    // Adjacent windows share most of their measurements.  Without their
+    // cross-covariance, P_current + P_previous is not the covariance of the
+    // estimate difference and must not be advertised as a normalized gate.
+    // Retain only explicit physical safety bounds on this dormant diagnostic
+    // path. Formal P4 uses the disjoint causal holdout lifecycle above.
+    diag.sliding_overlap_normalized_max_sigma =
+        std::numeric_limits<double>::infinity();
     const bool physical_safety_passed =
         diag.sliding_overlap_attitude_max_deg <=
             options_.sliding_window_max_overlap_attitude_deg &&
@@ -4406,10 +4735,7 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
             options_.sliding_window_max_overlap_gyro_bias_rad_s &&
         diag.sliding_overlap_accel_bias_max_mps2 <=
             options_.sliding_window_max_overlap_accel_bias_mps2;
-    diag.sliding_overlap_consistency_passed =
-        physical_safety_passed &&
-        diag.sliding_overlap_normalized_max_sigma <=
-            options_.sliding_window_overlap_max_normalized_sigma;
+    diag.sliding_overlap_consistency_passed = physical_safety_passed;
   }
   if (summary.IsSolutionUsable() && release_covariance_valid) {
     previous_window_covariance_ = release_covariance;
@@ -4822,6 +5148,141 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
   result.release_policy = options_.release_policy;
   diag.state_transitions = transitions_;
   result.diagnostics = diag;
+
+  if (options_.formal_causal_lifecycle) {
+    if (formal_refinement_pending_) {
+      // A formal release is owned by the one newly advanced joint solve after
+      // the immutable candidate passed its causal holdout.  No old candidate
+      // covariance is mixed into this terminal marginal, and the injected
+      // timestamp remains the current camera-clock graph horizon.
+      if (!refinement_attempt) {
+        fail_retry(now, "formal_refinement_state_machine_inconsistent");
+        return false;
+      }
+      diag.formal_candidate_holdout_fc_samples =
+          formal_candidate_holdout_fc_samples_;
+      diag.formal_candidate_holdout_imu_samples =
+          formal_candidate_holdout_imu_samples_;
+      diag.formal_candidate_holdout_visual_frames =
+          formal_candidate_holdout_visual_frames_;
+      diag.formal_candidate_holdout_duration_s =
+          formal_candidate_holdout_duration_s_;
+      diag.formal_candidate_holdout_passed = true;
+      diag.formal_refinement_release = true;
+      diag.candidate_closed_loop_refinement_applied = true;
+      diag.quality_passed = true;
+      diag.decision_time = now;
+      diag.readiness = release_full
+                           ? AlignmentReadiness::FULL_ALIGNMENT_READY
+                           : AlignmentReadiness::NAVIGATION_READY;
+      diag.readiness_reason =
+          "formal_candidate_holdout_passed_single_current_window_refinement";
+      result.readiness = diag.readiness;
+      result.released_to_openvins = true;
+
+      navigation_released_ = true;
+      ++successful_release_count_;
+      navigation_ready_time_ = now;
+      alignment_window_closed_ = true;
+      alignment_window_close_time_ = now;
+      if (release_full) {
+        full_alignment_recorded_ = true;
+        full_alignment_ready_time_ = now;
+        transition(AlignmentPhase::FULL_ALIGNMENT_READY, now,
+                   "formal_single_refinement_atomic_release");
+      } else {
+        transition(AlignmentPhase::NAVIGATION_READY, now,
+                   "formal_single_refinement_atomic_release");
+      }
+      formal_refinement_pending_ = false;
+      force_refinement_solve_ = false;
+      candidate_active_ = false;
+      candidate_visual_snapshots_.clear();
+      diag.navigation_ready_time = navigation_ready_time_;
+      diag.full_alignment_ready_time = full_alignment_ready_time_;
+      diag.alignment_window_closed = true;
+      diag.alignment_window_close_time = alignment_window_close_time_;
+      copy_runtime_counters(diag);
+      diag.state_transitions = transitions_;
+      result.diagnostics = diag;
+      candidate_result_ = result;
+      candidate_record_.result = result;
+      if (!attempt_receipts_.empty()) {
+        attempt_receipts_.back().outcome = "formal_refined_release";
+        attempt_receipts_.back().failed_gate.clear();
+        attempt_receipts_.back().next_eligible_condition =
+            "closed_after_atomic_release";
+      }
+      latest_evidence_diagnostics_ = diag;
+      latest_evidence_diagnostics_valid_ = true;
+      last_diagnostics_ = diag;
+      last_rejection_.clear();
+      fc_buffer_.clear();
+      imu_buffer_.clear();
+      stereo_buffer_.clear();
+      return true;
+    }
+
+    // Freeze the finite-window solution.  The next sensor-time interval is a
+    // holdout only: it can reject this candidate or authorize one advanced
+    // joint refinement, but it cannot update q/p/v/bg/ba sequentially.
+    diag.quality_passed = false;
+    diag.readiness = AlignmentReadiness::NOT_READY;
+    diag.readiness_reason = "formal_candidate_short_causal_hold_pending";
+    result.readiness = AlignmentReadiness::NOT_READY;
+    result.released_to_openvins = false;
+    candidate_created_time_ = now;
+    formal_candidate_camera_time_ = result.timestamp;
+    formal_candidate_holdout_fc_samples_ = 0;
+    formal_candidate_holdout_imu_samples_ = 0;
+    formal_candidate_holdout_visual_frames_ = 0;
+    formal_candidate_holdout_duration_s_ = 0.0;
+    candidate_reference_snapshot_ =
+        make_visual_snapshot(*usable_frames.back());
+    candidate_visual_snapshots_.clear();
+    candidate_active_ = true;
+    ++candidate_created_count_;
+    candidate_gate_depth_counts_.fill(0);
+    candidate_gate_depth_source_ =
+        "formal_fixed_candidate_causal_holdout_no_feedback";
+    transition(AlignmentPhase::CANDIDATE_VALIDATING, now,
+               "formal_joint_solution_frozen_for_causal_holdout");
+    copy_runtime_counters(diag);
+    diag.state_transitions = transitions_;
+    result.diagnostics = diag;
+    candidate_result_ = result;
+    candidate_record_ = AlignmentCandidate();
+    candidate_record_.result = result;
+    candidate_record_.solve_window_start = diag.window_start;
+    candidate_record_.solve_window_end = diag.init_time;
+    for (const auto *frame : usable_frames)
+      candidate_record_.selected_frame_timestamps.push_back(
+          frame->left_timestamp);
+    candidate_record_.selected_feature_ids.assign(
+        fingerprint_features.begin(), fingerprint_features.end());
+    candidate_record_.factor_contributions = diag.factor_contributions;
+    candidate_record_.state_observability = diag.state_observability;
+    candidate_record_.prior_dominated_states = diag.fixed_state_list;
+    candidate_record_.prior_dominated_states.insert(
+        candidate_record_.prior_dominated_states.end(),
+        diag.weak_state_list.begin(), diag.weak_state_list.end());
+    candidate_record_.solve_wall_time_s = diag.initialization_duration_s;
+    candidate_record_.provenance = diag.provenance;
+    if (!attempt_receipts_.empty()) {
+      int factor_count = 0;
+      for (const auto &family : diag.factor_contributions)
+        factor_count += family.residual_blocks;
+      attempt_receipts_.back().factor_count = factor_count;
+      attempt_receipts_.back().selected_landmarks = 0;
+      attempt_receipts_.back().outcome = "candidate_ready";
+      attempt_receipts_.back().failed_gate.clear();
+      attempt_receipts_.back().next_eligible_condition =
+          "two_second_causal_holdout_then_single_refinement";
+    }
+    last_diagnostics_ = diag;
+    last_rejection_ = diag.readiness_reason;
+    return false;
+  }
 
   std::array<bool,
              static_cast<std::size_t>(CandidateStateGroup::COUNT)>
