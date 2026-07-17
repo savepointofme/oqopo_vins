@@ -690,10 +690,23 @@ void test_formal_candidate_holdout_and_single_refinement_release() {
   require(released && result.released_to_openvins,
           "passed causal holdout must release the single refined graph");
   require(result.diagnostics.formal_candidate_holdout_passed &&
-              result.diagnostics.formal_candidate_holdout_duration_s >= 2.0 &&
+              result.diagnostics.formal_candidate_holdout_duration_s +
+                      1.0e-9 >=
+                  options.candidate_short_validation_duration_s &&
               result.diagnostics.formal_refinement_release &&
               result.diagnostics.candidate_refinement_count == 1,
-          "formal receipt must prove two-second holdout and exactly one refinement");
+          "formal receipt must prove two-second holdout and exactly one "
+          "refinement: passed=" +
+              std::to_string(
+                  result.diagnostics.formal_candidate_holdout_passed) +
+              ", duration=" +
+              std::to_string(
+                  result.diagnostics.formal_candidate_holdout_duration_s) +
+              ", release=" +
+              std::to_string(result.diagnostics.formal_refinement_release) +
+              ", refinements=" +
+              std::to_string(
+                  result.diagnostics.candidate_refinement_count));
   require(result.diagnostics.nonlinear_solve_attempt_count ==
                   solves_at_candidate + 1 &&
               !result.diagnostics.candidate_closed_loop_correction_applied &&
