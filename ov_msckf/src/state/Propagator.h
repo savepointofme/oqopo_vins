@@ -43,6 +43,7 @@
 #define OV_MSCKF_STATE_PROPAGATOR_H
 
 #include <atomic>
+#include <cstdint>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -79,7 +80,7 @@ public:
    * [中文] 按照连续时间器件参数 (sigma_w / sigma_a / sigma_wb / sigma_ab)
    *        预计算平方缓存, 避免每步都调用 pow。
    */
-  Propagator(NoiseManager noises, double gravity_mag) : _noises(noises), cache_imu_valid(false) {
+  Propagator(NoiseManager noises, double gravity_mag) : _noises(noises) {
     _noises.sigma_w_2 = std::pow(_noises.sigma_w, 2);
     _noises.sigma_a_2 = std::pow(_noises.sigma_a, 2);
     _noises.sigma_wb_2 = std::pow(_noises.sigma_wb, 2);
@@ -127,7 +128,21 @@ public:
   /**
    * @brief Will invalidate the cache used for fast propagation
    */
-  void invalidate_cache() { cache_imu_valid = false; }
+  void invalidate_cache() noexcept;
+
+  struct FastStateCacheStatus {
+    std::uint64_t epoch = 0;
+    std::uint64_t published_epoch = 0;
+    bool valid = false;
+  };
+
+  /**
+   * @brief Thread-safe diagnostic snapshot of the fast-propagation cache.
+   *
+   * `valid` is true only when the published cache belongs to the current
+   * invalidation epoch.
+   */
+  FastStateCacheStatus fast_state_cache_status() const;
 
   void set_yaw_diag_window(double t0, double t1) {
     yaw_diag_t0_ = t0;
@@ -527,11 +542,19 @@ protected:
   bool have_last_prop_time_offset = false;
 
   // Cache of the last fast propagated state
-  std::atomic<bool> cache_imu_valid;
-  double cache_state_time;
+  mutable std::mutex cache_imu_mtx;
+  std::atomic<std::uint64_t> cache_epoch{0};
+  bool cache_imu_valid = false;
+  std::uint64_t cache_published_epoch = 0;
+  double cache_state_time = std::numeric_limits<double>::quiet_NaN();
   Eigen::MatrixXd cache_state_est;
   Eigen::MatrixXd cache_state_covariance;
-  double cache_t_off;
+  double cache_t_off = 0.0;
+  double cache_output_timestamp = std::numeric_limits<double>::quiet_NaN();
+  Eigen::Matrix<double, 13, 1> cache_output_state_plus =
+      Eigen::Matrix<double, 13, 1>::Zero();
+  Eigen::Matrix<double, 12, 12> cache_output_covariance =
+      Eigen::Matrix<double, 12, 12>::Zero();
 };
 
 } // namespace ov_msckf

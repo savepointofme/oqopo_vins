@@ -181,12 +181,66 @@ struct SensorProvenance {
 };
 
 struct OnlineAlignmentOptions {
-  /// P4-R1: rebuild a bounded joint problem on every advanced fixed-time
-  /// window, retain the solution as shadow evidence, and never inject it into
-  /// OpenVINS. Candidate-filter release is bypassed while this is true.
+  /// Production P4 path. Initialize the local metric VIO once with the
+  /// upstream OpenVINS dynamic initializer, then use this class only to build
+  /// synchronized causal FC targets for a low-dimensional yaw+translation
+  /// gauge window. The repeated FC/IMU/visual Ceres graph is bypassed.
+  bool upstream_dynamic_init_fc_gauge = false;
+  /// Diagnostic ablation: replace the solved release attitude with the
+  /// synchronized FC attitude composed with the accepted FC-to-board mount.
+  /// The graph, window, p/v/bg/ba solution, and covariance remain unchanged.
+  bool diagnostic_release_attitude_from_fc = false;
+  /// Root-cause ablation only. Retain the joint graph attitude while replacing
+  /// p/v with the synchronized FC board-state observation and bg/ba with zero.
+  /// Production must never enable this mixed-source release contract.
+  bool diagnostic_release_graph_attitude_fc_pv_zero_bias = false;
+  /// Anchor the released terminal attitude to the synchronized FC attitude
+  /// composed with the accepted full-flight FC-to-board calibration. Earlier
+  /// FC attitudes constrain only relative increments, so keyframe density does
+  /// not multiply absolute gauge information.
+  bool fc_attitude_gauge_factor_enabled = true;
+  /// Rebuild a bounded joint problem on every advanced fixed-time window and
+  /// retain each solution as shadow evidence. Candidate validation and formal
+  /// OpenVINS injection are bypassed only while this is true.
   bool sliding_window_shadow_only = false;
+  /// Production P4 lifecycle: keep OpenVINS uninitialized while repeated
+  /// joint windows are solved, then inject one coherent q/p/v/bg/ba state and
+  /// covariance after time-based overlap consistency is established.
+  bool sliding_window_direct_state_release = false;
+  /// Keep every advanced window as a complete joint q/p/v/bg/ba solve, but
+  /// defer release-only Jacobian/Schur/covariance certification until the
+  /// rolling solutions have been physically stable for the configured
+  /// sensor-time interval. This changes runtime scheduling, not estimation
+  /// topology or release gates.
+  bool sliding_window_deferred_release_certification = false;
+  /// Production OpenVINS injects only the terminal IMU state. Do not recover
+  /// clone/landmark covariance blocks that the handoff will discard.
+  bool sliding_window_terminal_state_covariance_only = false;
+  /// Diagnostic isolation only: keep solving the same sliding-window graphs
+  /// and keep the provisional VIO running, but never apply the final gauge
+  /// anchor. This is not a production release policy.
+  bool sliding_window_diagnostic_never_anchor = false;
   double sliding_window_duration_s = 8.0;
   double sliding_window_min_advance_s = 0.5;
+  /// Formal gauge release requires this much continuous sensor-time agreement
+  /// between independently advanced fixed-time window solutions. It is not an
+  /// update-count quota.
+  double sliding_window_gauge_stability_duration_s = 2.0;
+  double sliding_window_overlap_stability_duration_s = 2.0;
+  /// A shared bias is converged only when its causal cross-window linear trend,
+  /// projected over one complete solve window, is no larger than this many
+  /// posterior standard deviations. This complements pairwise overlap checks,
+  /// which cannot reject a smooth one-directional drift.
+  double sliding_window_bias_trend_max_normalized_sigma = 1.0;
+  int sliding_window_min_overlap_states = 4;
+  /// Statistical agreement is measured against the combined 15-state graph
+  /// covariance. These absolute limits are only fail-closed physical guards.
+  double sliding_window_overlap_max_normalized_sigma = 3.0;
+  double sliding_window_max_overlap_attitude_deg = 5.0;
+  double sliding_window_max_overlap_position_m = 5.0;
+  double sliding_window_max_overlap_velocity_mps = 3.0;
+  double sliding_window_max_overlap_gyro_bias_rad_s = 0.03;
+  double sliding_window_max_overlap_accel_bias_mps2 = 1.0;
   /// Upstream-style reference window followed by progressively longer joint
   /// alignment windows. The shortest usable window is solved first.
   double reference_window_duration_s = 2.0;
@@ -199,9 +253,18 @@ struct OnlineAlignmentOptions {
   int min_feature_tracks = 20;
   int min_stereo_depths = 12;
   int min_keyframes = 5;
-  int max_keyframes = 10;
+  /// Computational guard only. Formal P4 uses every frame selected by the
+  /// time-window selector up to this bound; it must not thin a normal 8 s
+  /// window to an arbitrary fixed measurement count.
+  int max_keyframes = 36;
   int min_visual_residual_blocks = 30;
   int max_visual_features = 80;
+  /// Bound persistent landmarks transferred with the batch posterior. Only
+  /// landmarks observed at the release keyframe are eligible.
+  int max_initial_slam_features = 50;
+  /// Number of terminal historical poses transferred to the EKF. This is a
+  /// backend state-capacity bound, not a limit on P4 graph measurements.
+  int max_initial_clones = 10;
   double min_monocular_parallax_deg = 0.5;
   double min_monocular_baseline_m = 0.20;
   double max_fc_gap_s = 0.35;
@@ -276,9 +339,11 @@ struct OnlineAlignmentOptions {
   double alignment_frame_minimum_interval_s = 0.10;
   double alignment_frame_maximum_interval_s = 0.60;
   double alignment_target_compensated_parallax_px = 3.0;
-  /// Persistent candidate-filter contract. Success is driven by data support,
-  /// covariance, correction history, and feedback/reset evidence; candidate
-  /// age is never a success condition.
+  /// A solved window is checked only with later causal data. This is the
+  /// required evidence duration; the bounded deadline additionally allows one
+  /// maximum FC/visual sampling gap. It is a sensor-time contract, not a fixed
+  /// update quota or a success-by-age rule.
+  double candidate_short_validation_duration_s = 2.0;
   CandidateFilterConfig candidate_filter_config;
   double candidate_max_fc_imu_rotation_residual_deg = 5.0;
   double candidate_reject_fc_imu_rotation_residual_deg = 10.0;
@@ -303,9 +368,9 @@ struct OnlineAlignmentOptions {
   /// independent reprojection validation gate; feeding them again would double
   /// count correlated information. The joint solve remains fully visual.
   int candidate_max_closed_loop_visual_updates = 0;
-  // The old one-shot terminal refinement path is forbidden. A rejected
-  // candidate returns to the sliding-window solver with new information.
-  bool candidate_refinement_enabled = false;
+  /// Permit at most one startup-wide refinement. The refinement must use a
+  /// newly advanced current window and may never rerun the candidate window.
+  bool candidate_refinement_enabled = true;
   bool visual_factors_enabled = true;
   bool navigation_allow_without_visual = false;
   double visual_perturbation_px = 0.0;
@@ -314,6 +379,11 @@ struct OnlineAlignmentOptions {
       AlignmentReleasePolicy::PRACTICAL_NAVIGATION_START;
   Eigen::Vector3d gravity_G = Eigen::Vector3d(0.0, 0.0, 9.81);
   Eigen::Matrix3d R_FtoI_declared = Eigen::Matrix3d::Identity();
+  /// FC-to-IMU axis map used only to start the provisional local VIO.  This is
+  /// intentionally separate from the externally calibrated P4 graph mount:
+  /// the provisional estimator must reproduce the frozen one-row baseline,
+  /// while P4 estimates the later global yaw+translation gauge independently.
+  Eigen::Matrix3d R_FtoI_provisional_seed = Eigen::Matrix3d::Identity();
   Eigen::Vector3d p_IinF = Eigen::Vector3d::Zero();
   std::array<Eigen::Vector4d, 2> q_ItoC = {
       (Eigen::Vector4d() << 0.0, 0.0, 0.0, 1.0).finished(),
@@ -359,6 +429,14 @@ struct OnlineAlignmentDiagnostics {
   double initial_cost = std::numeric_limits<double>::infinity();
   double final_cost = std::numeric_limits<double>::infinity();
   int solver_iterations = 0;
+  bool shared_window_bias_model = false;
+  bool staged_solver_enabled = false;
+  bool stage1_solution_usable = false;
+  double stage1_initial_cost = std::numeric_limits<double>::infinity();
+  double stage1_final_cost = std::numeric_limits<double>::infinity();
+  int stage1_solver_iterations = 0;
+  double stage1_solve_wall_time_s = 0.0;
+  double final_stage_solve_wall_time_s = 0.0;
   int retry_count = 0;
   /// Number of actual entries into the nonlinear Ceres joint solve.
   int nonlinear_solve_attempt_count = 0;
@@ -371,11 +449,77 @@ struct OnlineAlignmentDiagnostics {
   int candidate_created_count = 0;
   int candidate_rejected_count = 0;
   int candidate_refinement_count = 0;
+  int gauge_window_observation_count = 0;
+  double gauge_stability_required_s = 0.0;
+  double gauge_stable_duration_s = 0.0;
+  double gauge_yaw_delta_from_previous_deg =
+      std::numeric_limits<double>::infinity();
+  double gauge_translation_delta_from_previous_m =
+      std::numeric_limits<double>::infinity();
+  double gauge_yaw_consistency_limit_deg =
+      std::numeric_limits<double>::infinity();
+  double gauge_translation_consistency_limit_m =
+      std::numeric_limits<double>::infinity();
+  double gauge_metric_scale = std::numeric_limits<double>::quiet_NaN();
+  double gauge_metric_scale_observed =
+      std::numeric_limits<double>::quiet_NaN();
+  double gauge_metric_scale_sigma =
+      std::numeric_limits<double>::infinity();
+  double gauge_velocity_fit_rmse_mps =
+      std::numeric_limits<double>::infinity();
+  double gauge_velocity_excitation_mps = 0.0;
+  double gauge_yaw_reset_deg = std::numeric_limits<double>::quiet_NaN();
+  Eigen::Vector3d gauge_translation_G = Eigen::Vector3d::Constant(
+      std::numeric_limits<double>::quiet_NaN());
+  bool gauge_window_quality_passed = false;
+  bool gauge_consistency_passed = false;
+  int sliding_overlap_state_count = 0;
+  double sliding_overlap_attitude_max_deg =
+      std::numeric_limits<double>::infinity();
+  double sliding_overlap_position_max_m =
+      std::numeric_limits<double>::infinity();
+  double sliding_overlap_velocity_max_mps =
+      std::numeric_limits<double>::infinity();
+  double sliding_overlap_gyro_bias_max_rad_s =
+      std::numeric_limits<double>::infinity();
+  double sliding_overlap_accel_bias_max_mps2 =
+      std::numeric_limits<double>::infinity();
+  double sliding_overlap_normalized_max_sigma =
+      std::numeric_limits<double>::infinity();
+  double sliding_overlap_stable_duration_s = 0.0;
+  double sliding_overlap_stability_required_s = 0.0;
+  bool sliding_overlap_consistency_passed = false;
+  int sliding_bias_trend_sample_count = 0;
+  double sliding_bias_trend_span_s = 0.0;
+  Eigen::Vector3d sliding_bg_trend_projected_change_rad_s =
+      Eigen::Vector3d::Constant(std::numeric_limits<double>::infinity());
+  Eigen::Vector3d sliding_ba_trend_projected_change_mps2 =
+      Eigen::Vector3d::Constant(std::numeric_limits<double>::infinity());
+  double sliding_bias_trend_normalized_max_sigma =
+      std::numeric_limits<double>::infinity();
+  bool sliding_bias_trend_passed = false;
+  bool direct_sliding_state_release = false;
+  int initial_history_clone_count = 0;
+  int initial_persistent_landmark_count = 0;
+  int initial_joint_covariance_dimension = 0;
+  bool initial_history_covariance_recovered = false;
+  bool handoff_covariance_inflation_applied = false;
+  std::string handoff_covariance_model = "none";
+  std::array<double, 4> handoff_covariance_inflation = {1.0, 1.0, 1.0,
+                                                        1.0};
+  Eigen::Matrix<double, 15, 1> handoff_raw_covariance_std =
+      Eigen::Matrix<double, 15, 1>::Constant(
+          std::numeric_limits<double>::quiet_NaN());
+  Eigen::Matrix<double, 15, 1> handoff_applied_covariance_std =
+      Eigen::Matrix<double, 15, 1>::Constant(
+          std::numeric_limits<double>::quiet_NaN());
   int candidate_validation_frames = 0;
   double selected_window_duration_s = 0.0;
   double maximum_buffer_window_s = 0.0;
   double candidate_validation_duration_s = 0.0;
   double candidate_fc_imu_rotation_residual_deg =
+      std::numeric_limits<double>::infinity();
+  double candidate_fc_imu_yaw_residual_deg =
       std::numeric_limits<double>::infinity();
   double candidate_relative_position_residual_m =
       std::numeric_limits<double>::infinity();
@@ -433,10 +577,33 @@ struct OnlineAlignmentDiagnostics {
   double candidate_accel_bias_stable_duration_s = 0.0;
   std::string candidate_feedback_tier = "PV_ONLY";
   std::string candidate_feedback_state_mask = "p,v";
-  /// FC/body attitude can contain transient Velcro flex in turns. It is
-  /// retained as an evaluation diagnostic and never drives navigation state
-  /// feedback or candidate rejection.
+  /// False only when a robust FC attitude gauge factor participates in the
+  /// joint solve and the held-out FC attitude residual is a release gate.
   bool candidate_fc_attitude_evaluation_only = true;
+  bool fc_attitude_gauge_factor_enabled = false;
+  int fc_attitude_gauge_factor_count = 0;
+  /// FC navigation is a temporally correlated filter output. The released
+  /// terminal p/v receives one full absolute factor; earlier rows constrain
+  /// density-invariant increments only.
+  int fc_position_velocity_factor_count = 0;
+  double fc_position_velocity_time_weight_sum = 0.0;
+  std::string fc_position_velocity_weight_model = "none";
+  double fc_terminal_attitude_residual_deg =
+      std::numeric_limits<double>::infinity();
+  double fc_terminal_position_residual_m =
+      std::numeric_limits<double>::infinity();
+  double fc_terminal_velocity_residual_mps =
+      std::numeric_limits<double>::infinity();
+  double fc_terminal_max_normalized_residual =
+      std::numeric_limits<double>::infinity();
+  double fc_attitude_gauge_anchor_timestamp_s =
+      std::numeric_limits<double>::quiet_NaN();
+  double fc_attitude_gauge_anchor_rate_rad_s =
+      std::numeric_limits<double>::quiet_NaN();
+  double fc_attitude_gauge_anchor_rate_residual_rad_s =
+      std::numeric_limits<double>::quiet_NaN();
+  double fc_attitude_gauge_sigma_deg =
+      std::numeric_limits<double>::quiet_NaN();
   Eigen::Matrix<double, 15, 1> candidate_persistent_error =
       Eigen::Matrix<double, 15, 1>::Zero();
   Eigen::Matrix<double, 15, 1> candidate_persistent_std =
@@ -499,6 +666,18 @@ struct OnlineAlignmentDiagnostics {
   SensorProvenance provenance;
 };
 
+struct AlignmentCloneState {
+  double timestamp = -1.0;
+  Eigen::Vector4d q_GtoI =
+      (Eigen::Vector4d() << 0.0, 0.0, 0.0, 1.0).finished();
+  Eigen::Vector3d p_IinG = Eigen::Vector3d::Zero();
+};
+
+struct AlignmentLandmarkState {
+  size_t feature_id = 0;
+  Eigen::Vector3d p_FinG = Eigen::Vector3d::Zero();
+};
+
 struct AlignmentResult {
   double timestamp = -1.0;
   Eigen::Vector4d q_GtoI = (Eigen::Vector4d() << 0.0, 0.0, 0.0, 1.0).finished();
@@ -508,6 +687,18 @@ struct AlignmentResult {
   Eigen::Vector3d ba = Eigen::Vector3d::Zero();
   Eigen::Matrix<double, 15, 15> covariance =
       Eigen::Matrix<double, 15, 15>::Identity();
+  /// Joint tangent covariance in the exact order
+  /// [active IMU(q,p,v,bg,ba), historical clone_0(q,p), ...,
+  /// persistent landmark_0(xyz), ...].
+  /// Historical clones are strictly increasing and exclude the active-state
+  /// timestamp. An empty matrix preserves the legacy terminal-only contract.
+  std::vector<AlignmentCloneState> initial_clones;
+  std::vector<AlignmentLandmarkState> initial_landmarks;
+  /// Exact tracker IDs whose startup observations entered P4 visual factors.
+  /// Their pre-release tracks must be removed after posterior transfer to
+  /// prevent reuse; all other KLT histories remain available to MSCKF.
+  std::vector<size_t> startup_consumed_feature_ids;
+  Eigen::MatrixXd initial_joint_covariance;
   Eigen::Matrix3d R_FtoI_nominal = Eigen::Matrix3d::Identity();
   Eigen::Matrix3d R_mount_residual = Eigen::Matrix3d::Identity();
   Eigen::Matrix3d mount_covariance = Eigen::Matrix3d::Identity();
@@ -567,6 +758,15 @@ struct AlignmentAttemptReceipt {
   int selected_landmarks = 0;
   int factor_count = 0;
   double solve_wall_time_s = 0.0;
+  int optimizer_invocation_count = 0;
+  bool shared_window_bias_model = false;
+  bool staged_solver_enabled = false;
+  bool stage1_solution_usable = false;
+  double stage1_initial_cost = std::numeric_limits<double>::infinity();
+  double stage1_final_cost = std::numeric_limits<double>::infinity();
+  int stage1_solver_iterations = 0;
+  double stage1_solve_wall_time_s = 0.0;
+  double final_stage_solve_wall_time_s = 0.0;
   double initial_cost = std::numeric_limits<double>::infinity();
   double final_cost = std::numeric_limits<double>::infinity();
   Eigen::Vector4d q_GtoI =
@@ -575,6 +775,8 @@ struct AlignmentAttemptReceipt {
   Eigen::Vector3d v_IinG = Eigen::Vector3d::Zero();
   Eigen::Vector3d bg = Eigen::Vector3d::Zero();
   Eigen::Vector3d ba = Eigen::Vector3d::Zero();
+  Eigen::Vector3d bg_prior_center = Eigen::Vector3d::Zero();
+  Eigen::Vector3d ba_prior_center = Eigen::Vector3d::Zero();
   Eigen::Matrix<double, 15, 1> state_std =
       Eigen::Matrix<double, 15, 1>::Constant(
           std::numeric_limits<double>::infinity());
@@ -597,6 +799,30 @@ struct AlignmentAttemptReceipt {
       std::numeric_limits<double>::quiet_NaN();
   double previous_accel_bias_delta_mps2 =
       std::numeric_limits<double>::quiet_NaN();
+  int overlap_state_count = 0;
+  double overlap_attitude_max_deg =
+      std::numeric_limits<double>::infinity();
+  double overlap_position_max_m =
+      std::numeric_limits<double>::infinity();
+  double overlap_velocity_max_mps =
+      std::numeric_limits<double>::infinity();
+  double overlap_gyro_bias_max_rad_s =
+      std::numeric_limits<double>::infinity();
+  double overlap_accel_bias_max_mps2 =
+      std::numeric_limits<double>::infinity();
+  double overlap_normalized_max_sigma =
+      std::numeric_limits<double>::infinity();
+  double overlap_stable_duration_s = 0.0;
+  bool overlap_consistency_passed = false;
+  int bias_trend_sample_count = 0;
+  double bias_trend_span_s = 0.0;
+  Eigen::Vector3d bg_trend_projected_change_rad_s =
+      Eigen::Vector3d::Constant(std::numeric_limits<double>::infinity());
+  Eigen::Vector3d ba_trend_projected_change_mps2 =
+      Eigen::Vector3d::Constant(std::numeric_limits<double>::infinity());
+  double bias_trend_normalized_max_sigma =
+      std::numeric_limits<double>::infinity();
+  bool bias_trend_passed = false;
   bool warm_start_used = false;
   std::string outcome;
   std::string failed_gate;
@@ -631,12 +857,18 @@ public:
   bool feed_fc_navigation(const FCNavigationSample &sample);
   bool feed_board_imu(const BoardImuSample &sample);
   bool feed_stereo(const StereoAlignmentFrame &frame);
+  bool make_fc_gauge_target(double camera_timestamp, AlignmentResult &result);
   bool try_initialize(double now, AlignmentResult &result);
   bool provisional_navigation(double now, ProvisionalNavigationOutput &output) const;
+  bool commit_shadow_gauge_release(const AlignmentResult &result);
   void reset();
 
   AlignmentPhase phase() const { return phase_; }
   const OnlineAlignmentDiagnostics &last_diagnostics() const { return last_diagnostics_; }
+  const OnlineAlignmentDiagnostics &latest_evidence_diagnostics() const {
+    return latest_evidence_diagnostics_valid_ ? latest_evidence_diagnostics_
+                                              : last_diagnostics_;
+  }
   const std::string &last_rejection() const { return last_rejection_; }
   size_t fc_buffer_size() const { return fc_buffer_.size(); }
   size_t imu_buffer_size() const { return imu_buffer_.size(); }
@@ -647,6 +879,9 @@ public:
   bool candidate_active() const { return candidate_active_; }
   bool sliding_window_shadow_only() const {
     return options_.sliding_window_shadow_only;
+  }
+  bool upstream_dynamic_init_fc_gauge() const {
+    return options_.upstream_dynamic_init_fc_gauge;
   }
   size_t sliding_window_solve_count() const { return attempt_receipts_.size(); }
   bool fatal_configuration_error() const { return fatal_configuration_error_; }
@@ -737,10 +972,19 @@ private:
   std::string candidate_gate_depth_source_ =
       "explicit_gate_configuration";
   std::vector<SlidingWindowStateEstimate> previous_window_states_;
+  Eigen::Matrix<double, 15, 15> previous_window_covariance_ =
+      Eigen::Matrix<double, 15, 15>::Zero();
+  bool previous_window_covariance_valid_ = false;
   AlignmentResult latest_shadow_window_result_;
   bool latest_shadow_window_result_valid_ = false;
+  OnlineAlignmentDiagnostics latest_evidence_diagnostics_;
+  bool latest_evidence_diagnostics_valid_ = false;
   double last_sliding_window_end_time_ = -1.0;
   int sliding_window_id_ = 0;
+  double sliding_overlap_stable_since_ = -1.0;
+  double sliding_overlap_last_window_end_ = -1.0;
+  double sliding_prevalidation_stable_since_ = -1.0;
+  double sliding_prevalidation_last_window_end_ = -1.0;
 
   void prune(double newest_timestamp);
   void transition(AlignmentPhase next, double stream_time,

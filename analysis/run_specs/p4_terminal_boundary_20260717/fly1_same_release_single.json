@@ -1,0 +1,17 @@
+{
+  "experiment_id": "p4_terminal_boundary_redesign_20260717",
+  "flight_name": "fly1",
+  "method_name": "same_release_fc_single_row_control",
+  "date": "20260717",
+  "status": "control",
+  "gps_csv": "D:/vscode_dir/open_vins_p4_sliding_r1/config/d455_fly1/fc_gps_cam_time.csv",
+  "vio_traj": "C:/Users/baloney/Desktop/实验目录/P4_terminal_boundary_redesign_20260717/same_release_controls/20260717_130634_fly1_same_release_single_row/traj_nav.txt",
+  "vio_bias": "C:/Users/baloney/Desktop/实验目录/P4_terminal_boundary_redesign_20260717/same_release_controls/20260717_130634_fly1_same_release_single_row/traj.txt.bias",
+  "diag_csv": "C:/Users/baloney/Desktop/实验目录/P4_terminal_boundary_redesign_20260717/same_release_controls/20260717_130634_fly1_same_release_single_row/diag.csv",
+  "t0": 1054.896608591,
+  "t1": 1150.967029333,
+  "alignment": {"mode": "start_heading", "course_window_s": 60.0},
+  "sampling": {"mode": "gps_update_after_vio", "max_delay_s": 0.2},
+  "segmentation": {"mode": "geometry"},
+  "notes": "FC single-row control generated at the exact P4 release state timestamp; evaluated over the P4 common output interval."
+}

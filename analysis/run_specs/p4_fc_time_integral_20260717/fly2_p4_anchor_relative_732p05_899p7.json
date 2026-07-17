@@ -1,0 +1,17 @@
+{
+  "experiment_id": "p4_fc_anchor_relative_20260717",
+  "flight_name": "fly2",
+  "method_name": "p4_anchor_relative_732p05_899p7",
+  "date": "20260717",
+  "status": "candidate",
+  "gps_csv": "/mnt/c/Users/baloney/Desktop/20260518_gsmq_d455_fly2/result/fc_rebuild_20260614/gps_refined_finealign.csv",
+  "vio_traj": "/mnt/c/Users/baloney/Desktop/P4_direct_sliding_state_20260717/anchor_relative_fc_half_v14/20260717_103241_fly2_anchor_relative_fc_half/fly2/traj_nav.txt",
+  "vio_bias": "/mnt/c/Users/baloney/Desktop/P4_direct_sliding_state_20260717/anchor_relative_fc_half_v14/20260717_103241_fly2_anchor_relative_fc_half/fly2/traj.txt.bias",
+  "diag_csv": "/mnt/c/Users/baloney/Desktop/P4_direct_sliding_state_20260717/anchor_relative_fc_half_v14/20260717_103241_fly2_anchor_relative_fc_half/fly2/diag.csv",
+  "t0": 732.049474955,
+  "t1": 899.7,
+  "alignment": {"mode": "start_heading", "course_window_s": 60.0},
+  "sampling": {"mode": "gps_update_after_vio", "max_delay_s": 0.2},
+  "segmentation": {"mode": "geometry"},
+  "notes": "Gauge/shape separated FC model, strict common start at first valid P4 output."
+}

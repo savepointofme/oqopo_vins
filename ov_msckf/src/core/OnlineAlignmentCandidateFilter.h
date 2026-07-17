@@ -101,6 +101,10 @@ struct CandidateGroupGate {
   double history_duration_s = 0.0;
   std::size_t history_length_updates = 0;
   int min_supported_updates = 0;
+  /// q/bg/ba feedback must be followed by this much supported sensor time.
+  /// A fixed update count may still be used as a minimum-completeness fallback
+  /// in tests, but production release uses this duration.
+  double post_feedback_validation_duration_s = 0.0;
   int required_post_feedback_stable_updates = 0;
   Eigen::Vector3d max_abs_error = Eigen::Vector3d::Constant(
       std::numeric_limits<double>::infinity());
@@ -147,6 +151,8 @@ struct CandidateGroupRuntime {
   int consecutive_stable_updates = 0;
   int post_first_feedback_stable_updates = 0;
   int feedback_count = 0;
+  double first_feedback_board_time = -1.0;
+  double post_feedback_stable_duration_s = 0.0;
   bool converged = false;
   bool last_gate_passed = false;
   bool last_feedback_clipped = false;

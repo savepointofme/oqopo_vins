@@ -33,6 +33,8 @@
 #include "state/State.h"
 #include "state/StateHelper.h"
 
+#include <Eigen/Eigenvalues>
+
 using namespace ov_core;
 using namespace ov_type;
 using namespace ov_msckf;
@@ -160,37 +162,178 @@ void VioManager::initialize_with_online_alignment(
     PRINT_ERROR(RED "[ONLINE-ALIGN] invalid or non-causal release rejected\n" RESET);
     return;
   }
+  OnlineAlignmentResult applied_result = result;
+  Eigen::Matrix<double, 15, 15> release_covariance =
+      online_alignment_release_covariance_override_enabled_
+          ? online_alignment_release_covariance_override_
+          : result.covariance;
+  const auto covariance_std = [](const Eigen::Matrix<double, 15, 15> &P) {
+    return P.diagonal().cwiseMax(0.0).cwiseSqrt();
+  };
+  applied_result.diagnostics.handoff_raw_covariance_std =
+      covariance_std(result.covariance);
+
+  const bool apply_native_handoff_inflation =
+      result.diagnostics.direct_sliding_state_release &&
+      !online_alignment_release_covariance_override_enabled_;
+  if (apply_native_handoff_inflation) {
+    const double orientation_inflation =
+        params.init_options.init_dyn_inflation_orientation;
+    const double velocity_inflation =
+        params.init_options.init_dyn_inflation_velocity;
+    const double gyro_bias_inflation =
+        params.init_options.init_dyn_inflation_bias_gyro;
+    const double accel_bias_inflation =
+        params.init_options.init_dyn_inflation_bias_accel;
+    std::string inflation_failure;
+    Eigen::MatrixXd active_covariance = release_covariance;
+    if (!StateHelper::inflate_initial_imu_subspace_covariance(
+            active_covariance, orientation_inflation, velocity_inflation,
+            gyro_bias_inflation, accel_bias_inflation,
+            &inflation_failure)) {
+      PRINT_ERROR(RED
+                  "[ONLINE-ALIGN] terminal covariance handoff inflation "
+                  "rejected: %s\n"
+                  RESET,
+                  inflation_failure.c_str());
+      return;
+    }
+    release_covariance = active_covariance.block<15, 15>(0, 0);
+    applied_result.diagnostics.handoff_covariance_inflation_applied = true;
+    applied_result.diagnostics.handoff_covariance_model =
+        "openvins_dynamic_initializer_terminal_state";
+    applied_result.diagnostics.handoff_covariance_inflation = {
+        orientation_inflation, velocity_inflation, gyro_bias_inflation,
+        accel_bias_inflation};
+    PRINT_INFO(
+        GREEN
+        "[ONLINE-ALIGN] terminal-state handoff with upstream covariance "
+        "inflation [att %.1f vel %.1f bg %.1f ba %.1f]\n"
+        RESET,
+        orientation_inflation, velocity_inflation, gyro_bias_inflation,
+        accel_bias_inflation);
+  } else if (online_alignment_release_covariance_override_enabled_) {
+    applied_result.diagnostics.handoff_covariance_model =
+        "diagnostic_cli_diagonal_no_history";
+  }
+  applied_result.covariance = release_covariance;
+  applied_result.initial_clones.clear();
+  applied_result.initial_landmarks.clear();
+  applied_result.startup_consumed_feature_ids.clear();
+  applied_result.initial_joint_covariance.resize(0, 0);
+  applied_result.diagnostics.initial_history_clone_count = 0;
+  applied_result.diagnostics.initial_persistent_landmark_count = 0;
+  applied_result.diagnostics.initial_joint_covariance_dimension = 0;
+  applied_result.diagnostics.initial_history_covariance_recovered = false;
+  applied_result.diagnostics.handoff_applied_covariance_std =
+      covariance_std(release_covariance);
   Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 15, 15>> eig(
-      result.covariance);
+      release_covariance);
   if (eig.info() != Eigen::Success || eig.eigenvalues().minCoeff() <= 0.0) {
     PRINT_ERROR(RED "[ONLINE-ALIGN] non-positive initial covariance rejected\n" RESET);
     return;
   }
 
   Eigen::Matrix<double, 16, 1> imu_state;
-  imu_state << result.q_GtoI, result.p_IinG, result.v_IinG, result.bg,
+  const Eigen::Vector3d estimator_position =
+      online_alignment_local_estimator_origin_enabled_
+          ? Eigen::Vector3d::Zero()
+          : result.p_IinG;
+  imu_state << result.q_GtoI, estimator_position, result.v_IinG, result.bg,
       result.ba;
   state->_imu->set_value(imu_state);
   state->_imu->set_fej(imu_state);
   std::vector<std::shared_ptr<ov_type::Type>> order = {state->_imu};
-  StateHelper::set_initial_covariance(state, result.covariance, order);
-
+  StateHelper::set_initial_covariance(state, release_covariance, order);
   state->_timestamp = result.timestamp;
+
   startup_time = result.timestamp;
+  // Match the standard OpenVINS dynamic-initializer boundary: the graph is an
+  // initializer, not an already-running EKF. Only its terminal IMU state and
+  // 15-D marginal enter the filter; normal OpenVINS propagation rebuilds clone
+  // history from subsequent causal camera frames.
   trackFEATS->get_feature_database()->cleanup_measurements(state->_timestamp);
   trackFEATS->set_num_features(std::floor(
       static_cast<double>(params.num_pts) /
       static_cast<double>(params.state_options.num_cameras)));
-  if (trackARUCO != nullptr)
-    trackARUCO->get_feature_database()->cleanup_measurements(state->_timestamp);
+  if (trackARUCO != nullptr) {
+    trackARUCO->get_feature_database()->cleanup_measurements(
+        state->_timestamp);
+  }
   camera_queue_init.clear();
   propagator->invalidate_cache();
   has_moved_since_zupt = state->_imu->vel().norm() > params.zupt_max_velocity;
   thread_init_success = true;
   thread_init_running = false;
   is_initialized_vio = true;
-  online_alignment_result_ = result;
+  online_alignment_result_ = applied_result;
   online_alignment_result_valid_ = true;
+
+  PRINT_INFO(GREEN
+             "[ONLINE-ALIGN] released terminal q/p/v/bg/ba only; graph clones, "
+             "landmarks, and joint history covariance were not injected\n"
+             RESET);
+
+  if (online_alignment_local_estimator_origin_enabled_) {
+    PRINT_INFO(GREEN
+               "[ONLINE-ALIGN][LOCAL-W0] estimator p_W0=[0 0 0], "
+               "fixed output p_W0inGnav=[%.6f %.6f %.6f]; q/v/bg/ba and "
+               "15x15 covariance unchanged\n" RESET,
+               result.p_IinG.x(), result.p_IinG.y(), result.p_IinG.z());
+  }
+
+  if (post_alignment_camera_extrinsic_rotation_enabled_) {
+    const auto calibration_it = state->_calib_IMUtoCAM.find(0);
+    if (calibration_it == state->_calib_IMUtoCAM.end() ||
+        calibration_it->second == nullptr) {
+      PRINT_ERROR(RED "[ONLINE-ALIGN][CAM-EXTRINSIC-ABLATION] camera 0 calibration missing\n" RESET);
+    } else {
+      const Eigen::Matrix3d R_old = calibration_it->second->Rot();
+      const Eigen::Matrix3d R_new =
+          ov_core::exp_so3(post_alignment_camera_extrinsic_left_rotvec_rad_) *
+          R_old;
+      Eigen::Matrix<double, 7, 1> value = calibration_it->second->value();
+      value.block<4, 1>(0, 0) = ov_core::rot_2_quat(R_new);
+      calibration_it->second->set_value(value);
+      calibration_it->second->set_fej(value);
+      propagator->invalidate_cache();
+      PRINT_INFO(CYAN "[ONLINE-ALIGN][CAM-EXTRINSIC-ABLATION] post-P4 only; "
+                      "left rotvec_deg=[%+.6f %+.6f %+.6f], norm=%.6fdeg\n" RESET,
+                 post_alignment_camera_extrinsic_left_rotvec_rad_.x() * 180.0 / M_PI,
+                 post_alignment_camera_extrinsic_left_rotvec_rad_.y() * 180.0 / M_PI,
+                 post_alignment_camera_extrinsic_left_rotvec_rad_.z() * 180.0 / M_PI,
+                 post_alignment_camera_extrinsic_left_rotvec_rad_.norm() * 180.0 / M_PI);
+      PRINT_INFO(CYAN "[ONLINE-ALIGN][CAM-EXTRINSIC-ABLATION] old_R_ItoC=[%.9f %.9f %.9f; %.9f %.9f %.9f; %.9f %.9f %.9f]\n" RESET,
+                 R_old(0, 0), R_old(0, 1), R_old(0, 2),
+                 R_old(1, 0), R_old(1, 1), R_old(1, 2),
+                 R_old(2, 0), R_old(2, 1), R_old(2, 2));
+      PRINT_INFO(CYAN "[ONLINE-ALIGN][CAM-EXTRINSIC-ABLATION] new_R_ItoC=[%.9f %.9f %.9f; %.9f %.9f %.9f; %.9f %.9f %.9f]\n" RESET,
+                 R_new(0, 0), R_new(0, 1), R_new(0, 2),
+                 R_new(1, 0), R_new(1, 1), R_new(1, 2),
+                 R_new(2, 0), R_new(2, 1), R_new(2, 2));
+    }
+  }
+
+  if (online_alignment_release_covariance_override_enabled_) {
+    const Eigen::Matrix<double, 15, 1> source_diag =
+        result.covariance.diagonal();
+    const Eigen::Matrix<double, 15, 1> applied_diag =
+        release_covariance.diagonal();
+    PRINT_INFO(CYAN "[ONLINE-ALIGN][COV-ABLATION] P4 nominal state and release timestamp unchanged; "
+                    "replaced only initial covariance\n" RESET);
+    PRINT_INFO(CYAN "[ONLINE-ALIGN][COV-ABLATION] source std=[att %.6g pos %.6g vel %.6g bg %.6g ba %.6g], "
+                    "applied std=[att %.6g pos %.6g vel %.6g bg %.6g ba %.6g]\n" RESET,
+               std::sqrt(source_diag.segment<3>(0).mean()),
+               std::sqrt(source_diag.segment<3>(3).mean()),
+               std::sqrt(source_diag.segment<3>(6).mean()),
+               std::sqrt(source_diag.segment<3>(9).mean()),
+               std::sqrt(source_diag.segment<3>(12).mean()),
+               std::sqrt(applied_diag.segment<3>(0).mean()),
+               std::sqrt(applied_diag.segment<3>(3).mean()),
+               std::sqrt(applied_diag.segment<3>(6).mean()),
+               std::sqrt(applied_diag.segment<3>(9).mean()),
+               std::sqrt(applied_diag.segment<3>(12).mean()));
+  }
 
   PRINT_INFO(GREEN "[ONLINE-ALIGN] RELEASED causal state at t=%.6f, solve_t=%.6f, window=[%.6f, %.6f]\n" RESET,
              result.timestamp, result.diagnostics.solve_time,
@@ -201,7 +344,7 @@ void VioManager::initialize_with_online_alignment(
              result.diagnostics.mount_residual_deg,
              result.diagnostics.rate_residual_rms_rad_s,
              result.diagnostics.visual_imu_rotation_residual_deg);
-  PRINT_INFO(GREEN "[ONLINE-ALIGN] release closed-loop updates=%d visual=%d correction=[%.3fdeg %.3fm %.3fm/s %.5frad/s %.4fm/s2], Joseph/reset=%s/%s; FC attitude is evaluation-only\n" RESET,
+  PRINT_INFO(GREEN "[ONLINE-ALIGN] release closed-loop updates=%d visual=%d correction=[%.3fdeg %.3fm %.3fm/s %.5frad/s %.4fm/s2], Joseph/reset=%s/%s; FC yaw gauge factors=%d\n" RESET,
              result.diagnostics.candidate_closed_loop_update_count,
              result.diagnostics.candidate_closed_loop_visual_update_count,
              result.diagnostics.candidate_closed_loop_attitude_correction_deg,
@@ -210,10 +353,420 @@ void VioManager::initialize_with_online_alignment(
              result.diagnostics.candidate_closed_loop_gyro_bias_correction_rad_s,
              result.diagnostics.candidate_closed_loop_accel_bias_correction_mps2,
              result.diagnostics.candidate_covariance_joseph_update_applied ? "yes" : "no",
-             result.diagnostics.candidate_covariance_error_reset_applied ? "yes" : "no");
+             result.diagnostics.candidate_covariance_error_reset_applied ? "yes" : "no",
+             result.diagnostics.fc_attitude_gauge_factor_count);
   PRINT_INFO(GREEN "[ONLINE-ALIGN] bg=[%.5f %.5f %.5f] ba=[%.5f %.5f %.5f], no continuous FC/GPS fusion\n" RESET,
              result.bg.x(), result.bg.y(), result.bg.z(), result.ba.x(),
-             result.ba.y(), result.ba.z());
+              result.ba.y(), result.ba.z());
+}
+
+bool VioManager::process_online_alignment_shadow_window(
+    const OnlineAlignmentResult &window_result) {
+  if (!is_initialized_vio || state == nullptr || state->_imu == nullptr ||
+      propagator == nullptr || online_alignment_initializer_ == nullptr ||
+      (!online_alignment_initializer_->sliding_window_shadow_only() &&
+       !online_alignment_initializer_->upstream_dynamic_init_fc_gauge()) ||
+      online_alignment_result_valid_)
+    return false;
+
+  const bool low_dimensional_target =
+      online_alignment_initializer_->upstream_dynamic_init_fc_gauge();
+  const bool window_quality =
+      (low_dimensional_target || window_result.diagnostics.solver_converged) &&
+      window_result.diagnostics.navigation_quality_passed &&
+      !window_result.diagnostics.future_data_used &&
+      window_result.q_GtoI.allFinite() &&
+      window_result.p_IinG.allFinite() &&
+      window_result.covariance.allFinite();
+  if (!window_quality) {
+    online_alignment_gauge_aligner_.reset();
+    PRINT_WARNING(YELLOW "[ONLINE-ALIGN][GAUGE-WINDOW] t=%.6f rejected by target quality; time window reset\n" RESET,
+                  window_result.timestamp);
+    return false;
+  }
+  if (!std::isfinite(window_result.timestamp)) {
+    online_alignment_gauge_aligner_.reset();
+    PRINT_WARNING(YELLOW "[ONLINE-ALIGN][GAUGE-WINDOW] target timestamp is non-finite\n" RESET);
+    return false;
+  }
+
+  OnlineAlignmentLocalStateSnapshot current_snapshot;
+  current_snapshot.timestamp = state->_timestamp;
+  current_snapshot.q_GtoI = state->_imu->quat();
+  current_snapshot.p_IinG = state->_imu->pos();
+  current_snapshot.v_IinG = state->_imu->vel();
+  if (online_alignment_local_state_history_.empty() ||
+      current_snapshot.timestamp >
+          online_alignment_local_state_history_.back().timestamp + 1.0e-9) {
+    online_alignment_local_state_history_.push_back(current_snapshot);
+  } else if (std::fabs(current_snapshot.timestamp -
+                       online_alignment_local_state_history_.back().timestamp) <=
+             1.0e-9) {
+    online_alignment_local_state_history_.back() = current_snapshot;
+  } else {
+    online_alignment_local_state_history_.clear();
+    online_alignment_local_state_history_.push_back(current_snapshot);
+    online_alignment_gauge_aligner_.reset();
+  }
+  const double history_keep_after =
+      state->_timestamp - online_alignment_gauge_aligner_.config().window_duration_s -
+      online_alignment_gauge_aligner_.config().maximum_observation_gap_s - 1.0;
+  while (online_alignment_local_state_history_.size() > 2 &&
+         online_alignment_local_state_history_[1].timestamp <
+             history_keep_after)
+    online_alignment_local_state_history_.pop_front();
+
+  const Eigen::MatrixXd local_covariance =
+      StateHelper::get_marginal_covariance(state, {state->_imu});
+  if (local_covariance.rows() != 15 || local_covariance.cols() != 15 ||
+      !local_covariance.allFinite() ||
+      (local_covariance.diagonal().array() < -1.0e-10).any()) {
+    online_alignment_gauge_aligner_.reset();
+    PRINT_WARNING(YELLOW "[ONLINE-ALIGN][GAUGE-WINDOW] local VIO covariance is invalid; time window reset\n" RESET);
+    return false;
+  }
+  const Eigen::MatrixXd symmetric_covariance =
+      0.5 * (local_covariance + local_covariance.transpose());
+  Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> covariance_solver(
+      symmetric_covariance, Eigen::EigenvaluesOnly);
+  if (covariance_solver.info() != Eigen::Success ||
+      covariance_solver.eigenvalues().minCoeff() < -1.0e-8) {
+    online_alignment_gauge_aligner_.reset();
+    PRINT_WARNING(YELLOW "[ONLINE-ALIGN][GAUGE-WINDOW] local VIO covariance is not positive semidefinite; time window reset\n" RESET);
+    return false;
+  }
+
+  Eigen::Vector4d provisional_q = state->_imu->quat();
+  Eigen::Vector3d provisional_p = state->_imu->pos();
+  Eigen::Vector3d provisional_v = state->_imu->vel();
+  bool local_state_available =
+      std::fabs(window_result.timestamp - state->_timestamp) <= 1.0e-9;
+  if (window_result.timestamp > state->_timestamp + 1.0e-9) {
+    Eigen::Matrix<double, 13, 1> propagated_state;
+    Eigen::Matrix<double, 12, 12> propagated_covariance;
+    if (!propagator->fast_state_propagate(
+            state, window_result.timestamp, propagated_state,
+            propagated_covariance)) {
+      online_alignment_gauge_aligner_.reset();
+      PRINT_WARNING(YELLOW "[ONLINE-ALIGN][GAUGE-WINDOW] no causal provisional propagation to t=%.6f\n" RESET,
+                    window_result.timestamp);
+      return false;
+    }
+    provisional_q = propagated_state.head<4>();
+    provisional_p = propagated_state.segment<3>(4);
+    provisional_v = propagated_state.segment<3>(7);
+    local_state_available = true;
+  } else if (window_result.timestamp < state->_timestamp - 1.0e-9) {
+    for (std::size_t index = 0;
+         index < online_alignment_local_state_history_.size(); ++index) {
+      const auto &snapshot = online_alignment_local_state_history_[index];
+      if (std::fabs(snapshot.timestamp - window_result.timestamp) <= 1.0e-9) {
+        provisional_q = snapshot.q_GtoI;
+        provisional_p = snapshot.p_IinG;
+        provisional_v = snapshot.v_IinG;
+        local_state_available = true;
+        break;
+      }
+      if (index == 0 || snapshot.timestamp < window_result.timestamp)
+        continue;
+      const auto &before = online_alignment_local_state_history_[index - 1];
+      if (before.timestamp > window_result.timestamp)
+        break;
+      const double span = snapshot.timestamp - before.timestamp;
+      if (!(span > 0.0))
+        break;
+      const double alpha =
+          (window_result.timestamp - before.timestamp) / span;
+      Eigen::Quaterniond q_before(ov_core::quat_2_Rot(before.q_GtoI));
+      Eigen::Quaterniond q_after(ov_core::quat_2_Rot(snapshot.q_GtoI));
+      if (q_before.dot(q_after) < 0.0)
+        q_after.coeffs() *= -1.0;
+      provisional_q = ov_core::rot_2_quat(
+          q_before.slerp(alpha, q_after).normalized().toRotationMatrix());
+      provisional_p =
+          (1.0 - alpha) * before.p_IinG + alpha * snapshot.p_IinG;
+      provisional_v =
+          (1.0 - alpha) * before.v_IinG + alpha * snapshot.v_IinG;
+      local_state_available = true;
+      break;
+    }
+  }
+  if (!local_state_available) {
+    PRINT_INFO(CYAN "[ONLINE-ALIGN][GAUGE-WINDOW] waiting for local VIO history bracket at t=%.6f (history %.6f..%.6f, active %.6f)\n" RESET,
+               window_result.timestamp,
+               online_alignment_local_state_history_.empty()
+                   ? -1.0
+                   : online_alignment_local_state_history_.front().timestamp,
+               online_alignment_local_state_history_.empty()
+                   ? -1.0
+                   : online_alignment_local_state_history_.back().timestamp,
+               state->_timestamp);
+    return false;
+  }
+
+  const Eigen::Matrix3d provisional_R_ItoG =
+      ov_core::quat_2_Rot(provisional_q).transpose();
+  const Eigen::Matrix3d target_R_ItoG =
+      ov_core::quat_2_Rot(window_result.q_GtoI).transpose();
+  const Eigen::Matrix3d gauge_rotation_observation =
+      target_R_ItoG * provisional_R_ItoG.transpose();
+  const double gauge_yaw =
+      std::atan2(gauge_rotation_observation(1, 0),
+                 gauge_rotation_observation(0, 0));
+  const double target_yaw_variance = std::max(
+      0.0, window_result.covariance.block<3, 3>(0, 0)
+               .diagonal()
+               .maxCoeff());
+  const double local_yaw_variance = std::max(
+      0.0, local_covariance.block<3, 3>(0, 0).diagonal().maxCoeff());
+  OnlineVioFcGaugeObservation observation;
+  observation.timestamp = window_result.timestamp;
+  observation.yaw_rad = gauge_yaw;
+  observation.yaw_sigma_deg =
+      std::sqrt(target_yaw_variance + local_yaw_variance) * 180.0 / M_PI;
+  observation.target_position = window_result.p_IinG;
+  observation.target_velocity = window_result.v_IinG;
+  observation.local_position = provisional_p;
+  observation.local_velocity = provisional_v;
+  std::string push_reason;
+  if (!online_alignment_gauge_aligner_.push(observation, &push_reason)) {
+    PRINT_WARNING(YELLOW "[ONLINE-ALIGN][GAUGE-WINDOW] t=%.6f observation rejected: %s\n" RESET,
+                  window_result.timestamp, push_reason.c_str());
+    return false;
+  }
+  ++online_alignment_gauge_window_count_;
+  const OnlineVioFcGaugeEstimate estimate =
+      online_alignment_gauge_aligner_.estimate();
+
+  PRINT_INFO(CYAN "[ONLINE-ALIGN][GAUGE-WINDOW] t=%.6f n=%d duration=%.3f/%.3fs gap=%.3fs yaw=%+.3fdeg yaw_mad=%.3fdeg unit_vfit_diag=%.3fm/s translation_rmse_diag=%.3fm decision=%s\n" RESET,
+             window_result.timestamp, estimate.observation_count,
+             estimate.covered_duration_s,
+             online_alignment_gauge_aligner_.config().window_duration_s,
+             estimate.maximum_observation_gap_s,
+             estimate.yaw_rad * 180.0 / M_PI, estimate.yaw_mad_deg,
+             estimate.unit_scale_velocity_rmse_mps,
+             estimate.translation_rmse_m, estimate.reason.c_str());
+  if (!estimate.ready)
+    return false;
+  if (online_alignment_options_.sliding_window_diagnostic_never_anchor) {
+    PRINT_INFO(CYAN "[ONLINE-ALIGN][DIAGNOSTIC] gauge is ready but the "
+                    "anchor is intentionally disabled; provisional VIO "
+                    "continues unchanged\n" RESET);
+    return false;
+  }
+
+  OnlineAlignmentResult release = window_result;
+  // The similarity was estimated from a historical causal window, but it is a
+  // global coordinate transform. Apply it atomically to the current active
+  // state instead of pretending that the active state still lives at the last
+  // FC sample time.
+  release.timestamp = state->_timestamp;
+  release.released_to_openvins = true;
+  release.readiness = AlignmentReadiness::NAVIGATION_READY;
+  release.diagnostics.readiness = release.readiness;
+  release.diagnostics.quality_passed = true;
+  release.diagnostics.decision_time =
+      window_result.diagnostics.solve_time;
+  release.diagnostics.readiness_reason =
+      "upstream_dynamic_init_then_causal_vio_fc_yaw_translation_window_scale_deferred_to_agl_output";
+  release.diagnostics.gauge_window_observation_count =
+      online_alignment_gauge_window_count_;
+  release.diagnostics.gauge_stability_required_s =
+      online_alignment_gauge_aligner_.config().window_duration_s;
+  release.diagnostics.gauge_stable_duration_s =
+      estimate.covered_duration_s;
+  release.diagnostics.gauge_yaw_delta_from_previous_deg =
+      estimate.yaw_mad_deg;
+  release.diagnostics.gauge_translation_delta_from_previous_m =
+      estimate.translation_rmse_m;
+  release.diagnostics.gauge_yaw_consistency_limit_deg =
+      online_alignment_gauge_aligner_.config().maximum_yaw_mad_deg;
+  release.diagnostics.gauge_translation_consistency_limit_m =
+      std::numeric_limits<double>::infinity();
+  release.diagnostics.gauge_metric_scale = 1.0;
+  release.diagnostics.gauge_metric_scale_observed =
+      estimate.observed_metric_scale;
+  release.diagnostics.gauge_metric_scale_sigma =
+      estimate.observed_metric_scale_sigma;
+  release.diagnostics.gauge_velocity_fit_rmse_mps =
+      estimate.unit_scale_velocity_rmse_mps;
+  release.diagnostics.gauge_velocity_excitation_mps = 0.0;
+  release.diagnostics.gauge_yaw_reset_deg =
+      estimate.yaw_rad * 180.0 / M_PI;
+  release.diagnostics.gauge_translation_G = estimate.translation_G;
+  release.diagnostics.gauge_window_quality_passed = true;
+  release.diagnostics.gauge_consistency_passed = true;
+  if (!anchor_with_online_alignment(release))
+    return false;
+  if (!online_alignment_initializer_->commit_shadow_gauge_release(release)) {
+    online_alignment_result_valid_ = false;
+    PRINT_ERROR(RED "[ONLINE-ALIGN][GAUGE] initializer refused an already-applied formal shadow release\n" RESET);
+    return false;
+  }
+  return true;
+}
+
+bool VioManager::anchor_with_online_alignment(
+    const OnlineAlignmentResult &result) {
+  if (!is_initialized_vio || state == nullptr || state->_imu == nullptr) {
+    PRINT_ERROR(RED "[ONLINE-ALIGN][GAUGE] provisional VIO is unavailable\n" RESET);
+    return false;
+  }
+  if (online_alignment_result_valid_) {
+    PRINT_WARNING(YELLOW "[ONLINE-ALIGN][GAUGE] duplicate anchor ignored\n" RESET);
+    return false;
+  }
+  if (!result.released_to_openvins || !result.diagnostics.quality_passed ||
+      result.diagnostics.future_data_used || !result.q_GtoI.allFinite() ||
+      !result.p_IinG.allFinite()) {
+    PRINT_ERROR(RED "[ONLINE-ALIGN][GAUGE] invalid or non-causal anchor rejected\n" RESET);
+    return false;
+  }
+  if (!std::isfinite(result.timestamp) ||
+      result.timestamp < state->_timestamp - 1.0e-6) {
+    PRINT_ERROR(RED "[ONLINE-ALIGN][GAUGE] anchor precedes active state: state=%.9f result=%.9f\n" RESET,
+                state->_timestamp, result.timestamp);
+    return false;
+  }
+
+  Eigen::Vector4d provisional_q_at_anchor = state->_imu->quat();
+  Eigen::Vector3d provisional_p_at_anchor = state->_imu->pos();
+  if (result.timestamp > state->_timestamp + 1.0e-9) {
+    Eigen::Matrix<double, 13, 1> propagated_state;
+    Eigen::Matrix<double, 12, 12> propagated_covariance;
+    if (propagator == nullptr ||
+        !propagator->fast_state_propagate(
+            state, result.timestamp, propagated_state,
+            propagated_covariance)) {
+      PRINT_ERROR(RED "[ONLINE-ALIGN][GAUGE] provisional VIO cannot be propagated to anchor t=%.9f from state t=%.9f\n" RESET,
+                  result.timestamp, state->_timestamp);
+      return false;
+    }
+    provisional_q_at_anchor = propagated_state.head<4>();
+    provisional_p_at_anchor = propagated_state.segment<3>(4);
+  }
+
+  const Eigen::Matrix3d R_ItoG_current =
+      ov_core::quat_2_Rot(provisional_q_at_anchor).transpose();
+  const Eigen::Matrix3d R_ItoG_target =
+      ov_core::quat_2_Rot(result.q_GtoI).transpose();
+  const double yaw_current =
+      std::atan2(R_ItoG_current(1, 0), R_ItoG_current(0, 0));
+  const double yaw_target =
+      std::atan2(R_ItoG_target(1, 0), R_ItoG_target(0, 0));
+  double yaw_delta =
+      std::atan2(std::sin(yaw_target - yaw_current),
+                 std::cos(yaw_target - yaw_current));
+  double metric_scale = 1.0;
+  Eigen::Vector3d gauge_translation = Eigen::Vector3d::Zero();
+  const bool supervised_gauge =
+      result.diagnostics.gauge_consistency_passed &&
+      std::isfinite(result.diagnostics.gauge_metric_scale) &&
+      result.diagnostics.gauge_metric_scale > 0.0 &&
+      std::isfinite(result.diagnostics.gauge_yaw_reset_deg) &&
+      result.diagnostics.gauge_translation_G.allFinite();
+  if (supervised_gauge) {
+    metric_scale = 1.0;
+    yaw_delta = result.diagnostics.gauge_yaw_reset_deg * M_PI / 180.0;
+    gauge_translation = result.diagnostics.gauge_translation_G;
+  }
+  const Eigen::Matrix3d gauge_rotation =
+      Eigen::AngleAxisd(yaw_delta, Eigen::Vector3d::UnitZ())
+          .toRotationMatrix();
+  if (!supervised_gauge) {
+    gauge_translation =
+        result.p_IinG - gauge_rotation * provisional_p_at_anchor;
+  }
+  const Eigen::Vector3d active_state_target_position =
+      metric_scale * gauge_rotation * state->_imu->pos() +
+      gauge_translation;
+
+  const Eigen::Vector3d bg_before = state->_imu->bias_g();
+  const Eigen::Vector3d ba_before = state->_imu->bias_a();
+  const std::size_t clone_count_before = state->_clones_IMU.size();
+  const std::size_t landmark_count_before = state->_features_SLAM.size();
+  const auto reset =
+      StateHelper::apply_global_yaw_scale_translation_reset(
+          state, metric_scale, yaw_delta, active_state_target_position,
+          propagator.get(), 0);
+  if (!reset.success) {
+    PRINT_ERROR(RED "[ONLINE-ALIGN][GAUGE] atomic reset rejected: %s\n" RESET,
+                reset.failure_reason.c_str());
+    return false;
+  }
+  if (!state->_imu->bias_g().isApprox(bg_before, 1.0e-12) ||
+      !state->_imu->bias_a().isApprox(ba_before, 1.0e-12) ||
+      state->_clones_IMU.size() != clone_count_before ||
+      state->_features_SLAM.size() != landmark_count_before) {
+    PRINT_ERROR(RED "[ONLINE-ALIGN][GAUGE] post-reset lifecycle invariant failed\n" RESET);
+    return false;
+  }
+
+  online_alignment_result_ = result;
+  online_alignment_result_.timestamp = state->_timestamp;
+  online_alignment_result_.q_GtoI = state->_imu->quat();
+  online_alignment_result_.p_IinG = state->_imu->pos();
+  online_alignment_result_.v_IinG = state->_imu->vel();
+  online_alignment_result_.bg = state->_imu->bias_g();
+  online_alignment_result_.ba = state->_imu->bias_a();
+  online_alignment_result_.covariance =
+      StateHelper::get_marginal_covariance(state, {state->_imu});
+  online_alignment_result_valid_ = true;
+  startup_time = state->_timestamp;
+
+  PRINT_INFO(GREEN "[ONLINE-ALIGN][GAUGE] RELEASED at state_t=%.6f anchor_t=%.6f scale=%.6f yaw_reset=%+.3fdeg "
+                   "translation=[%+.3f %+.3f %+.3f], preserved bg/ba, "
+                   "clones=%zu landmarks=%zu\n" RESET,
+             state->_timestamp, result.timestamp,
+             metric_scale,
+             yaw_delta * 180.0 / M_PI,
+             reset.translation.x(), reset.translation.y(),
+             reset.translation.z(), clone_count_before,
+             landmark_count_before);
+  return true;
+}
+
+bool VioManager::set_online_alignment_release_covariance_override(
+    double sigma_att_rad, double sigma_pos, double sigma_vel,
+    double sigma_bg, double sigma_ba) {
+  const std::array<double, 5> sigmas = {
+      sigma_att_rad, sigma_pos, sigma_vel, sigma_bg, sigma_ba};
+  for (double sigma : sigmas) {
+    if (!std::isfinite(sigma) || sigma <= 0.0) {
+      PRINT_ERROR(RED "[ONLINE-ALIGN][COV-ABLATION] all covariance sigmas must be finite and positive\n" RESET);
+      return false;
+    }
+  }
+  online_alignment_release_covariance_override_.setZero();
+  online_alignment_release_covariance_override_.block<3, 3>(0, 0) =
+      std::pow(sigma_att_rad, 2) * Eigen::Matrix3d::Identity();
+  online_alignment_release_covariance_override_.block<3, 3>(3, 3) =
+      std::pow(sigma_pos, 2) * Eigen::Matrix3d::Identity();
+  online_alignment_release_covariance_override_.block<3, 3>(6, 6) =
+      std::pow(sigma_vel, 2) * Eigen::Matrix3d::Identity();
+  online_alignment_release_covariance_override_.block<3, 3>(9, 9) =
+      std::pow(sigma_bg, 2) * Eigen::Matrix3d::Identity();
+  online_alignment_release_covariance_override_.block<3, 3>(12, 12) =
+      std::pow(sigma_ba, 2) * Eigen::Matrix3d::Identity();
+  online_alignment_release_covariance_override_enabled_ = true;
+  return true;
+}
+
+bool VioManager::configure_post_alignment_camera_extrinsic_rotation(
+    const Eigen::Vector3d &left_rotvec_rad) {
+  if (!left_rotvec_rad.allFinite() ||
+      left_rotvec_rad.norm() > 10.0 * M_PI / 180.0) {
+    PRINT_ERROR(RED "[ONLINE-ALIGN][CAM-EXTRINSIC-ABLATION] rotation must be finite and <=10deg\n" RESET);
+    return false;
+  }
+  if (is_initialized_vio) {
+    PRINT_ERROR(RED "[ONLINE-ALIGN][CAM-EXTRINSIC-ABLATION] must be configured before initialization\n" RESET);
+    return false;
+  }
+  post_alignment_camera_extrinsic_rotation_enabled_ =
+      left_rotvec_rad.norm() > 1e-12;
+  post_alignment_camera_extrinsic_left_rotvec_rad_ = left_rotvec_rad;
+  return true;
 }
 
 // =============================================================================

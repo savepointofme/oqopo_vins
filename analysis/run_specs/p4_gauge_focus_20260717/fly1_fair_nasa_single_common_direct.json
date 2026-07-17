@@ -1,0 +1,17 @@
+{
+  "experiment_id": "p4_direct_sliding_state_20260717",
+  "flight_name": "fly1",
+  "method_name": "single_row_covlocked_nasa_stride12_common_direct",
+  "date": "20260717",
+  "status": "partial",
+  "gps_csv": "C:/Users/baloney/Desktop/20260517_gsmq_d455_fly1/result/fc_rebuild_20260614/gps_refined_finealign.csv",
+  "vio_traj": "C:/Users/baloney/Desktop/实验目录/P4_provisional_gauge_refactor_20260717/fair_nasa_single/20260717_025346_fly1/traj_nav.txt",
+  "vio_bias": "C:/Users/baloney/Desktop/实验目录/P4_provisional_gauge_refactor_20260717/fair_nasa_single/20260717_025346_fly1/traj.txt.bias",
+  "diag_csv": "C:/Users/baloney/Desktop/实验目录/P4_provisional_gauge_refactor_20260717/fair_nasa_single/20260717_025346_fly1/diag.csv",
+  "t0": 947.250199795,
+  "t1": 1150.8,
+  "alignment": {"mode": "start_heading", "course_window_s": 60.0},
+  "sampling": {"mode": "gps_update_after_vio", "max_delay_s": 0.2},
+  "segmentation": {"mode": "geometry"},
+  "notes": "Fair single-row control cropped to the exact direct-release evaluation interval."
+}

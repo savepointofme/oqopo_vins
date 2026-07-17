@@ -214,9 +214,26 @@ add_executable(test_online_alignment_initializer src/test_online_alignment_initi
 target_link_libraries(test_online_alignment_initializer ov_msckf_lib ${thirdparty_libraries})
 add_test(NAME test_online_alignment_initializer COMMAND test_online_alignment_initializer)
 
+add_executable(test_online_vio_fc_gauge_aligner
+  src/test_online_vio_fc_gauge_aligner.cpp)
+target_link_libraries(test_online_vio_fc_gauge_aligner ${thirdparty_libraries})
+add_test(NAME test_online_vio_fc_gauge_aligner
+  COMMAND test_online_vio_fc_gauge_aligner)
+
+add_executable(test_online_alignment_window_injection
+  src/test_online_alignment_window_injection.cpp)
+target_link_libraries(test_online_alignment_window_injection
+  ov_msckf_lib ${thirdparty_libraries})
+add_test(NAME test_online_alignment_window_injection
+  COMMAND test_online_alignment_window_injection)
+
 add_executable(test_online_alignment_candidate_filter src/test_online_alignment_candidate_filter.cpp)
 target_link_libraries(test_online_alignment_candidate_filter ov_msckf_lib ${thirdparty_libraries})
 add_test(NAME test_online_alignment_candidate_filter COMMAND test_online_alignment_candidate_filter)
+
+add_executable(test_visual_observability_policy src/test_visual_observability_policy.cpp)
+target_link_libraries(test_visual_observability_policy ov_msckf_lib ${thirdparty_libraries})
+add_test(NAME test_visual_observability_policy COMMAND test_visual_observability_policy)
 
 # Camera/IMU external-YAML extrinsic direction regression tests.
 add_executable(test_camera_extrinsic_parser src/test_camera_extrinsic_parser.cpp)
@@ -251,12 +268,34 @@ install(TARGETS test_adaptive_stride
         RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
-# Header-only P5 state-machine replay used to recompute shadow timelines from
-# existing estimator telemetry without rerunning fixed-stride estimators.
-add_executable(p5_shadow_state_replay src/p5_shadow_state_replay.cpp)
-target_link_libraries(p5_shadow_state_replay ${thirdparty_libraries})
-install(TARGETS p5_shadow_state_replay
-        RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
+add_executable(test_dynamic_turn_roi src/test_dynamic_turn_roi.cpp)
+target_link_libraries(test_dynamic_turn_roi ov_msckf_lib ${thirdparty_libraries})
+install(TARGETS test_dynamic_turn_roi
+  RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+# Atomic post-MSCKF scene-scale reset contract tests.
+add_executable(test_state_sim3_scale_reset src/test_state_sim3_scale_reset.cpp)
+target_link_libraries(test_state_sim3_scale_reset ov_msckf_lib ${thirdparty_libraries})
+install(TARGETS test_state_sim3_scale_reset
+  RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+add_executable(test_agl_scene_scale_ground_estimator
+  src/test_agl_scene_scale_ground_estimator.cpp)
+target_link_libraries(test_agl_scene_scale_ground_estimator
+  ov_msckf_lib ${thirdparty_libraries})
+install(TARGETS test_agl_scene_scale_ground_estimator
+  RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+add_executable(test_agl_scene_scale_controller
+  src/test_agl_scene_scale_controller.cpp)
+target_link_libraries(test_agl_scene_scale_controller
+  ov_msckf_lib ${thirdparty_libraries})
+install(TARGETS test_agl_scene_scale_controller
+  RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
 
 # Pure external-anchor source-quality and trust-policy tests.
 add_executable(test_anchor_trust_policy src/test_anchor_trust_policy.cpp)
@@ -280,6 +319,12 @@ if (BUILD_TESTING)
     add_test(NAME test_fc_init_loader COMMAND test_fc_init_loader)
     add_test(NAME test_camera_extrinsic_parser COMMAND test_camera_extrinsic_parser)
     add_test(NAME test_adaptive_stride COMMAND test_adaptive_stride)
+    add_test(NAME test_dynamic_turn_roi COMMAND test_dynamic_turn_roi)
+    add_test(NAME test_state_sim3_scale_reset COMMAND test_state_sim3_scale_reset)
+    add_test(NAME test_agl_scene_scale_ground_estimator
+             COMMAND test_agl_scene_scale_ground_estimator)
+    add_test(NAME test_agl_scene_scale_controller
+             COMMAND test_agl_scene_scale_controller)
     add_test(NAME test_anchor_trust_policy COMMAND test_anchor_trust_policy)
     add_test(NAME test_imu_filter COMMAND test_imu_filter)
     add_test(NAME test_joseph_update COMMAND test_joseph_update)

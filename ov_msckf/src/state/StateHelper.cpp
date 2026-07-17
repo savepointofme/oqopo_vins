@@ -21,20 +21,27 @@
 
 #include "StateHelper.h"
 
+#include "state/Propagator.h"
 #include "state/State.h"
 
 #include "types/Landmark.h"
+#include "types/PoseJPL.h"
 #include "utils/colors.h"
 #include "utils/print.h"
 
 #include <algorithm>
+#include <array>
 #include <boost/filesystem.hpp>
 #include <boost/math/distributions/chi_squared.hpp>
 #include <cmath>
+#include <exception>
 #include <fstream>
 #include <iomanip>
 #include <limits>
 #include <set>
+#include <sstream>
+#include <unordered_set>
+#include <utility>
 
 using namespace ov_core;
 using namespace ov_type;
@@ -97,14 +104,16 @@ Eigen::Vector3d yaw_position_dir(const Eigen::Vector3d &p) {
 }
 
 void fill_pose_yaw_gauge(Eigen::VectorXd &n, int col, int size, const Eigen::Matrix3d &R_GtoI,
-                         const Eigen::Vector3d &p_IinG, bool has_velocity, const Eigen::Vector3d &v_IinG) {
+                         const Eigen::Vector3d &p_IinG, bool has_velocity,
+                         const Eigen::Vector3d &v_IinG,
+                         const Eigen::Vector3d &position_reference = Eigen::Vector3d::Zero()) {
   if (col < 0 || col + size > n.rows())
     return;
   if (size >= 3) {
     n.block(col, 0, 3, 1) = R_GtoI * Eigen::Vector3d::UnitZ();
   }
   if (size >= 6) {
-    n.block(col + 3, 0, 3, 1) = yaw_position_dir(p_IinG);
+    n.block(col + 3, 0, 3, 1) = yaw_position_dir(p_IinG - position_reference);
   }
   if (has_velocity && size >= 9) {
     n.block(col + 6, 0, 3, 1) = yaw_position_dir(v_IinG);
@@ -112,20 +121,39 @@ void fill_pose_yaw_gauge(Eigen::VectorXd &n, int col, int size, const Eigen::Mat
 }
 
 void fill_landmark_yaw_gauge(Eigen::VectorXd &n, int col, const std::shared_ptr<Landmark> &lm,
-                             bool use_fej = false) {
+                             bool use_fej = false,
+                             const Eigen::Vector3d &position_reference = Eigen::Vector3d::Zero()) {
   if (lm == nullptr || col < 0 || col + lm->size() > n.rows())
     return;
   if (LandmarkRepresentation::is_relative_representation(lm->_feat_representation))
     return;
   if (lm->_feat_representation != LandmarkRepresentation::GLOBAL_3D || lm->size() != 3)
     return;
-  n.block(col, 0, 3, 1) = yaw_position_dir(lm->get_xyz(use_fej));
+  n.block(col, 0, 3, 1) =
+      yaw_position_dir(lm->get_xyz(use_fej) - position_reference);
+}
+
+Eigen::Vector3d yaw_gauge_position_reference(std::shared_ptr<State> state,
+                                             bool use_fej) {
+  if (state == nullptr)
+    return Eigen::Vector3d::Zero();
+  if (!state->_clones_IMU.empty() && state->_clones_IMU.begin()->second != nullptr) {
+    const auto &anchor = state->_clones_IMU.begin()->second;
+    return use_fej ? anchor->pos_fej() : anchor->pos();
+  }
+  if (state->_imu != nullptr)
+    return use_fej ? state->_imu->pos_fej() : state->_imu->pos();
+  return Eigen::Vector3d::Zero();
 }
 
 Eigen::VectorXd build_global_yaw_gauge_small(std::shared_ptr<State> state, const std::vector<std::shared_ptr<Type>> &H_order,
                                              const std::vector<int> &H_id, int H_cols,
-                                             bool use_fej = false) {
+                                             bool use_fej = false,
+                                             bool center_positions = false) {
   Eigen::VectorXd n = Eigen::VectorXd::Zero(H_cols);
+  const Eigen::Vector3d position_reference = center_positions
+                                                 ? yaw_gauge_position_reference(state, use_fej)
+                                                 : Eigen::Vector3d::Zero();
   for (size_t i = 0; i < H_order.size(); i++) {
     const auto &var = H_order[i];
     const int col = H_id[i];
@@ -135,18 +163,21 @@ Eigen::VectorXd build_global_yaw_gauge_small(std::shared_ptr<State> state, const
                           use_fej ? state->_imu->Rot_fej() : state->_imu->Rot(),
                           use_fej ? state->_imu->pos_fej() : state->_imu->pos(),
                           true,
-                          use_fej ? state->_imu->vel_fej() : state->_imu->vel());
+                          use_fej ? state->_imu->vel_fej() : state->_imu->vel(),
+                          position_reference);
       continue;
     }
     if (var == state->_imu->q()) {
       fill_pose_yaw_gauge(n, col, var->size(),
                           use_fej ? state->_imu->Rot_fej() : state->_imu->Rot(),
                           use_fej ? state->_imu->pos_fej() : state->_imu->pos(),
-                          false, Eigen::Vector3d::Zero());
+                          false, Eigen::Vector3d::Zero(), position_reference);
       continue;
     }
     if (var == state->_imu->p()) {
-      n.block(col, 0, 3, 1) = yaw_position_dir(use_fej ? state->_imu->pos_fej() : state->_imu->pos());
+      n.block(col, 0, 3, 1) = yaw_position_dir(
+          (use_fej ? state->_imu->pos_fej() : state->_imu->pos()) -
+          position_reference);
       continue;
     }
     if (var == state->_imu->v()) {
@@ -164,7 +195,7 @@ Eigen::VectorXd build_global_yaw_gauge_small(std::shared_ptr<State> state, const
         fill_pose_yaw_gauge(n, col, var->size(),
                             use_fej ? pose->Rot_fej() : pose->Rot(),
                             use_fej ? pose->pos_fej() : pose->pos(),
-                            false, Eigen::Vector3d::Zero());
+                            false, Eigen::Vector3d::Zero(), position_reference);
         matched_clone = true;
         break;
       }
@@ -177,7 +208,8 @@ Eigen::VectorXd build_global_yaw_gauge_small(std::shared_ptr<State> state, const
         break;
       }
       if (var == pose->p()) {
-        n.block(col, 0, 3, 1) = yaw_position_dir(use_fej ? pose->pos_fej() : pose->pos());
+        n.block(col, 0, 3, 1) = yaw_position_dir(
+            (use_fej ? pose->pos_fej() : pose->pos()) - position_reference);
         matched_clone = true;
         break;
       }
@@ -185,9 +217,69 @@ Eigen::VectorXd build_global_yaw_gauge_small(std::shared_ptr<State> state, const
     if (matched_clone)
       continue;
 
-    fill_landmark_yaw_gauge(n, col, std::dynamic_pointer_cast<Landmark>(var), use_fej);
+    fill_landmark_yaw_gauge(n, col, std::dynamic_pointer_cast<Landmark>(var),
+                            use_fej, position_reference);
   }
   return n;
+}
+
+void fill_translation_gauge(Eigen::MatrixXd &N, int col) {
+  if (col < 0 || col + 3 > N.rows() || N.cols() < 4)
+    return;
+  N.block<3, 3>(col, 1) = Eigen::Matrix3d::Identity();
+}
+
+Eigen::MatrixXd build_global_4d_gauge_small(
+    std::shared_ptr<State> state,
+    const std::vector<std::shared_ptr<Type>> &H_order,
+    const std::vector<int> &H_id, int H_cols, bool use_fej) {
+  Eigen::MatrixXd N = Eigen::MatrixXd::Zero(H_cols, 4);
+  N.col(0) = build_global_yaw_gauge_small(
+      state, H_order, H_id, H_cols, use_fej, false);
+
+  for (size_t i = 0; i < H_order.size(); ++i) {
+    const auto &var = H_order[i];
+    const int col = H_id[i];
+    if (var == state->_imu) {
+      fill_translation_gauge(N, col + 3);
+      continue;
+    }
+    if (var == state->_imu->p()) {
+      fill_translation_gauge(N, col);
+      continue;
+    }
+    if (var == state->_imu->q() || var == state->_imu->v() ||
+        var == state->_imu->bg() || var == state->_imu->ba())
+      continue;
+
+    bool matched_clone = false;
+    for (const auto &clone : state->_clones_IMU) {
+      const auto &pose = clone.second;
+      if (var == pose) {
+        fill_translation_gauge(N, col + 3);
+        matched_clone = true;
+        break;
+      }
+      if (var == pose->p()) {
+        fill_translation_gauge(N, col);
+        matched_clone = true;
+        break;
+      }
+      if (var == pose->q()) {
+        matched_clone = true;
+        break;
+      }
+    }
+    if (matched_clone)
+      continue;
+
+    const auto landmark = std::dynamic_pointer_cast<Landmark>(var);
+    if (landmark != nullptr &&
+        landmark->_feat_representation == LandmarkRepresentation::GLOBAL_3D &&
+        landmark->size() == 3)
+      fill_translation_gauge(N, col);
+  }
+  return N;
 }
 
 // Once-per-process flags for gauge-coverage diagnostic print (one per source).
@@ -209,8 +301,12 @@ bool g_gauge_full_fej_diag_printed = false;
 // On the first call a summary is printed via PRINT_INFO to confirm coverage and flag any
 // composite-variable duplication.
 Eigen::VectorXd build_global_yaw_gauge_full(std::shared_ptr<State> state, int N,
-                                            bool use_fej = false) {
+                                            bool use_fej = false,
+                                            bool center_positions = false) {
   Eigen::VectorXd n = Eigen::VectorXd::Zero(N);
+  const Eigen::Vector3d position_reference = center_positions
+                                                 ? yaw_gauge_position_reference(state, use_fej)
+                                                 : Eigen::Vector3d::Zero();
 
   bool imu_covered  = false;
   int  n_clones     = 0;
@@ -223,7 +319,8 @@ Eigen::VectorXd build_global_yaw_gauge_full(std::shared_ptr<State> state, int N,
                         use_fej ? state->_imu->Rot_fej() : state->_imu->Rot(),
                         use_fej ? state->_imu->pos_fej() : state->_imu->pos(),
                         true,
-                        use_fej ? state->_imu->vel_fej() : state->_imu->vel());
+                        use_fej ? state->_imu->vel_fej() : state->_imu->vel(),
+                        position_reference);
     imu_covered = true;
   }
 
@@ -234,7 +331,7 @@ Eigen::VectorXd build_global_yaw_gauge_full(std::shared_ptr<State> state, int N,
     fill_pose_yaw_gauge(n, pose->id(), pose->size(),
                         use_fej ? pose->Rot_fej() : pose->Rot(),
                         use_fej ? pose->pos_fej() : pose->pos(),
-                        false, Eigen::Vector3d::Zero());
+                        false, Eigen::Vector3d::Zero(), position_reference);
     n_clones++;
   }
 
@@ -245,7 +342,7 @@ Eigen::VectorXd build_global_yaw_gauge_full(std::shared_ptr<State> state, int N,
     if (LandmarkRepresentation::is_relative_representation(lm->_feat_representation)) {
       n_slam_skip++;
     } else {
-      fill_landmark_yaw_gauge(n, lm->id(), lm, use_fej);
+      fill_landmark_yaw_gauge(n, lm->id(), lm, use_fej, position_reference);
       n_slam++;
     }
   }
@@ -288,6 +385,7 @@ Eigen::VectorXd build_global_yaw_gauge_full(std::shared_ptr<State> state, int N,
                "  SLAM relative     = %d (skipped, gauge=0, %d DOF)\n"
                "  cam_extr/intr/dt  = 0 (gauge=0, %d DOF)\n"
                "  q_full norm       = %.6f\n"
+               "  position anchor   = [%.3f %.3f %.3f] (%s)\n"
                RESET,
                use_fej ? "fej" : "current",
                N, n_nonzero,
@@ -297,7 +395,9 @@ Eigen::VectorXd build_global_yaw_gauge_full(std::shared_ptr<State> state, int N,
                n_clones,
                n_slam, n_slam_skip, n_slam_skip_dof,
                n_zero_calib_dof,
-               n.norm());
+               n.norm(),
+               position_reference.x(), position_reference.y(),
+               position_reference.z(), center_positions ? "centered" : "global-origin");
   }
 
   return n;
@@ -305,16 +405,43 @@ Eigen::VectorXd build_global_yaw_gauge_full(std::shared_ptr<State> state, int N,
 
 Eigen::MatrixXd project_global_yaw_from_H(std::shared_ptr<State> state, const std::vector<std::shared_ptr<Type>> &H_order,
                                           const std::vector<int> &H_id, const Eigen::MatrixXd &H, double alpha,
-                                          bool use_fej = false) {
+                                          bool use_fej = false,
+                                          bool center_positions = false) {
   alpha = std::max(0.0, std::min(1.0, alpha));
   if (alpha <= 1e-12)
     return H;
-  Eigen::VectorXd n = build_global_yaw_gauge_small(state, H_order, H_id, H.cols(), use_fej);
+  Eigen::VectorXd n = build_global_yaw_gauge_small(
+      state, H_order, H_id, H.cols(), use_fej, center_positions);
   const double n2 = n.squaredNorm();
   if (n2 < 1e-12)
     return H;
   Eigen::VectorXd Hn = H * n;
   return H - (alpha / n2) * Hn * n.transpose();
+}
+
+Eigen::MatrixXd project_global_4d_from_H(
+    std::shared_ptr<State> state,
+    const std::vector<std::shared_ptr<Type>> &H_order,
+    const std::vector<int> &H_id, const Eigen::MatrixXd &H, double alpha,
+    bool use_fej = false) {
+  alpha = std::max(0.0, std::min(1.0, alpha));
+  if (alpha <= 1e-12)
+    return H;
+  const Eigen::MatrixXd N = build_global_4d_gauge_small(
+      state, H_order, H_id, H.cols(), use_fej);
+  Eigen::JacobiSVD<Eigen::MatrixXd> svd(
+      N, Eigen::ComputeThinU | Eigen::ComputeThinV);
+  const Eigen::VectorXd singular_values = svd.singularValues();
+  if (singular_values.size() == 0 || singular_values(0) <= 1e-12)
+    return H;
+  const double threshold = 1e-8 * singular_values(0);
+  int rank = 0;
+  while (rank < singular_values.size() && singular_values(rank) > threshold)
+    ++rank;
+  if (rank == 0)
+    return H;
+  const Eigen::MatrixXd Q = svd.matrixU().leftCols(rank);
+  return H - alpha * (H * Q) * Q.transpose();
 }
 
 double yaw_dx_component_deg(std::shared_ptr<State> state, const Eigen::VectorXd &dx) {
@@ -330,7 +457,1165 @@ double yaw_dx_component_deg(std::shared_ptr<State> state, const Eigen::VectorXd 
   return g_local.dot(dx.segment(q_var->id(), 3)) * rad_to_deg;
 }
 
+constexpr double kScaleResetEpsilon = 1e-12;
+constexpr double kScaleResetStorageTolerance = 1e-12;
+constexpr double kScaleResetQuaternionTolerance = 1e-6;
+constexpr double kScaleResetSymmetryTolerance = 1e-10;
+constexpr double kScaleResetPsdRoundoffFactor = 64.0;
+
+Eigen::Matrix3d scale_reset_skew(const Eigen::Vector3d &v) {
+  Eigen::Matrix3d out;
+  out << 0.0, -v.z(), v.y(), v.z(), 0.0, -v.x(), -v.y(), v.x(), 0.0;
+  return out;
+}
+
+bool scale_reset_matrix_near(const Eigen::MatrixXd &a,
+                             const Eigen::MatrixXd &b) {
+  if (a.rows() != b.rows() || a.cols() != b.cols() || !a.allFinite() ||
+      !b.allFinite())
+    return false;
+  const double scale =
+      std::max(1.0, std::max(a.cwiseAbs().maxCoeff(), b.cwiseAbs().maxCoeff()));
+  return (a - b).cwiseAbs().maxCoeff() <=
+         kScaleResetStorageTolerance * scale;
+}
+
+bool scale_reset_valid_quaternion(const Eigen::Vector4d &q) {
+  return q.allFinite() &&
+         std::abs(q.squaredNorm() - 1.0) <=
+             kScaleResetQuaternionTolerance;
+}
+
+bool scale_reset_pose_consistent(const std::shared_ptr<PoseJPL> &pose,
+                                 std::string &reason) {
+  if (pose == nullptr) {
+    reason = "null pose";
+    return false;
+  }
+  if (pose->size() != 6 || pose->value().rows() != 7 ||
+      pose->value().cols() != 1 || pose->fej().rows() != 7 ||
+      pose->fej().cols() != 1 || !pose->value().allFinite() ||
+      !pose->fej().allFinite()) {
+    reason = "invalid pose storage";
+    return false;
+  }
+  if (!scale_reset_valid_quaternion(pose->quat()) ||
+      !scale_reset_valid_quaternion(pose->quat_fej())) {
+    reason = "non-unit pose quaternion";
+    return false;
+  }
+  if (!scale_reset_matrix_near(pose->value().block(0, 0, 4, 1),
+                               pose->q()->value()) ||
+      !scale_reset_matrix_near(pose->value().block(4, 0, 3, 1),
+                               pose->p()->value()) ||
+      !scale_reset_matrix_near(pose->fej().block(0, 0, 4, 1),
+                               pose->q()->fej()) ||
+      !scale_reset_matrix_near(pose->fej().block(4, 0, 3, 1),
+                               pose->p()->fej())) {
+    reason = "pose composite/substate mismatch";
+    return false;
+  }
+  return pose->Rot().allFinite() && pose->Rot_fej().allFinite();
+}
+
+bool scale_reset_imu_consistent(const std::shared_ptr<IMU> &imu,
+                                std::string &reason) {
+  if (imu == nullptr) {
+    reason = "null IMU";
+    return false;
+  }
+  if (imu->size() != 15 || imu->value().rows() != 16 ||
+      imu->value().cols() != 1 || imu->fej().rows() != 16 ||
+      imu->fej().cols() != 1 || !imu->value().allFinite() ||
+      !imu->fej().allFinite()) {
+    reason = "invalid IMU storage";
+    return false;
+  }
+  if (!scale_reset_pose_consistent(imu->pose(), reason))
+    return false;
+  const bool value_synced =
+      scale_reset_matrix_near(imu->value().block(0, 0, 7, 1),
+                              imu->pose()->value()) &&
+      scale_reset_matrix_near(imu->value().block(7, 0, 3, 1),
+                              imu->v()->value()) &&
+      scale_reset_matrix_near(imu->value().block(10, 0, 3, 1),
+                              imu->bg()->value()) &&
+      scale_reset_matrix_near(imu->value().block(13, 0, 3, 1),
+                              imu->ba()->value());
+  const bool fej_synced =
+      scale_reset_matrix_near(imu->fej().block(0, 0, 7, 1),
+                              imu->pose()->fej()) &&
+      scale_reset_matrix_near(imu->fej().block(7, 0, 3, 1),
+                              imu->v()->fej()) &&
+      scale_reset_matrix_near(imu->fej().block(10, 0, 3, 1),
+                              imu->bg()->fej()) &&
+      scale_reset_matrix_near(imu->fej().block(13, 0, 3, 1),
+                              imu->ba()->fej());
+  if (!value_synced || !fej_synced) {
+    reason = "IMU composite/substate mismatch";
+    return false;
+  }
+  return true;
+}
+
+struct ScaleResetCameraKinematics {
+  Eigen::Vector3d lever_in_imu = Eigen::Vector3d::Zero();
+  Eigen::Vector3d lever_in_global = Eigen::Vector3d::Zero();
+  Eigen::Vector3d center_in_global = Eigen::Vector3d::Zero();
+  Eigen::Matrix3d dcenter_dpose_theta = Eigen::Matrix3d::Zero();
+  Eigen::Matrix3d dcenter_dextrinsic_theta = Eigen::Matrix3d::Zero();
+  Eigen::Matrix3d dcenter_dextrinsic_position = Eigen::Matrix3d::Zero();
+};
+
+bool scale_reset_camera_kinematics(
+    const Eigen::Matrix3d &R_GtoI, const Eigen::Vector3d &p_IinG,
+    const Eigen::Matrix3d &R_ItoC, const Eigen::Vector3d &p_IinC,
+    ScaleResetCameraKinematics &out) {
+  if (!R_GtoI.allFinite() || !p_IinG.allFinite() ||
+      !R_ItoC.allFinite() || !p_IinC.allFinite())
+    return false;
+  const Eigen::Matrix3d R_ItoG = R_GtoI.transpose();
+  const Eigen::Matrix3d R_CtoI = R_ItoC.transpose();
+  out.lever_in_imu = -R_CtoI * p_IinC;
+  out.lever_in_global = R_ItoG * out.lever_in_imu;
+  out.center_in_global = p_IinG + out.lever_in_global;
+  out.dcenter_dpose_theta =
+      -R_ItoG * scale_reset_skew(out.lever_in_imu);
+  out.dcenter_dextrinsic_theta =
+      R_ItoG * R_CtoI * scale_reset_skew(p_IinC);
+  out.dcenter_dextrinsic_position = -R_ItoG * R_CtoI;
+  return out.lever_in_imu.allFinite() && out.lever_in_global.allFinite() &&
+         out.center_in_global.allFinite() &&
+         out.dcenter_dpose_theta.allFinite() &&
+         out.dcenter_dextrinsic_theta.allFinite() &&
+         out.dcenter_dextrinsic_position.allFinite();
+}
+
+bool scale_reset_inverse_depth_xyz(const Eigen::Vector3d &inverse,
+                                   Eigen::Vector3d &xyz,
+                                   Eigen::Matrix3d *dxyz_dinverse) {
+  const double theta = inverse(0);
+  const double phi = inverse(1);
+  const double rho = inverse(2);
+  if (!inverse.allFinite() || rho <= kScaleResetEpsilon)
+    return false;
+  const double radius = 1.0 / rho;
+  const double st = std::sin(theta);
+  const double ct = std::cos(theta);
+  const double sp = std::sin(phi);
+  const double cp = std::cos(phi);
+  xyz << radius * ct * sp, radius * st * sp, radius * cp;
+  if (!xyz.allFinite())
+    return false;
+  if (dxyz_dinverse != nullptr) {
+    dxyz_dinverse->col(0) << -radius * st * sp, radius * ct * sp, 0.0;
+    dxyz_dinverse->col(1) << radius * ct * cp, radius * st * cp,
+        -radius * sp;
+    dxyz_dinverse->col(2) = -xyz / rho;
+    if (!dxyz_dinverse->allFinite())
+      return false;
+  }
+  return true;
+}
+
+bool scale_reset_transform_global_inverse_depth(
+    const Eigen::Vector3d &inverse, const Eigen::Vector3d &pivot,
+    double scale, Eigen::Vector3d &inverse_new,
+    Eigen::Matrix3d *dinverse_new_dinverse,
+    Eigen::Matrix3d *dinverse_new_dpivot) {
+  Eigen::Vector3d xyz;
+  Eigen::Matrix3d dxyz_dinverse;
+  if (!scale_reset_inverse_depth_xyz(inverse, xyz, &dxyz_dinverse))
+    return false;
+  const Eigen::Vector3d xyz_new = pivot + scale * (xyz - pivot);
+  const double radius_new = xyz_new.norm();
+  if (!xyz_new.allFinite() || !std::isfinite(radius_new) ||
+      radius_new <= kScaleResetEpsilon)
+    return false;
+
+  constexpr double pi = 3.14159265358979323846;
+  double theta_new = std::atan2(xyz_new.y(), xyz_new.x());
+  theta_new += 2.0 * pi *
+               std::round((inverse(0) - theta_new) / (2.0 * pi));
+  const double cos_phi =
+      std::max(-1.0, std::min(1.0, xyz_new.z() / radius_new));
+  inverse_new << theta_new, std::acos(cos_phi), 1.0 / radius_new;
+
+  Eigen::Matrix3d dxyz_new_dinverse_new;
+  Eigen::Vector3d xyz_roundtrip;
+  if (!scale_reset_inverse_depth_xyz(inverse_new, xyz_roundtrip,
+                                     &dxyz_new_dinverse_new))
+    return false;
+  Eigen::JacobiSVD<Eigen::Matrix3d> svd(
+      dxyz_new_dinverse_new, Eigen::ComputeFullU | Eigen::ComputeFullV);
+  const Eigen::Vector3d singular_values = svd.singularValues();
+  if (!singular_values.allFinite() || singular_values.maxCoeff() <= 0.0 ||
+      singular_values.minCoeff() <=
+          kScaleResetEpsilon * singular_values.maxCoeff())
+    return false;
+  const Eigen::Matrix3d dinverse_new_dxyz =
+      svd.solve(Eigen::Matrix3d::Identity());
+  if (dinverse_new_dinverse != nullptr)
+    *dinverse_new_dinverse =
+        dinverse_new_dxyz * (scale * dxyz_dinverse);
+  if (dinverse_new_dpivot != nullptr)
+    *dinverse_new_dpivot = (1.0 - scale) * dinverse_new_dxyz;
+  return inverse_new.allFinite() && dinverse_new_dxyz.allFinite() &&
+         (dinverse_new_dinverse == nullptr ||
+          dinverse_new_dinverse->allFinite()) &&
+         (dinverse_new_dpivot == nullptr ||
+          dinverse_new_dpivot->allFinite());
+}
+
+bool gauge_reset_transform_global_inverse_depth(
+    const Eigen::Vector3d &inverse, const Eigen::Matrix3d &rotation,
+    const Eigen::Vector3d &translation, Eigen::Vector3d &inverse_new,
+    Eigen::Matrix3d *dinverse_new_dinverse) {
+  Eigen::Vector3d xyz;
+  Eigen::Matrix3d dxyz_dinverse;
+  if (!scale_reset_inverse_depth_xyz(inverse, xyz, &dxyz_dinverse))
+    return false;
+  const Eigen::Vector3d xyz_new = rotation * xyz + translation;
+  const double radius_new = xyz_new.norm();
+  if (!xyz_new.allFinite() || !std::isfinite(radius_new) ||
+      radius_new <= kScaleResetEpsilon)
+    return false;
+
+  constexpr double pi = 3.14159265358979323846;
+  double theta_new = std::atan2(xyz_new.y(), xyz_new.x());
+  theta_new += 2.0 * pi *
+               std::round((inverse(0) - theta_new) / (2.0 * pi));
+  const double cos_phi =
+      std::max(-1.0, std::min(1.0, xyz_new.z() / radius_new));
+  inverse_new << theta_new, std::acos(cos_phi), 1.0 / radius_new;
+
+  if (dinverse_new_dinverse != nullptr) {
+    Eigen::Matrix3d dxyz_new_dinverse_new;
+    Eigen::Vector3d xyz_roundtrip;
+    if (!scale_reset_inverse_depth_xyz(inverse_new, xyz_roundtrip,
+                                       &dxyz_new_dinverse_new))
+      return false;
+    Eigen::JacobiSVD<Eigen::Matrix3d> svd(
+        dxyz_new_dinverse_new, Eigen::ComputeFullU | Eigen::ComputeFullV);
+    const Eigen::Vector3d singular_values = svd.singularValues();
+    if (!singular_values.allFinite() || singular_values.maxCoeff() <= 0.0 ||
+        singular_values.minCoeff() <=
+            kScaleResetEpsilon * singular_values.maxCoeff())
+      return false;
+    const Eigen::Matrix3d dinverse_new_dxyz =
+        svd.solve(Eigen::Matrix3d::Identity());
+    *dinverse_new_dinverse =
+        dinverse_new_dxyz * rotation * dxyz_dinverse;
+  }
+  return inverse_new.allFinite() &&
+         (dinverse_new_dinverse == nullptr ||
+          dinverse_new_dinverse->allFinite());
+}
+
+struct ScaleResetCovarianceHealth {
+  bool valid = false;
+  double symmetry_error = std::numeric_limits<double>::infinity();
+  double min_diagonal = -std::numeric_limits<double>::infinity();
+  double min_eigenvalue = -std::numeric_limits<double>::infinity();
+  double psd_tolerance = 0.0;
+  std::string reason;
+};
+
+ScaleResetCovarianceHealth
+scale_reset_covariance_health(const Eigen::MatrixXd &covariance) {
+  ScaleResetCovarianceHealth out;
+  if (covariance.rows() <= 0 || covariance.rows() != covariance.cols()) {
+    out.reason = "covariance is not a non-empty square matrix";
+    return out;
+  }
+  if (!covariance.allFinite()) {
+    out.reason = "covariance contains non-finite values";
+    return out;
+  }
+  const double covariance_scale = std::max(1.0, covariance.norm());
+  out.symmetry_error = (covariance - covariance.transpose()).norm();
+  if (out.symmetry_error >
+      kScaleResetSymmetryTolerance * covariance_scale) {
+    out.reason = "covariance is not symmetric";
+    return out;
+  }
+  const Eigen::MatrixXd symmetric =
+      0.5 * (covariance + covariance.transpose());
+  const double spectral_upper_bound = std::max(
+      1.0, symmetric.cwiseAbs().rowwise().sum().maxCoeff());
+  out.psd_tolerance =
+      kScaleResetPsdRoundoffFactor * std::numeric_limits<double>::epsilon() *
+      static_cast<double>(std::max<Eigen::Index>(1, covariance.rows())) *
+      spectral_upper_bound;
+  out.min_diagonal = covariance.diagonal().minCoeff();
+  if (out.min_diagonal < -out.psd_tolerance) {
+    out.reason = "covariance has a negative diagonal";
+    return out;
+  }
+  Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eigen_solver(
+      symmetric, Eigen::EigenvaluesOnly);
+  if (eigen_solver.info() != Eigen::Success ||
+      !eigen_solver.eigenvalues().allFinite()) {
+    out.reason = "covariance eigendecomposition failed";
+    return out;
+  }
+  out.min_eigenvalue = eigen_solver.eigenvalues().minCoeff();
+  if (out.min_eigenvalue < -out.psd_tolerance) {
+    out.reason = "covariance is not positive semidefinite";
+    return out;
+  }
+  out.valid = true;
+  return out;
+}
+
+struct ScaleResetPendingValue {
+  std::shared_ptr<Type> type;
+  Eigen::MatrixXd value_before;
+  Eigen::MatrixXd fej_before;
+  Eigen::MatrixXd value_after;
+  Eigen::MatrixXd fej_after;
+};
+
 } // namespace
+
+StateHelper::Sim3ScaleResetResult StateHelper::apply_sim3_scale_reset(
+    std::shared_ptr<State> state, double scale, Propagator *propagator,
+    std::size_t camera_id) {
+  Sim3ScaleResetResult result;
+  result.scale = scale;
+  result.camera_id = camera_id;
+  auto reject = [&result](const std::string &reason) {
+    result.failure_reason = reason;
+    return result;
+  };
+
+  if (state == nullptr)
+    return reject("state is null");
+  if (!std::isfinite(scale) || scale <= 0.0)
+    return reject("scale must be finite and strictly positive");
+
+  std::lock_guard<std::mutex> lock(state->_mutex_state);
+  if (state->_options.num_cameras != 1)
+    return reject("scale reset supports exactly one camera");
+  if (camera_id != 0)
+    return reject("scale reset supports only camera_id 0");
+  if (state->_calib_IMUtoCAM.size() != 1 ||
+      state->_calib_IMUtoCAM.count(0) != 1)
+    return reject("single-camera calibration map is inconsistent");
+  const int covariance_size = static_cast<int>(state->_Cov.rows());
+  if (covariance_size <= 0 || state->_Cov.cols() != covariance_size)
+    return reject("state covariance has invalid dimensions");
+
+  std::unordered_set<const Type *> variable_pointers;
+  int expected_id = 0;
+  for (const auto &variable : state->_variables) {
+    if (variable == nullptr)
+      return reject("state variable list contains a null entry");
+    if (!variable_pointers.insert(variable.get()).second)
+      return reject("state variable list contains a duplicate entry");
+    if (variable->size() <= 0 || variable->id() != expected_id ||
+        variable->id() + variable->size() > covariance_size)
+      return reject("state variables are not contiguous with covariance");
+    if (variable->value().size() <= 0 || variable->fej().size() <= 0 ||
+        !variable->value().allFinite() || !variable->fej().allFinite())
+      return reject("state variable contains invalid nominal or FEJ data");
+    expected_id += variable->size();
+  }
+  if (expected_id != covariance_size)
+    return reject("state variable dimensions do not match covariance");
+  if (state->_imu == nullptr ||
+      variable_pointers.count(state->_imu.get()) != 1)
+    return reject("active IMU is missing from the state variable list");
+
+  std::string consistency_reason;
+  if (!scale_reset_imu_consistent(state->_imu, consistency_reason))
+    return reject("active IMU is inconsistent: " + consistency_reason);
+
+  std::unordered_set<const Type *> calibration_pointers;
+  for (const auto &calibration_pair : state->_calib_IMUtoCAM) {
+    const auto &calibration = calibration_pair.second;
+    if (!scale_reset_pose_consistent(calibration, consistency_reason))
+      return reject("camera extrinsic is inconsistent: " +
+                    consistency_reason);
+    if (!calibration_pointers.insert(calibration.get()).second)
+      return reject("camera extrinsic map contains a duplicate pose");
+    if (calibration->id() >= 0 &&
+        variable_pointers.count(calibration.get()) != 1)
+      return reject("estimated camera extrinsic is absent from state ordering");
+  }
+  for (const auto &intrinsic_pair : state->_cam_intrinsics) {
+    const auto &intrinsic = intrinsic_pair.second;
+    if (intrinsic == nullptr || !intrinsic->value().allFinite() ||
+        !intrinsic->fej().allFinite())
+      return reject("camera intrinsics contain invalid data");
+  }
+
+  std::unordered_set<const Type *> clone_pointers;
+  for (const auto &clone_pair : state->_clones_IMU) {
+    const auto &clone = clone_pair.second;
+    if (!std::isfinite(clone_pair.first) ||
+        !scale_reset_pose_consistent(clone, consistency_reason))
+      return reject("IMU clone is inconsistent: " + consistency_reason);
+    if (!clone_pointers.insert(clone.get()).second)
+      return reject("clone map contains a duplicate pose");
+    if (variable_pointers.count(clone.get()) != 1)
+      return reject("IMU clone is absent from state ordering");
+  }
+
+  std::unordered_set<const Type *> landmark_pointers;
+  for (const auto &feature_pair : state->_features_SLAM) {
+    const auto &landmark = feature_pair.second;
+    if (landmark == nullptr)
+      return reject("SLAM landmark map contains a null entry");
+    if (!landmark_pointers.insert(landmark.get()).second)
+      return reject("SLAM landmark map contains a duplicate entry");
+    if (variable_pointers.count(landmark.get()) != 1)
+      return reject("SLAM landmark is absent from state ordering");
+    if (!landmark->value().allFinite() || !landmark->fej().allFinite())
+      return reject("SLAM landmark contains non-finite nominal or FEJ data");
+
+    const auto representation = landmark->_feat_representation;
+    const bool three_parameter =
+        representation == LandmarkRepresentation::GLOBAL_3D ||
+        representation == LandmarkRepresentation::GLOBAL_FULL_INVERSE_DEPTH ||
+        representation == LandmarkRepresentation::ANCHORED_3D ||
+        representation == LandmarkRepresentation::ANCHORED_FULL_INVERSE_DEPTH ||
+        representation == LandmarkRepresentation::ANCHORED_MSCKF_INVERSE_DEPTH;
+    const bool single_parameter =
+        representation == LandmarkRepresentation::ANCHORED_INVERSE_DEPTH_SINGLE;
+    if ((!three_parameter && !single_parameter) ||
+        (three_parameter && landmark->size() != 3) ||
+        (single_parameter && landmark->size() != 1) ||
+        landmark->value().rows() != landmark->size() ||
+        landmark->fej().rows() != landmark->size())
+      return reject("SLAM landmark representation and storage disagree");
+
+    if (LandmarkRepresentation::is_relative_representation(representation)) {
+      if (landmark->_anchor_cam_id < 0 ||
+          state->_calib_IMUtoCAM.count(
+              static_cast<std::size_t>(landmark->_anchor_cam_id)) != 1 ||
+          !std::isfinite(landmark->_anchor_clone_timestamp) ||
+          state->_clones_IMU.count(landmark->_anchor_clone_timestamp) != 1)
+        return reject("anchored SLAM landmark has an invalid anchor");
+    }
+    if (single_parameter &&
+        (!landmark->uv_norm_zero.allFinite() ||
+         !landmark->uv_norm_zero_fej.allFinite()))
+      return reject("single inverse-depth landmark has an invalid bearing");
+  }
+  for (const auto &variable : state->_variables) {
+    const auto landmark = std::dynamic_pointer_cast<Landmark>(variable);
+    if (landmark != nullptr && landmark_pointers.count(landmark.get()) != 1)
+      return reject("state ordering contains an unregistered SLAM landmark");
+  }
+
+  const auto prior_health = scale_reset_covariance_health(state->_Cov);
+  result.covariance_min_eigenvalue = prior_health.min_eigenvalue;
+  result.covariance_psd_projection_limit = prior_health.psd_tolerance;
+  result.covariance_psd_projection_magnitude =
+      std::max(0.0, -prior_health.min_eigenvalue);
+  if (!prior_health.valid)
+    return reject("prior " + prior_health.reason);
+
+  const auto calibration_it = state->_calib_IMUtoCAM.find(camera_id);
+  if (calibration_it == state->_calib_IMUtoCAM.end() ||
+      calibration_it->second == nullptr)
+    return reject("pivot camera calibration is unavailable");
+  const auto &calibration = calibration_it->second;
+
+  ScaleResetCameraKinematics pivot;
+  ScaleResetCameraKinematics pivot_fej;
+  if (!scale_reset_camera_kinematics(
+          state->_imu->Rot(), state->_imu->pos(), calibration->Rot(),
+          calibration->pos(), pivot) ||
+      !scale_reset_camera_kinematics(
+          state->_imu->Rot_fej(), state->_imu->pos_fej(),
+          calibration->Rot_fej(), calibration->pos_fej(), pivot_fej))
+    return reject("failed to form current camera pivot");
+  result.pivot_camera_center = pivot.center_in_global;
+
+  if (scale == 1.0) {
+    result.success = true;
+    result.failure_reason.clear();
+    return result;
+  }
+  if (propagator == nullptr)
+    return reject("non-identity reset requires a propagator cache handle");
+
+  const int imu_q_id = state->_imu->q()->id();
+  const int imu_p_id = state->_imu->p()->id();
+  const int imu_v_id = state->_imu->v()->id();
+  const bool estimated_extrinsic = calibration->id() >= 0;
+  if (estimated_extrinsic &&
+      variable_pointers.count(calibration.get()) != 1)
+    return reject("pivot camera extrinsic covariance block is unavailable");
+
+  Eigen::MatrixXd reset_jacobian =
+      Eigen::MatrixXd::Identity(covariance_size, covariance_size);
+  std::vector<ScaleResetPendingValue> pending;
+  pending.reserve(1 + state->_clones_IMU.size() +
+                  state->_features_SLAM.size());
+
+  ScaleResetPendingValue imu_pending;
+  imu_pending.type = state->_imu;
+  imu_pending.value_before = state->_imu->value();
+  imu_pending.fej_before = state->_imu->fej();
+  imu_pending.value_after = imu_pending.value_before;
+  imu_pending.fej_after = imu_pending.fej_before;
+  imu_pending.value_after.block(7, 0, 3, 1) *= scale;
+  imu_pending.fej_after.block(7, 0, 3, 1) *= scale;
+  pending.push_back(std::move(imu_pending));
+  reset_jacobian.block(imu_v_id, 0, 3, covariance_size).setZero();
+  reset_jacobian.block<3, 3>(imu_v_id, imu_v_id) =
+      scale * Eigen::Matrix3d::Identity();
+
+  for (const auto &clone_pair : state->_clones_IMU) {
+    const auto &clone = clone_pair.second;
+    ScaleResetCameraKinematics clone_camera;
+    ScaleResetCameraKinematics clone_camera_fej;
+    if (!scale_reset_camera_kinematics(
+            clone->Rot(), clone->pos(), calibration->Rot(),
+            calibration->pos(), clone_camera) ||
+        !scale_reset_camera_kinematics(
+            clone->Rot_fej(), clone->pos_fej(), calibration->Rot_fej(),
+            calibration->pos_fej(), clone_camera_fej))
+      return reject("failed to form a clone camera center");
+
+    ScaleResetPendingValue clone_pending;
+    clone_pending.type = clone;
+    clone_pending.value_before = clone->value();
+    clone_pending.fej_before = clone->fej();
+    clone_pending.value_after = clone_pending.value_before;
+    clone_pending.fej_after = clone_pending.fej_before;
+    clone_pending.value_after.block(4, 0, 3, 1) =
+        pivot.center_in_global +
+        scale * (clone_camera.center_in_global - pivot.center_in_global) -
+        clone_camera.lever_in_global;
+    clone_pending.fej_after.block(4, 0, 3, 1) =
+        pivot_fej.center_in_global +
+        scale * (clone_camera_fej.center_in_global -
+                 pivot_fej.center_in_global) -
+        clone_camera_fej.lever_in_global;
+    if (!clone_pending.value_after.allFinite() ||
+        !clone_pending.fej_after.allFinite())
+      return reject("clone scale transform produced non-finite data");
+    pending.push_back(std::move(clone_pending));
+
+    const int clone_q_id = clone->q()->id();
+    const int clone_p_id = clone->p()->id();
+    reset_jacobian.block(clone_p_id, 0, 3, covariance_size).setZero();
+    reset_jacobian.block<3, 3>(clone_p_id, clone_p_id) =
+        scale * Eigen::Matrix3d::Identity();
+    reset_jacobian.block<3, 3>(clone_p_id, imu_p_id) =
+        (1.0 - scale) * Eigen::Matrix3d::Identity();
+    reset_jacobian.block<3, 3>(clone_p_id, clone_q_id) =
+        (scale - 1.0) * clone_camera.dcenter_dpose_theta;
+    reset_jacobian.block<3, 3>(clone_p_id, imu_q_id) =
+        (1.0 - scale) * pivot.dcenter_dpose_theta;
+    if (estimated_extrinsic) {
+      reset_jacobian.block<3, 3>(clone_p_id, calibration->q()->id()) =
+          (scale - 1.0) *
+          (clone_camera.dcenter_dextrinsic_theta -
+           pivot.dcenter_dextrinsic_theta);
+      reset_jacobian.block<3, 3>(clone_p_id, calibration->p()->id()) =
+          (scale - 1.0) *
+          (clone_camera.dcenter_dextrinsic_position -
+           pivot.dcenter_dextrinsic_position);
+    }
+  }
+
+  auto add_pivot_jacobian = [&](int row,
+                                const Eigen::Matrix3d &drow_dcenter) {
+    reset_jacobian.block<3, 3>(row, imu_p_id) += drow_dcenter;
+    reset_jacobian.block<3, 3>(row, imu_q_id) +=
+        drow_dcenter * pivot.dcenter_dpose_theta;
+    if (estimated_extrinsic) {
+      reset_jacobian.block<3, 3>(row, calibration->q()->id()) +=
+          drow_dcenter * pivot.dcenter_dextrinsic_theta;
+      reset_jacobian.block<3, 3>(row, calibration->p()->id()) +=
+          drow_dcenter * pivot.dcenter_dextrinsic_position;
+    }
+  };
+
+  for (const auto &feature_pair : state->_features_SLAM) {
+    const auto &landmark = feature_pair.second;
+    const auto representation = landmark->_feat_representation;
+    ScaleResetPendingValue landmark_pending;
+    landmark_pending.type = landmark;
+    landmark_pending.value_before = landmark->value();
+    landmark_pending.fej_before = landmark->fej();
+    landmark_pending.value_after = landmark_pending.value_before;
+    landmark_pending.fej_after = landmark_pending.fej_before;
+
+    const int landmark_id = landmark->id();
+    reset_jacobian.block(landmark_id, 0, landmark->size(),
+                         covariance_size)
+        .setZero();
+
+    if (representation == LandmarkRepresentation::GLOBAL_3D) {
+      landmark_pending.value_after =
+          pivot.center_in_global +
+          scale * (landmark->value() - pivot.center_in_global);
+      landmark_pending.fej_after =
+          pivot_fej.center_in_global +
+          scale * (landmark->fej() - pivot_fej.center_in_global);
+      reset_jacobian.block<3, 3>(landmark_id, landmark_id) =
+          scale * Eigen::Matrix3d::Identity();
+      add_pivot_jacobian(
+          landmark_id,
+          (1.0 - scale) * Eigen::Matrix3d::Identity());
+    } else if (representation ==
+               LandmarkRepresentation::GLOBAL_FULL_INVERSE_DEPTH) {
+      Eigen::Vector3d inverse_new;
+      Eigen::Vector3d inverse_fej_new;
+      Eigen::Matrix3d dinverse_new_dinverse;
+      Eigen::Matrix3d dinverse_new_dpivot;
+      if (!scale_reset_transform_global_inverse_depth(
+              landmark->value(), pivot.center_in_global, scale, inverse_new,
+              &dinverse_new_dinverse, &dinverse_new_dpivot) ||
+          !scale_reset_transform_global_inverse_depth(
+              landmark->fej(), pivot_fej.center_in_global, scale,
+              inverse_fej_new, nullptr, nullptr))
+        return reject("global inverse-depth landmark reset is singular");
+      landmark_pending.value_after = inverse_new;
+      landmark_pending.fej_after = inverse_fej_new;
+      reset_jacobian.block<3, 3>(landmark_id, landmark_id) =
+          dinverse_new_dinverse;
+      add_pivot_jacobian(landmark_id, dinverse_new_dpivot);
+    } else if (representation == LandmarkRepresentation::ANCHORED_3D) {
+      landmark_pending.value_after *= scale;
+      landmark_pending.fej_after *= scale;
+      reset_jacobian.block<3, 3>(landmark_id, landmark_id) =
+          scale * Eigen::Matrix3d::Identity();
+    } else if (
+        representation == LandmarkRepresentation::ANCHORED_FULL_INVERSE_DEPTH ||
+        representation == LandmarkRepresentation::ANCHORED_MSCKF_INVERSE_DEPTH) {
+      if (landmark->value()(2) <= kScaleResetEpsilon ||
+          landmark->fej()(2) <= kScaleResetEpsilon)
+        return reject("anchored inverse-depth landmark has non-positive depth");
+      landmark_pending.value_after(2) /= scale;
+      landmark_pending.fej_after(2) /= scale;
+      reset_jacobian.block<3, 3>(landmark_id, landmark_id) =
+          Eigen::Vector3d(1.0, 1.0, 1.0 / scale).asDiagonal();
+    } else if (representation ==
+               LandmarkRepresentation::ANCHORED_INVERSE_DEPTH_SINGLE) {
+      if (landmark->value()(0) <= kScaleResetEpsilon ||
+          landmark->fej()(0) <= kScaleResetEpsilon)
+        return reject("single inverse-depth landmark has non-positive depth");
+      landmark_pending.value_after(0) /= scale;
+      landmark_pending.fej_after(0) /= scale;
+      reset_jacobian(landmark_id, landmark_id) = 1.0 / scale;
+    } else {
+      return reject("unsupported SLAM landmark representation");
+    }
+
+    if (!landmark_pending.value_after.allFinite() ||
+        !landmark_pending.fej_after.allFinite())
+      return reject("landmark scale transform produced non-finite data");
+    pending.push_back(std::move(landmark_pending));
+  }
+
+  if (!reset_jacobian.allFinite())
+    return reject("scale-reset Jacobian contains non-finite values");
+
+  Eigen::MatrixXd covariance_candidate =
+      (reset_jacobian * state->_Cov * reset_jacobian.transpose()).eval();
+  covariance_candidate =
+      0.5 * (covariance_candidate + covariance_candidate.transpose());
+  auto candidate_health =
+      scale_reset_covariance_health(covariance_candidate);
+  result.covariance_min_eigenvalue = candidate_health.min_eigenvalue;
+  result.covariance_psd_projection_limit = candidate_health.psd_tolerance;
+  result.covariance_psd_projection_magnitude =
+      std::max(0.0, -candidate_health.min_eigenvalue);
+  if (!candidate_health.valid)
+    return reject("candidate " + candidate_health.reason);
+
+  // Remove only roundoff-sized negative eigenvalues. A material negative mode
+  // was rejected above, while this projection makes the committed matrix
+  // numerically PSD rather than merely PSD within tolerance.
+  if (candidate_health.min_eigenvalue < 0.0) {
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eigen_solver(
+        covariance_candidate);
+    if (eigen_solver.info() != Eigen::Success ||
+        !eigen_solver.eigenvalues().allFinite() ||
+        !eigen_solver.eigenvectors().allFinite())
+      return reject("candidate covariance PSD stabilization failed");
+    Eigen::VectorXd eigenvalues = eigen_solver.eigenvalues().cwiseMax(0.0);
+    covariance_candidate =
+        (eigen_solver.eigenvectors() * eigenvalues.asDiagonal() *
+         eigen_solver.eigenvectors().transpose())
+            .eval();
+    covariance_candidate =
+        0.5 * (covariance_candidate + covariance_candidate.transpose());
+    result.covariance_psd_projected = true;
+    candidate_health = scale_reset_covariance_health(covariance_candidate);
+    if (!candidate_health.valid)
+      return reject("stabilized candidate " + candidate_health.reason);
+  }
+
+  for (const auto &entry : pending) {
+    if (entry.type == nullptr || !entry.value_after.allFinite() ||
+        !entry.fej_after.allFinite() ||
+        entry.value_after.rows() != entry.value_before.rows() ||
+        entry.value_after.cols() != entry.value_before.cols() ||
+        entry.fej_after.rows() != entry.fej_before.rows() ||
+        entry.fej_after.cols() != entry.fej_before.cols())
+      return reject("pending scale-reset state is invalid");
+  }
+
+  const Eigen::MatrixXd covariance_before = state->_Cov;
+  const Eigen::Vector4d imu_quaternion_before = state->_imu->quat();
+  const Eigen::Vector4d imu_quaternion_fej_before = state->_imu->quat_fej();
+  const Eigen::Vector3d imu_position_before = state->_imu->pos();
+  const Eigen::Vector3d imu_position_fej_before = state->_imu->pos_fej();
+  const Eigen::Vector3d gyro_bias_before = state->_imu->bias_g();
+  const Eigen::Vector3d gyro_bias_fej_before = state->_imu->bias_g_fej();
+  const Eigen::Vector3d accel_bias_before = state->_imu->bias_a();
+  const Eigen::Vector3d accel_bias_fej_before = state->_imu->bias_a_fej();
+  const Eigen::MatrixXd calibration_value_before = calibration->value();
+  const Eigen::MatrixXd calibration_fej_before = calibration->fej();
+
+  auto rollback = [&]() {
+    for (auto it = pending.rbegin(); it != pending.rend(); ++it) {
+      it->type->set_value(it->value_before);
+      it->type->set_fej(it->fej_before);
+    }
+    state->_Cov = covariance_before;
+  };
+
+  try {
+    for (const auto &entry : pending) {
+      entry.type->set_value(entry.value_after);
+      entry.type->set_fej(entry.fej_after);
+    }
+    state->_Cov = covariance_candidate;
+  } catch (const std::exception &error) {
+    rollback();
+    return reject(std::string("scale-reset commit threw: ") + error.what());
+  } catch (...) {
+    rollback();
+    return reject("scale-reset commit threw an unknown exception");
+  }
+
+  bool post_state_valid = true;
+  for (const auto &entry : pending) {
+    post_state_valid =
+        post_state_valid &&
+        scale_reset_matrix_near(entry.type->value(), entry.value_after) &&
+        scale_reset_matrix_near(entry.type->fej(), entry.fej_after);
+  }
+  post_state_valid =
+      post_state_valid &&
+      scale_reset_matrix_near(state->_imu->quat(), imu_quaternion_before) &&
+      scale_reset_matrix_near(state->_imu->quat_fej(),
+                              imu_quaternion_fej_before) &&
+      scale_reset_matrix_near(state->_imu->pos(), imu_position_before) &&
+      scale_reset_matrix_near(state->_imu->pos_fej(),
+                              imu_position_fej_before) &&
+      scale_reset_matrix_near(state->_imu->bias_g(), gyro_bias_before) &&
+      scale_reset_matrix_near(state->_imu->bias_g_fej(),
+                              gyro_bias_fej_before) &&
+      scale_reset_matrix_near(state->_imu->bias_a(), accel_bias_before) &&
+      scale_reset_matrix_near(state->_imu->bias_a_fej(),
+                              accel_bias_fej_before) &&
+      scale_reset_matrix_near(calibration->value(),
+                              calibration_value_before) &&
+      scale_reset_matrix_near(calibration->fej(), calibration_fej_before);
+  const auto post_health = scale_reset_covariance_health(state->_Cov);
+  if (!post_state_valid || !post_health.valid) {
+    rollback();
+    return reject(!post_state_valid
+                      ? "post-reset state consistency check failed"
+                      : "post-reset " + post_health.reason);
+  }
+
+  propagator->invalidate_cache();
+  result.success = true;
+  result.state_changed = true;
+  result.propagator_cache_invalidated = true;
+  result.covariance_min_eigenvalue = post_health.min_eigenvalue;
+  result.failure_reason.clear();
+  return result;
+}
+
+StateHelper::GlobalYawTranslationResetResult
+StateHelper::apply_global_yaw_translation_reset(
+    std::shared_ptr<State> state, double yaw_delta_rad,
+    const Eigen::Vector3d &target_imu_position, Propagator *propagator) {
+  GlobalYawTranslationResetResult result;
+  result.yaw_delta_rad = yaw_delta_rad;
+  auto reject = [&result](const std::string &reason) {
+    result.failure_reason = reason;
+    return result;
+  };
+  if (state == nullptr)
+    return reject("state is null");
+  if (!std::isfinite(yaw_delta_rad) || !target_imu_position.allFinite())
+    return reject("yaw delta and target position must be finite");
+
+  std::lock_guard<std::mutex> lock(state->_mutex_state);
+  if (state->_imu == nullptr)
+    return reject("active IMU is unavailable");
+  const int covariance_size = static_cast<int>(state->_Cov.rows());
+  if (covariance_size <= 0 || state->_Cov.cols() != covariance_size)
+    return reject("state covariance has invalid dimensions");
+
+  std::unordered_set<const Type *> variable_pointers;
+  int expected_id = 0;
+  for (const auto &variable : state->_variables) {
+    if (variable == nullptr || variable->id() != expected_id ||
+        variable->size() <= 0 ||
+        variable->id() + variable->size() > covariance_size ||
+        !variable->value().allFinite() || !variable->fej().allFinite())
+      return reject("state variables are invalid or non-contiguous");
+    if (!variable_pointers.insert(variable.get()).second)
+      return reject("state variable list contains a duplicate entry");
+    expected_id += variable->size();
+  }
+  if (expected_id != covariance_size ||
+      variable_pointers.count(state->_imu.get()) != 1)
+    return reject("state ordering does not match covariance");
+
+  std::string consistency_reason;
+  if (!scale_reset_imu_consistent(state->_imu, consistency_reason))
+    return reject("active IMU is inconsistent: " + consistency_reason);
+  for (const auto &clone_pair : state->_clones_IMU) {
+    if (!std::isfinite(clone_pair.first) ||
+        !scale_reset_pose_consistent(clone_pair.second, consistency_reason) ||
+        variable_pointers.count(clone_pair.second.get()) != 1)
+      return reject("IMU clone is invalid or absent from state ordering");
+  }
+  for (const auto &feature_pair : state->_features_SLAM) {
+    const auto &landmark = feature_pair.second;
+    if (landmark == nullptr ||
+        variable_pointers.count(landmark.get()) != 1 ||
+        !landmark->value().allFinite() || !landmark->fej().allFinite())
+      return reject("SLAM landmark is invalid or absent from state ordering");
+    if (LandmarkRepresentation::is_relative_representation(
+            landmark->_feat_representation) &&
+        (landmark->_anchor_cam_id < 0 ||
+         !std::isfinite(landmark->_anchor_clone_timestamp) ||
+         state->_clones_IMU.count(landmark->_anchor_clone_timestamp) != 1))
+      return reject("anchored SLAM landmark has an invalid anchor");
+  }
+
+  const auto prior_health = scale_reset_covariance_health(state->_Cov);
+  result.covariance_min_eigenvalue = prior_health.min_eigenvalue;
+  result.covariance_psd_projection_limit = prior_health.psd_tolerance;
+  if (!prior_health.valid)
+    return reject("prior " + prior_health.reason);
+  if (propagator == nullptr)
+    return reject("gauge reset requires a propagator cache handle");
+
+  const Eigen::Matrix3d rotation =
+      Eigen::AngleAxisd(yaw_delta_rad, Eigen::Vector3d::UnitZ())
+          .toRotationMatrix();
+  const Eigen::Vector3d translation =
+      target_imu_position - rotation * state->_imu->pos();
+  result.translation = translation;
+  const bool identity =
+      std::fabs(yaw_delta_rad) <= 1.0e-15 && translation.norm() <= 1.0e-15;
+  if (identity) {
+    result.success = true;
+    result.failure_reason.clear();
+    return result;
+  }
+
+  Eigen::MatrixXd reset_jacobian =
+      Eigen::MatrixXd::Identity(covariance_size, covariance_size);
+  std::vector<ScaleResetPendingValue> pending;
+  pending.reserve(1 + state->_clones_IMU.size() +
+                  state->_features_SLAM.size());
+
+  auto transform_pose = [&](const Eigen::MatrixXd &value,
+                            Eigen::MatrixXd &transformed) {
+    if (value.rows() != 7 || value.cols() != 1)
+      return false;
+    transformed = value;
+    const Eigen::Matrix3d R_GtoI =
+        ov_core::quat_2_Rot(value.block<4, 1>(0, 0));
+    transformed.block<4, 1>(0, 0) =
+        ov_core::rot_2_quat(R_GtoI * rotation.transpose());
+    transformed.block<3, 1>(4, 0) =
+        rotation * value.block<3, 1>(4, 0) + translation;
+    return transformed.allFinite();
+  };
+
+  ScaleResetPendingValue imu_pending;
+  imu_pending.type = state->_imu;
+  imu_pending.value_before = state->_imu->value();
+  imu_pending.fej_before = state->_imu->fej();
+  imu_pending.value_after = imu_pending.value_before;
+  imu_pending.fej_after = imu_pending.fej_before;
+  {
+    Eigen::MatrixXd pose_after;
+    Eigen::MatrixXd pose_fej_after;
+    if (!transform_pose(imu_pending.value_before.block(0, 0, 7, 1),
+                        pose_after) ||
+        !transform_pose(imu_pending.fej_before.block(0, 0, 7, 1),
+                        pose_fej_after))
+      return reject("active IMU pose transform failed");
+    imu_pending.value_after.block(0, 0, 7, 1) = pose_after;
+    imu_pending.fej_after.block(0, 0, 7, 1) = pose_fej_after;
+  }
+  imu_pending.value_after.block<3, 1>(7, 0) =
+      rotation * imu_pending.value_before.block<3, 1>(7, 0);
+  imu_pending.fej_after.block<3, 1>(7, 0) =
+      rotation * imu_pending.fej_before.block<3, 1>(7, 0);
+  pending.push_back(std::move(imu_pending));
+  reset_jacobian.block<3, 3>(state->_imu->p()->id(),
+                             state->_imu->p()->id()) = rotation;
+  reset_jacobian.block<3, 3>(state->_imu->v()->id(),
+                             state->_imu->v()->id()) = rotation;
+
+  for (const auto &clone_pair : state->_clones_IMU) {
+    const auto &clone = clone_pair.second;
+    ScaleResetPendingValue clone_pending;
+    clone_pending.type = clone;
+    clone_pending.value_before = clone->value();
+    clone_pending.fej_before = clone->fej();
+    if (!transform_pose(clone_pending.value_before,
+                        clone_pending.value_after) ||
+        !transform_pose(clone_pending.fej_before,
+                        clone_pending.fej_after))
+      return reject("clone gauge transform failed");
+    pending.push_back(std::move(clone_pending));
+    reset_jacobian.block<3, 3>(clone->p()->id(), clone->p()->id()) =
+        rotation;
+  }
+
+  for (const auto &feature_pair : state->_features_SLAM) {
+    const auto &landmark = feature_pair.second;
+    const auto representation = landmark->_feat_representation;
+    if (LandmarkRepresentation::is_relative_representation(representation))
+      continue;
+    ScaleResetPendingValue landmark_pending;
+    landmark_pending.type = landmark;
+    landmark_pending.value_before = landmark->value();
+    landmark_pending.fej_before = landmark->fej();
+    landmark_pending.value_after = landmark_pending.value_before;
+    landmark_pending.fej_after = landmark_pending.fej_before;
+    if (representation == LandmarkRepresentation::GLOBAL_3D) {
+      landmark_pending.value_after =
+          rotation * landmark_pending.value_before + translation;
+      landmark_pending.fej_after =
+          rotation * landmark_pending.fej_before + translation;
+      reset_jacobian.block<3, 3>(landmark->id(), landmark->id()) =
+          rotation;
+    } else if (representation ==
+               LandmarkRepresentation::GLOBAL_FULL_INVERSE_DEPTH) {
+      Eigen::Matrix3d representation_jacobian;
+      Eigen::Vector3d value_after;
+      Eigen::Vector3d fej_after;
+      if (!gauge_reset_transform_global_inverse_depth(
+              landmark_pending.value_before, rotation, translation,
+              value_after, &representation_jacobian) ||
+          !gauge_reset_transform_global_inverse_depth(
+              landmark_pending.fej_before, rotation, translation, fej_after,
+              nullptr))
+        return reject("global inverse-depth gauge transform failed");
+      landmark_pending.value_after = value_after;
+      landmark_pending.fej_after = fej_after;
+      reset_jacobian.block<3, 3>(landmark->id(), landmark->id()) =
+          representation_jacobian;
+    } else {
+      return reject("unsupported global SLAM landmark representation");
+    }
+    pending.push_back(std::move(landmark_pending));
+  }
+
+  if (!reset_jacobian.allFinite())
+    return reject("gauge-reset Jacobian contains non-finite values");
+  Eigen::MatrixXd covariance_candidate =
+      (reset_jacobian * state->_Cov * reset_jacobian.transpose()).eval();
+  covariance_candidate =
+      0.5 * (covariance_candidate + covariance_candidate.transpose());
+  auto candidate_health =
+      scale_reset_covariance_health(covariance_candidate);
+  result.covariance_min_eigenvalue = candidate_health.min_eigenvalue;
+  result.covariance_psd_projection_limit = candidate_health.psd_tolerance;
+  result.covariance_psd_projection_magnitude =
+      std::max(0.0, -candidate_health.min_eigenvalue);
+  if (!candidate_health.valid)
+    return reject("candidate " + candidate_health.reason);
+  if (candidate_health.min_eigenvalue < 0.0) {
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eigen_solver(
+        covariance_candidate);
+    if (eigen_solver.info() != Eigen::Success ||
+        !eigen_solver.eigenvalues().allFinite() ||
+        !eigen_solver.eigenvectors().allFinite())
+      return reject("candidate covariance PSD stabilization failed");
+    covariance_candidate =
+        (eigen_solver.eigenvectors() *
+         eigen_solver.eigenvalues().cwiseMax(0.0).asDiagonal() *
+         eigen_solver.eigenvectors().transpose())
+            .eval();
+    covariance_candidate =
+        0.5 * (covariance_candidate + covariance_candidate.transpose());
+    result.covariance_psd_projected = true;
+    candidate_health = scale_reset_covariance_health(covariance_candidate);
+    if (!candidate_health.valid)
+      return reject("stabilized candidate " + candidate_health.reason);
+  }
+
+  const Eigen::MatrixXd covariance_before = state->_Cov;
+  auto rollback = [&]() {
+    for (auto it = pending.rbegin(); it != pending.rend(); ++it) {
+      it->type->set_value(it->value_before);
+      it->type->set_fej(it->fej_before);
+    }
+    state->_Cov = covariance_before;
+  };
+  try {
+    for (const auto &entry : pending) {
+      entry.type->set_value(entry.value_after);
+      entry.type->set_fej(entry.fej_after);
+    }
+    state->_Cov = covariance_candidate;
+  } catch (const std::exception &error) {
+    rollback();
+    return reject(std::string("gauge-reset commit threw: ") + error.what());
+  } catch (...) {
+    rollback();
+    return reject("gauge-reset commit threw an unknown exception");
+  }
+
+  const auto post_health = scale_reset_covariance_health(state->_Cov);
+  if (!post_health.valid ||
+      (state->_imu->pos() - target_imu_position).norm() > 1.0e-8 ||
+      !state->_imu->bias_g().isApprox(
+          pending.front().value_before.block<3, 1>(10, 0), 1.0e-12) ||
+      !state->_imu->bias_a().isApprox(
+          pending.front().value_before.block<3, 1>(13, 0), 1.0e-12)) {
+    rollback();
+    return reject(!post_health.valid
+                      ? "post-reset " + post_health.reason
+                      : "post-reset state invariant failed");
+  }
+
+  propagator->invalidate_cache();
+  result.success = true;
+  result.state_changed = true;
+  result.propagator_cache_invalidated = true;
+  result.covariance_min_eigenvalue = post_health.min_eigenvalue;
+  result.failure_reason.clear();
+  return result;
+}
+
+StateHelper::GlobalYawTranslationResetResult
+StateHelper::apply_global_yaw_scale_translation_reset(
+    std::shared_ptr<State> state, double scale, double yaw_delta_rad,
+    const Eigen::Vector3d &target_imu_position, Propagator *propagator,
+    std::size_t camera_id) {
+  GlobalYawTranslationResetResult result;
+  result.scale = scale;
+  result.yaw_delta_rad = yaw_delta_rad;
+  auto reject = [&result](const std::string &reason) {
+    result.failure_reason = reason;
+    return result;
+  };
+  if (state == nullptr || propagator == nullptr)
+    return reject("similarity reset requires state and propagator");
+  if (!std::isfinite(scale) || scale <= 0.0 ||
+      !std::isfinite(yaw_delta_rad) || !target_imu_position.allFinite())
+    return reject("similarity parameters must be finite and scale positive");
+
+  struct SavedValue {
+    std::shared_ptr<Type> type;
+    Eigen::MatrixXd value;
+    Eigen::MatrixXd fej;
+  };
+  std::vector<SavedValue> saved;
+  Eigen::MatrixXd covariance_before;
+  {
+    std::lock_guard<std::mutex> lock(state->_mutex_state);
+    saved.reserve(state->_variables.size());
+    for (const auto &variable : state->_variables) {
+      if (variable == nullptr)
+        return reject("similarity reset found a null state variable");
+      saved.push_back({variable, variable->value(), variable->fej()});
+    }
+    covariance_before = state->_Cov;
+  }
+
+  auto restore = [&]() {
+    std::lock_guard<std::mutex> lock(state->_mutex_state);
+    for (const auto &entry : saved) {
+      entry.type->set_value(entry.value);
+      entry.type->set_fej(entry.fej);
+    }
+    state->_Cov = covariance_before;
+    propagator->invalidate_cache();
+  };
+
+  const Sim3ScaleResetResult scale_result =
+      apply_sim3_scale_reset(state, scale, propagator, camera_id);
+  if (!scale_result.success)
+    return reject("metric scale stage rejected: " +
+                  scale_result.failure_reason);
+
+  const GlobalYawTranslationResetResult gauge_result =
+      apply_global_yaw_translation_reset(state, yaw_delta_rad,
+                                         target_imu_position, propagator);
+  if (!gauge_result.success) {
+    restore();
+    result.propagator_cache_invalidated = true;
+    return reject("yaw/translation stage rejected after rolled-back scale: " +
+                  gauge_result.failure_reason);
+  }
+
+  result.success = true;
+  result.state_changed = scale_result.state_changed || gauge_result.state_changed;
+  result.propagator_cache_invalidated =
+      scale_result.propagator_cache_invalidated ||
+      gauge_result.propagator_cache_invalidated;
+  result.translation = gauge_result.translation;
+  result.covariance_min_eigenvalue =
+      gauge_result.covariance_min_eigenvalue;
+  result.covariance_psd_projection_limit =
+      std::max(scale_result.covariance_psd_projection_limit,
+               gauge_result.covariance_psd_projection_limit);
+  result.covariance_psd_projection_magnitude =
+      std::max(scale_result.covariance_psd_projection_magnitude,
+               gauge_result.covariance_psd_projection_magnitude);
+  result.covariance_psd_projected =
+      scale_result.covariance_psd_projected ||
+      gauge_result.covariance_psd_projected;
+  result.failure_reason.clear();
+  return result;
+}
+
+Eigen::MatrixXd StateHelper::project_visual_measurement_jacobian(
+    std::shared_ptr<State> state,
+    const std::vector<std::shared_ptr<Type>> &H_order,
+    const Eigen::MatrixXd &H,
+    VisualYawUpdateMode visual_yaw_update_mode,
+    double visual_yaw_update_scale,
+    double visual_global_yaw_oc_alpha) {
+  int current_it = 0;
+  std::vector<int> H_id;
+  for (const auto &meas_var : H_order) {
+    H_id.push_back(current_it);
+    current_it += meas_var ? meas_var->size() : 0;
+  }
+  if (visual_yaw_update_mode == VisualYawUpdateMode::GLOBAL_YAW_OC_PROJECTION)
+    return project_global_yaw_from_H(state, H_order, H_id, H,
+                                     visual_global_yaw_oc_alpha, false);
+  if (visual_yaw_update_mode == VisualYawUpdateMode::GLOBAL_YAW_OC_FEJ_PROJECTION)
+    return project_global_yaw_from_H(state, H_order, H_id, H,
+                                     visual_global_yaw_oc_alpha, true);
+  if (visual_yaw_update_mode == VisualYawUpdateMode::GLOBAL_YAW_OC_CENTERED_PROJECTION)
+    return project_global_yaw_from_H(state, H_order, H_id, H,
+                                     visual_global_yaw_oc_alpha, false, true);
+  if (visual_yaw_update_mode == VisualYawUpdateMode::GLOBAL_4DOF_OC_PROJECTION)
+    return project_global_4d_from_H(state, H_order, H_id, H,
+                                    visual_global_yaw_oc_alpha, false);
+  if (visual_yaw_update_mode == VisualYawUpdateMode::PER_BLOCK_SCALE)
+    return project_per_block_yaw_from_H(state, H_order, H_id, H,
+                                        visual_yaw_update_scale);
+  return H;
+}
 
 void StateHelper::reset_last_yaw_dx_projection_diag() {
   last_yaw_dx_projection_diag = YawDxProjectionDiag();
@@ -423,7 +1708,7 @@ void StateHelper::EKFPropagation(std::shared_ptr<State> state, const std::vector
 void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std::shared_ptr<Type>> &H_order, const Eigen::MatrixXd &H,
                             const Eigen::VectorXd &res, const Eigen::MatrixXd &R, VisualYawUpdateMode visual_yaw_update_mode,
                             double visual_yaw_update_scale, double visual_global_yaw_oc_alpha,
-                            double visual_bgz_update_scale) {
+                            double visual_bgz_update_scale, double visual_imu_yaw_gain_scale) {
 
   //==========================================================
   //==========================================================
@@ -444,6 +1729,16 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
     H_eff = project_global_yaw_from_H(state, H_order, H_id, H, visual_global_yaw_oc_alpha, /*use_fej=*/false);
   } else if (visual_yaw_update_mode == VisualYawUpdateMode::GLOBAL_YAW_OC_FEJ_PROJECTION) {
     H_eff = project_global_yaw_from_H(state, H_order, H_id, H, visual_global_yaw_oc_alpha, /*use_fej=*/true);
+  } else if (visual_yaw_update_mode ==
+             VisualYawUpdateMode::GLOBAL_YAW_OC_CENTERED_PROJECTION) {
+    H_eff = project_global_yaw_from_H(state, H_order, H_id, H,
+                                      visual_global_yaw_oc_alpha,
+                                      /*use_fej=*/false,
+                                      /*center_positions=*/true);
+  } else if (visual_yaw_update_mode ==
+             VisualYawUpdateMode::GLOBAL_4DOF_OC_PROJECTION) {
+    H_eff = project_global_4d_from_H(state, H_order, H_id, H,
+                                     visual_global_yaw_oc_alpha, false);
   } else if (visual_yaw_update_mode == VisualYawUpdateMode::PER_BLOCK_SCALE) {
     H_eff = project_per_block_yaw_from_H(state, H_order, H_id, H, visual_yaw_update_scale);
   }
@@ -493,6 +1788,10 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
     K = M_a * Sinv.selfadjointView<Eigen::Upper>();
   }
 
+  // Save the unmodified gain so diagnostics can distinguish the update requested
+  // by the visual residual from the diagnostic gain intervention below.
+  const Eigen::MatrixXd K_before_gain_scaling = K;
+
   // Scale bg_z row of K for visual bg_z ablation (default scale=1.0 = no change)
   bool bgz_row_scaled = false;
   if (visual_bgz_update_scale < 1.0 - 1e-12 &&
@@ -504,8 +1803,28 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
     }
   }
 
+  // Diagnostic-only suppression of the current IMU global-heading correction.
+  // Projecting H orientation columns is insufficient because P cross-covariance
+  // can still put yaw into the current IMU gain. Project the current IMU
+  // orientation rows of K directly, while leaving roll/pitch and all non-yaw
+  // state corrections available to the measurement.
+  bool imu_yaw_gain_scaled = false;
+  visual_imu_yaw_gain_scale =
+      std::max(0.0, std::min(1.0, visual_imu_yaw_gain_scale));
+  if (visual_imu_yaw_gain_scale < 1.0 - 1e-12 && state->_imu != nullptr &&
+      state->_imu->q() != nullptr) {
+    const int q_row = state->_imu->q()->id();
+    if (q_row >= 0 && q_row + 3 <= K.rows()) {
+      const Eigen::Matrix3d Cq =
+          yaw_projection_matrix(state->_imu->Rot(), visual_imu_yaw_gain_scale);
+      K.block(q_row, 0, 3, K.cols()) =
+          (Cq * K.block(q_row, 0, 3, K.cols())).eval();
+      imu_yaw_gain_scaled = true;
+    }
+  }
+
   Eigen::MatrixXd P_candidate = state->_Cov;
-  if (bgz_row_scaled) {
+  if (bgz_row_scaled || imu_yaw_gain_scaled) {
     // K no longer equals M_a S^{-1}, so the standard form P -= K M_a^T is invalid
     // (non-symmetric, goes non-PSD).  Use the gain-agnostic consistent form
     //   P+ = P - K' M_a^T - M_a K'^T + K' S K'^T
@@ -545,10 +1864,12 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
   state->_Cov = P_candidate;
 
   // Calculate our delta and update all our active states
+  const Eigen::VectorXd dx_before_gain_scaling = K_before_gain_scaling * res;
   Eigen::VectorXd dx = K * res;
   last_yaw_dx_projection_diag.valid = true;
   last_yaw_dx_projection_diag.mode = visual_yaw_update_mode;
-  last_yaw_dx_projection_diag.dx_yaw_before_projection_deg = yaw_dx_component_deg(state, dx);
+  last_yaw_dx_projection_diag.dx_yaw_before_projection_deg =
+      yaw_dx_component_deg(state, dx_before_gain_scaling);
   last_yaw_dx_projection_diag.dx_yaw_after_projection_deg = yaw_dx_component_deg(state, dx);
 
   for (size_t i = 0; i < state->_variables.size(); i++) {
@@ -593,6 +1914,14 @@ StateHelper::UpdateDiagnostics StateHelper::compute_update_diagnostics(
     H_eff = project_global_yaw_from_H(state, H_order, H_id, H, visual_global_yaw_oc_alpha, false);
   } else if (visual_yaw_update_mode == VisualYawUpdateMode::GLOBAL_YAW_OC_FEJ_PROJECTION) {
     H_eff = project_global_yaw_from_H(state, H_order, H_id, H, visual_global_yaw_oc_alpha, true);
+  } else if (visual_yaw_update_mode ==
+             VisualYawUpdateMode::GLOBAL_YAW_OC_CENTERED_PROJECTION) {
+    H_eff = project_global_yaw_from_H(state, H_order, H_id, H,
+                                      visual_global_yaw_oc_alpha, false, true);
+  } else if (visual_yaw_update_mode ==
+             VisualYawUpdateMode::GLOBAL_4DOF_OC_PROJECTION) {
+    H_eff = project_global_4d_from_H(state, H_order, H_id, H,
+                                     visual_global_yaw_oc_alpha, false);
   } else if (visual_yaw_update_mode == VisualYawUpdateMode::PER_BLOCK_SCALE) {
     H_eff = project_per_block_yaw_from_H(state, H_order, H_id, H, visual_yaw_update_scale);
   }
@@ -774,6 +2103,14 @@ Eigen::VectorXd StateHelper::compute_update_dx(std::shared_ptr<State> state,
     H_eff = project_global_yaw_from_H(state, H_order, H_id, H, visual_global_yaw_oc_alpha, false);
   } else if (visual_yaw_update_mode == VisualYawUpdateMode::GLOBAL_YAW_OC_FEJ_PROJECTION) {
     H_eff = project_global_yaw_from_H(state, H_order, H_id, H, visual_global_yaw_oc_alpha, true);
+  } else if (visual_yaw_update_mode ==
+             VisualYawUpdateMode::GLOBAL_YAW_OC_CENTERED_PROJECTION) {
+    H_eff = project_global_yaw_from_H(state, H_order, H_id, H,
+                                      visual_global_yaw_oc_alpha, false, true);
+  } else if (visual_yaw_update_mode ==
+             VisualYawUpdateMode::GLOBAL_4DOF_OC_PROJECTION) {
+    H_eff = project_global_4d_from_H(state, H_order, H_id, H,
+                                     visual_global_yaw_oc_alpha, false);
   } else if (visual_yaw_update_mode == VisualYawUpdateMode::PER_BLOCK_SCALE) {
     H_eff = project_per_block_yaw_from_H(state, H_order, H_id, H, visual_yaw_update_scale);
   }
@@ -836,6 +2173,204 @@ void StateHelper::set_initial_covariance(std::shared_ptr<State> state, const Eig
     i_index += order[i]->size();
   }
   state->_Cov = state->_Cov.selfadjointView<Eigen::Upper>();
+}
+
+bool StateHelper::inflate_initial_imu_subspace_covariance(
+    Eigen::MatrixXd &joint_covariance, double orientation_inflation,
+    double velocity_inflation, double gyro_bias_inflation,
+    double accel_bias_inflation, std::string *failure_reason) {
+  const auto fail = [&](const std::string &reason) {
+    if (failure_reason != nullptr)
+      *failure_reason = reason;
+    return false;
+  };
+  if (joint_covariance.rows() < 15 ||
+      joint_covariance.cols() != joint_covariance.rows() ||
+      !joint_covariance.allFinite())
+    return fail("joint_covariance_dimension_or_finiteness");
+  const std::array<double, 4> inflation = {
+      orientation_inflation, velocity_inflation, gyro_bias_inflation,
+      accel_bias_inflation};
+  for (double value : inflation) {
+    if (!std::isfinite(value) || value <= 0.0)
+      return fail("covariance_inflation_not_positive_finite");
+  }
+
+  const Eigen::MatrixXd symmetric =
+      0.5 * (joint_covariance + joint_covariance.transpose());
+  Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> before_eigen(symmetric);
+  if (before_eigen.info() != Eigen::Success ||
+      before_eigen.eigenvalues().minCoeff() <= 0.0)
+    return fail("joint_covariance_not_positive_definite_before_inflation");
+
+  joint_covariance = symmetric;
+  joint_covariance.block<3, 3>(0, 0) *= orientation_inflation;
+  joint_covariance.block<3, 3>(6, 6) *= velocity_inflation;
+  joint_covariance.block<3, 3>(9, 9) *= gyro_bias_inflation;
+  joint_covariance.block<3, 3>(12, 12) *= accel_bias_inflation;
+  joint_covariance =
+      0.5 * (joint_covariance + joint_covariance.transpose());
+
+  Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> after_eigen(
+      joint_covariance);
+  if (after_eigen.info() != Eigen::Success ||
+      after_eigen.eigenvalues().minCoeff() <= 0.0)
+    return fail("joint_covariance_not_positive_definite_after_inflation");
+  if (failure_reason != nullptr)
+    failure_reason->clear();
+  return true;
+}
+
+bool StateHelper::initialize_with_pose_history(
+    std::shared_ptr<State> state, double active_timestamp,
+    const Eigen::Matrix<double, 16, 1> &imu_state,
+    const std::vector<double> &clone_timestamps,
+    const std::vector<Eigen::Matrix<double, 7, 1>> &clone_states,
+    const std::vector<size_t> &landmark_feature_ids,
+    const std::vector<Eigen::Vector3d> &landmark_positions,
+    const Eigen::MatrixXd &joint_covariance, std::string *failure_reason) {
+  const auto fail = [&](const std::string &reason) {
+    if (failure_reason != nullptr)
+      *failure_reason = reason;
+    return false;
+  };
+  if (state == nullptr || state->_imu == nullptr)
+    return fail("missing_state_or_imu");
+  if (!std::isfinite(active_timestamp) || !imu_state.allFinite())
+    return fail("nonfinite_active_state");
+  if (std::fabs(imu_state.head<4>().norm() - 1.0) > 1.0e-6)
+    return fail("active_quaternion_not_unit");
+  if (clone_timestamps.size() != clone_states.size())
+    return fail("clone_timestamp_state_size_mismatch");
+  if (landmark_feature_ids.size() != landmark_positions.size())
+    return fail("landmark_id_state_size_mismatch");
+  if (clone_timestamps.size() >
+      static_cast<size_t>(std::max(0, state->_options.max_clone_size)))
+    return fail("clone_capacity_exceeded");
+  if (landmark_feature_ids.size() >
+      static_cast<size_t>(std::max(0, state->_options.max_slam_features)))
+    return fail("landmark_capacity_exceeded");
+  if (!state->_clones_IMU.empty() || !state->_features_SLAM.empty())
+    return fail("state_history_not_empty");
+  double previous_timestamp = -std::numeric_limits<double>::infinity();
+  for (size_t index = 0; index < clone_timestamps.size(); ++index) {
+    if (!std::isfinite(clone_timestamps[index]) ||
+        clone_timestamps[index] <= previous_timestamp + 1.0e-9 ||
+        clone_timestamps[index] >= active_timestamp - 1.0e-9)
+      return fail("clone_timestamps_not_strictly_historical");
+    if (!clone_states[index].allFinite() ||
+        std::fabs(clone_states[index].head<4>().norm() - 1.0) > 1.0e-6)
+      return fail("invalid_clone_state");
+    previous_timestamp = clone_timestamps[index];
+  }
+  std::unordered_set<size_t> unique_landmark_ids;
+  for (size_t index = 0; index < landmark_feature_ids.size(); ++index) {
+    if (!landmark_positions[index].allFinite())
+      return fail("invalid_landmark_state");
+    if (!unique_landmark_ids.insert(landmark_feature_ids[index]).second)
+      return fail("duplicate_landmark_feature_id");
+  }
+  const Eigen::Index expected_covariance_dimension =
+      15 + 6 * static_cast<Eigen::Index>(clone_states.size()) +
+      3 * static_cast<Eigen::Index>(landmark_positions.size());
+  if (joint_covariance.rows() != expected_covariance_dimension ||
+      joint_covariance.cols() != expected_covariance_dimension ||
+      !joint_covariance.allFinite())
+    return fail("joint_covariance_dimension_or_finiteness");
+  const Eigen::MatrixXd symmetric_covariance =
+      0.5 * (joint_covariance + joint_covariance.transpose());
+  const double covariance_scale =
+      std::max(1.0, symmetric_covariance.cwiseAbs().maxCoeff());
+  if ((joint_covariance - joint_covariance.transpose()).norm() >
+      1.0e-9 * covariance_scale)
+    return fail("joint_covariance_not_symmetric");
+  Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> covariance_eigen(
+      symmetric_covariance);
+  if (covariance_eigen.info() != Eigen::Success ||
+      covariance_eigen.eigenvalues().minCoeff() <= 0.0)
+    return fail("joint_covariance_not_positive_definite");
+
+  const Eigen::Index old_covariance_dimension = state->_Cov.rows();
+  const Eigen::Index new_covariance_dimension =
+      old_covariance_dimension +
+      6 * static_cast<Eigen::Index>(clone_states.size()) +
+      3 * static_cast<Eigen::Index>(landmark_positions.size());
+  Eigen::MatrixXd new_covariance = Eigen::MatrixXd::Zero(
+      new_covariance_dimension, new_covariance_dimension);
+  new_covariance.topLeftCorner(old_covariance_dimension,
+                               old_covariance_dimension) = state->_Cov;
+  const Eigen::Index imu_offset = state->_imu->id();
+  if (imu_offset < 0 || imu_offset + state->_imu->size() >
+                            old_covariance_dimension)
+    return fail("active_imu_covariance_index_invalid");
+  new_covariance.block(imu_offset, 0, state->_imu->size(),
+                       new_covariance_dimension)
+      .setZero();
+  new_covariance.block(0, imu_offset, new_covariance_dimension,
+                       state->_imu->size())
+      .setZero();
+
+  std::vector<std::shared_ptr<ov_type::Type>> new_variables =
+      state->_variables;
+  std::map<double, std::shared_ptr<ov_type::PoseJPL>> new_clones;
+  std::unordered_map<size_t, std::shared_ptr<ov_type::Landmark>>
+      new_landmarks;
+  std::vector<std::shared_ptr<ov_type::Type>> covariance_order;
+  covariance_order.reserve(1 + clone_states.size() + landmark_positions.size());
+  covariance_order.push_back(state->_imu);
+  for (size_t index = 0; index < clone_states.size(); ++index) {
+    auto clone = std::make_shared<ov_type::PoseJPL>();
+    clone->set_value(clone_states[index]);
+    clone->set_fej(clone_states[index]);
+    clone->set_local_id(static_cast<int>(old_covariance_dimension + 6 * index));
+    new_variables.push_back(clone);
+    new_clones.emplace(clone_timestamps[index], clone);
+    covariance_order.push_back(clone);
+  }
+  const Eigen::Index landmark_covariance_offset =
+      old_covariance_dimension +
+      6 * static_cast<Eigen::Index>(clone_states.size());
+  for (size_t index = 0; index < landmark_positions.size(); ++index) {
+    auto landmark = std::make_shared<ov_type::Landmark>(3);
+    landmark->_featid = landmark_feature_ids[index];
+    landmark->_unique_camera_id = 0;
+    landmark->_feat_representation =
+        ov_type::LandmarkRepresentation::Representation::GLOBAL_3D;
+    landmark->set_from_xyz(landmark_positions[index], false);
+    landmark->set_from_xyz(landmark_positions[index], true);
+    landmark->set_local_id(
+        static_cast<int>(landmark_covariance_offset + 3 * index));
+    new_variables.push_back(landmark);
+    new_landmarks.emplace(landmark_feature_ids[index], landmark);
+    covariance_order.push_back(landmark);
+  }
+
+  Eigen::Index source_row = 0;
+  for (const auto &row_variable : covariance_order) {
+    Eigen::Index source_col = 0;
+    for (const auto &col_variable : covariance_order) {
+      new_covariance.block(row_variable->id(), col_variable->id(),
+                           row_variable->size(), col_variable->size()) =
+          symmetric_covariance.block(source_row, source_col,
+                                     row_variable->size(),
+                                     col_variable->size());
+      source_col += col_variable->size();
+    }
+    source_row += row_variable->size();
+  }
+  new_covariance =
+      0.5 * (new_covariance + new_covariance.transpose());
+
+  state->_imu->set_value(imu_state);
+  state->_imu->set_fej(imu_state);
+  state->_variables = std::move(new_variables);
+  state->_clones_IMU = std::move(new_clones);
+  state->_features_SLAM = std::move(new_landmarks);
+  state->_Cov = std::move(new_covariance);
+  state->_timestamp = active_timestamp;
+  if (failure_reason != nullptr)
+    failure_reason->clear();
+  return true;
 }
 
 void StateHelper::inject_pz_noise(std::shared_ptr<State> state, double noise) {
@@ -1231,7 +2766,8 @@ bool StateHelper::initialize(std::shared_ptr<State> state, std::shared_ptr<Type>
                              const std::vector<std::shared_ptr<Type>> &H_order, Eigen::MatrixXd &H_R, Eigen::MatrixXd &H_L,
                              Eigen::MatrixXd &R, Eigen::VectorXd &res, double chi_2_mult,
                              VisualYawUpdateMode visual_yaw_update_mode, double visual_yaw_update_scale,
-                             double visual_global_yaw_oc_alpha, VisualOcFn oc_fn) {
+                             double visual_global_yaw_oc_alpha, VisualOcFn oc_fn,
+                             double visual_imu_yaw_gain_scale) {
 
   // Check that this new variable is not already initialized
   if (std::find(state->_variables.begin(), state->_variables.end(), new_variable) != state->_variables.end()) {
@@ -1335,10 +2871,12 @@ bool StateHelper::initialize(std::shared_ptr<State> state, std::shared_ptr<Type>
   if (Hup.rows() > 0) {
     if (oc_fn) {
       StateHelper::EKFUpdate(state, H_order, Hup_for_gate, resup, Rup,
-                             VisualYawUpdateMode::ORIGINAL, 1.0, 0.0);
+                             VisualYawUpdateMode::ORIGINAL, 1.0, 0.0, 1.0,
+                             visual_imu_yaw_gain_scale);
     } else {
       StateHelper::EKFUpdate(state, H_order, Hup, resup, Rup, visual_yaw_update_mode,
-                             visual_yaw_update_scale, visual_global_yaw_oc_alpha);
+                             visual_yaw_update_scale, visual_global_yaw_oc_alpha, 1.0,
+                             visual_imu_yaw_gain_scale);
     }
   }
   return true;

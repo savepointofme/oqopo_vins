@@ -1,0 +1,17 @@
+{
+  "experiment_id": "p4_direct_sliding_state_20260717",
+  "flight_name": "fly2",
+  "method_name": "diagnostic_staged_shared_bias_fc_attitude_common_direct",
+  "date": "20260717",
+  "status": "diagnostic",
+  "gps_csv": "C:/Users/baloney/Desktop/20260518_gsmq_d455_fly2/result/fc_rebuild_20260614/gps_refined_finealign.csv",
+  "vio_traj": "C:/Users/baloney/Desktop/P4_direct_sliding_state_20260717/staged_shared_bias_attitude_ablation_v2/20260717_060700_fly2_staged_shared_bias_fc_attitude_full_v2/fly2/traj_nav.txt",
+  "vio_bias": "C:/Users/baloney/Desktop/P4_direct_sliding_state_20260717/staged_shared_bias_attitude_ablation_v2/20260717_060700_fly2_staged_shared_bias_fc_attitude_full_v2/fly2/traj.txt.bias",
+  "diag_csv": "C:/Users/baloney/Desktop/P4_direct_sliding_state_20260717/staged_shared_bias_attitude_ablation_v2/20260717_060700_fly2_staged_shared_bias_fc_attitude_full_v2/fly2/diag.csv",
+  "t0": 728.84884119,
+  "t1": 1099.8,
+  "alignment": {"mode": "start_heading", "course_window_s": 60.0},
+  "sampling": {"mode": "gps_update_after_vio", "max_delay_s": 0.2},
+  "segmentation": {"mode": "geometry"},
+  "notes": "Root-cause ablation only: same staged shared-bias P4 p/v/bg/ba/covariance and release time, q replaced by accepted mount times synchronized FC attitude; no GPS XY/course online."
+}

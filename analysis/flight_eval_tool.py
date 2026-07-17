@@ -62,9 +62,29 @@ def cmd_single(args):
     if not has_vel:
         st.warn("飞控速度列缺失 → 参考速度使用位置差分 fallback")
 
-    # 限制到有效窗口（保留 mask 供 fc_log 行过滤）
-    _gps_window_mask = (gps_full["t"] >= spec.t0) & (gps_full["t"] <= spec.t1)
+    # Read VIO before defining the evaluation interval.  P4 may need several
+    # seconds after the replay trim boundary before emitting its first state.
+    # Aligning that first state to GPS at spec.t0 creates a fictitious initial
+    # position error equal to all motion during initialization.
+    vio = io.read_tum(spec.inputs["vio_traj"])
+    bias = io.read_bias(spec.inputs.get("vio_bias")) if spec.inputs.get("vio_bias") else None
+    vio_velocity_source = "traj.bias" if bias is not None else "vio_position_diff"
+    st.ok("align", f"vio velocity source = {vio_velocity_source}")
+
+    effective_t0 = max(float(spec.t0), float(vio["t"].iloc[0]))
+    effective_t1 = min(float(spec.t1), float(vio["t"].iloc[-1]))
+    if effective_t1 <= effective_t0:
+        raise ValueError(
+            f"GPS/VIO evaluation interval is empty: [{effective_t0}, {effective_t1}]")
+
+    # Restrict the GPS grid to actual GPS/VIO overlap.  Interior delayed
+    # samples and GPS gaps remain in the table with valid/gap flags.
+    _gps_window_mask = (
+        (gps_full["t"] >= effective_t0) & (gps_full["t"] <= effective_t1))
     gps = gps_full[_gps_window_mask].reset_index(drop=True)
+    if len(gps) < 2:
+        raise ValueError(
+            f"Too few GPS samples in GPS/VIO overlap [{effective_t0}, {effective_t1}]")
     lat0, lon0, alt0 = gps["lat"].iloc[0], gps["lon"].iloc[0], gps.get("alt", pd.Series([0])).iloc[0]
     gps_ENU = trajectory.lla_to_enu(gps["lat"], gps["lon"], gps.get("alt", 0), lat0, lon0, alt0)
     gps_EN = gps_ENU[:, :2]
@@ -76,12 +96,6 @@ def cmd_single(args):
         gps_v = trajectory.velocity_from_position(gps["t"].values, gps_EN)
         gps_vEN, gps_vU = gps_v, np.gradient(gps_U, gps["t"].values)
     gps_course = np.arctan2(gps_vEN[:, 1], gps_vEN[:, 0])
-
-    # ---- 读取 VIO（位姿 + 速度优先 .bias） ----
-    vio = io.read_tum(spec.inputs["vio_traj"])
-    bias = io.read_bias(spec.inputs.get("vio_bias")) if spec.inputs.get("vio_bias") else None
-    vio_velocity_source = "traj.bias" if bias is not None else "vio_position_diff"
-    st.ok("align", f"vio velocity source = {vio_velocity_source}")
 
     # ---- GPS 更新时间采样 ----
     gaps = gps_sampling.detect_gps_gaps(gps["t"].values)
@@ -106,11 +120,11 @@ def cmd_single(args):
 
     # ---- start-heading 对齐（位置 + 速度同旋转） ----
     h_gps = trajectory.estimate_initial_heading(gps["t"].values, gps_vEN[:, 0], gps_vEN[:, 1],
-                                                spec.t0, spec.alignment["course_window_s"])
+                                                effective_t0, spec.alignment["course_window_s"])
     # Use the same GPS-aligned time grid and same window so VIO initial heading
     # is estimated from the same first course_window_s seconds as the GPS.
     h_vio = trajectory.estimate_initial_heading(gps["t"].values, vio_vxy[:, 0], vio_vxy[:, 1],
-                                                spec.t0, spec.alignment["course_window_s"])
+                                                effective_t0, spec.alignment["course_window_s"])
     vio_EN_al, vio_vEN_al, R, dtheta = trajectory.start_align(
         gps_EN, vio_xy, gps_vEN, vio_vxy, h_gps, h_vio)
     vio_U_al = vio_z - vio_z[0] + gps_U[0]
@@ -242,6 +256,7 @@ def cmd_single(args):
     meta = {
         "experiment_id": spec.experiment_id, "flight": spec.flight_name, "method": spec.method_name,
         "status": spec.status, "t0": spec.t0, "t1": spec.t1,
+        "effective_t0": effective_t0, "effective_t1": effective_t1,
         "alignment": spec.alignment["mode"], "course_window_s": spec.alignment["course_window_s"],
         "velocity_source": ref_src, "vio_velocity_source": vio_velocity_source,
         "lk": {"available": lk.available, "mode": lk.mode,

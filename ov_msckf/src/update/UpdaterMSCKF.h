@@ -103,6 +103,9 @@ public:
     visual_yaw_update_scale_ = scale;
     visual_global_yaw_oc_alpha_ = global_alpha;
   }
+  void set_current_imu_yaw_gain_scale(double scale) {
+    current_imu_yaw_gain_scale_ = std::max(0.0, std::min(1.0, scale));
+  }
   void set_visual_bgz_update_scale(double s) { visual_bgz_update_scale_ = s; }
 
   void set_visual_observability_policy(std::shared_ptr<VisualObservabilityPolicy> policy) {
@@ -173,6 +176,7 @@ protected:
   double visual_yaw_update_scale_ = 1.0;
   double visual_global_yaw_oc_alpha_ = 0.0;
   double visual_bgz_update_scale_ = 1.0;
+  double current_imu_yaw_gain_scale_ = 1.0;
 
   std::shared_ptr<VisualObservabilityPolicy> vop_;
   std::shared_ptr<VisualResidualDiag> visual_residual_diag_;

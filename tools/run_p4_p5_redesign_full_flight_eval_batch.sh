@@ -2,6 +2,8 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+analysis_script="${P4_ANALYSIS_SCRIPT:-${repo_root}/analysis/full_flight_error_analysis.py}"
+common_segment_root="${P4_COMMON_SEGMENT_ROOT:-/mnt/c/Users/baloney/Desktop/实验目录/_OPENVINS_ORGANIZED_20260625/01_final_locked_stride_sweep/ADAPTIVE_STRIDE_VALIDATION_OFFICIAL_20260621}"
 run_root="${1:?usage: $0 RUN_ROOT OUT_ROOT [active|p4_only] [short|full]}"
 out_root="${2:?usage: $0 RUN_ROOT OUT_ROOT [active|p4_only] [short|full]}"
 mode="${3:-active}"
@@ -9,10 +11,10 @@ scope="${4:-full}"
 
 case "${mode}" in
   active)
-    method_name="persistent P4 plus target-parallax P5"
+    method_name="formal finite-window P4 plus continuous active P5"
     ;;
   p4_only)
-    method_name="persistent P4 plus fixed stride12"
+    method_name="formal finite-window P4 plus fixed stride12"
     ;;
   *)
     printf 'unsupported mode: %s (expected active or p4_only)\n' "${mode}" >&2
@@ -36,24 +38,34 @@ case "${scope}" in
 esac
 
 mkdir -p "${out_root}"
+sha256sum "${analysis_script}" >"${out_root}/analysis_tool_sha256.txt"
 
 run_one() {
   local flight="$1"
   local gps="$2"
-  local run_dir="${run_root}/${flight}_persistent_p4_${mode}"
+  local run_dir="${run_root}/${flight}_formal_p4_${mode}"
+  if [[ ! -d "${run_dir}" ]]; then
+    run_dir="${run_root}/${flight}_persistent_p4_${mode}"
+  fi
   local out_dir="${out_root}/${flight}"
+  local segment_csv="${common_segment_root}/COMMON_${flight}/COMMON_LAP_SEGMENTS.csv"
+  if [[ ! -f "${segment_csv}" ]]; then
+    printf 'missing shared lap segmentation: %s\n' "${segment_csv}" >&2
+    return 2
+  fi
   mkdir -p "${out_dir}"
-  python3 "${repo_root}/analysis/full_flight_error_analysis.py" \
+  python3 "${analysis_script}" \
     --gps "${gps}" \
-    --vio-traj "${run_dir}/traj.txt" \
+    --vio-traj "${run_dir}/traj_nav.txt" \
     --vio-bias "${run_dir}/traj.txt.bias" \
     --vio-diag "${run_dir}/diag.csv" \
     --out-dir "${out_dir}" \
     --evaluation-window-mode "${evaluation_window_mode}" \
+    --segment-index-csv "${segment_csv}" \
     --alignment-mode absolute_navigation_no_post_alignment \
     --flight-name "${flight}" \
     --method-name "${method_name}" \
-    --experiment-id "P4_P5_redesign_20260714_${scope}_${mode}" \
+    --experiment-id "P4_P5_redesign_20260715_${scope}_${mode}" \
     --source-package "${run_dir}" \
     --experiment-config "${run_dir}/command.txt" \
     --run-status success \

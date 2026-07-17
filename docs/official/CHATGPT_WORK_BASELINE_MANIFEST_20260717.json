@@ -1,0 +1,44 @@
+{
+  "schema": "openvins.p4_p5.chatgpt_work_baseline.v1",
+  "created_local_date": "2026-07-17",
+  "branch": "redesign/p4-sliding-window-r1-20260714",
+  "tag": "baseline/p4-p5-chatgpt-work-20260717",
+  "source_parent_commit": "fdd8d745229c7115b56b5d2d765f462a3fd68b4b",
+  "workspace": "D:/vscode_dir/open_vins_p4_sliding_r1",
+  "status": {
+    "build": "passed_direct_targets",
+    "direct_tests": "10_of_10_passed",
+    "p4_formal_acceptance": "failed_not_accepted",
+    "p5_formal_acceptance": "not_started_not_accepted",
+    "new_p4_spec_implemented": false
+  },
+  "registry": {
+    "records": 1321,
+    "raw_runs": 492,
+    "evaluations": 571,
+    "batches": 201,
+    "run_specs": 57,
+    "successful_nonempty_raw_runs": 365,
+    "explicit_failed_runs_or_batches": 109,
+    "trajectories_without_exit_receipt": 63,
+    "incomplete_or_abandoned": 3,
+    "evaluations_with_main_xy_na": 8
+  },
+  "key_documents": [
+    "docs/official/CHATGPT_WORK_BASELINE_HANDOFF_20260717.md",
+    "docs/official/P4_FORMAL_INITIALIZATION_IMPLEMENTATION_SPEC_20260717.md",
+    "docs/official/P4_INITIALIZATION_LITERATURE_AND_ARCHITECTURE_REVIEW_20260717.md",
+    "docs/official/P4_P5_NIGHT_20260715/P4_EXPERIMENT_MASTER_RECORD_AND_RULES.md",
+    "docs/official/P4_P5_NIGHT_20260715/P4_EXPERIMENT_LEDGER.csv",
+    "docs/official/P4_P5_NIGHT_20260715/P5_NIGHT_RESULT.md",
+    "evidence_staging/FINAL_NEWCODE_KD_VERDICT.md"
+  ],
+  "excluded_artifacts": [
+    "build directories",
+    "Testing output",
+    "PID files",
+    "stdout/stderr logs",
+    "large generated flight outputs and dashboards"
+  ],
+  "warning": "This tag is an experimental evidence baseline, not an accepted P4 or P5 release."
+}

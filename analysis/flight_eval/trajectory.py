@@ -102,6 +102,35 @@ def cumulative_distance(EN: np.ndarray) -> np.ndarray:
 
 
 def velocity_from_position(t: np.ndarray, EN: np.ndarray) -> np.ndarray:
-    """位置差分得速度（fallback）。中心差分。"""
-    v = np.gradient(EN, t, axis=0)
-    return v
+    """位置差分得速度（fallback）。中心差分并处理重复时间戳。
+
+    正式 GPS CSV 通常已在读取时去重；这里仍对重复时间戳做防御性
+    聚合，避免任何调用者把 ``dt=0`` 交给 ``np.gradient`` 后污染整条
+    航向对齐链路。
+    """
+    t = np.asarray(t, dtype=float)
+    position = np.asarray(EN, dtype=float)
+    if t.ndim != 1 or position.shape[0] != t.size:
+        raise ValueError("time and position lengths do not match")
+    if t.size < 2:
+        return np.full_like(position, np.nan, dtype=float)
+
+    order = np.argsort(t, kind="stable")
+    t_sorted = t[order]
+    p_sorted = position[order]
+    unique_t, inverse, counts = np.unique(
+        t_sorted, return_inverse=True, return_counts=True)
+    if unique_t.size < 2:
+        return np.full_like(position, np.nan, dtype=float)
+
+    flat = p_sorted.reshape(p_sorted.shape[0], -1)
+    unique_flat = np.zeros((unique_t.size, flat.shape[1]), dtype=float)
+    np.add.at(unique_flat, inverse, flat)
+    unique_flat /= counts[:, None]
+    edge_order = 2 if unique_t.size >= 3 else 1
+    unique_velocity = np.gradient(
+        unique_flat, unique_t, axis=0, edge_order=edge_order)
+    sorted_velocity = unique_velocity[inverse].reshape(p_sorted.shape)
+    velocity = np.empty_like(sorted_velocity)
+    velocity[order] = sorted_velocity
+    return velocity

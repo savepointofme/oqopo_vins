@@ -262,6 +262,15 @@ void FeatureDatabase::cleanup_measurements_exact(double timestamp) {
   }
 }
 
+size_t FeatureDatabase::remove_features(
+    const std::vector<size_t> &feature_ids) {
+  std::lock_guard<std::mutex> lck(mtx);
+  size_t removed = 0;
+  for (const size_t feature_id : feature_ids)
+    removed += features_idlookup.erase(feature_id);
+  return removed;
+}
+
 double FeatureDatabase::get_oldest_timestamp() {
   std::lock_guard<std::mutex> lck(mtx);
   double oldest_time = -1;

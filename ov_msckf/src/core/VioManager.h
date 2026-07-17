@@ -65,8 +65,12 @@
 #include <unordered_set>
 
 #include "FCInitLoader.h"
+#include "AglSceneScaleController.h"
+#include "AglSceneScaleGroundEstimator.h"
 #include "BackendUpdateTrigger.h"
+#include "DynamicTurnRoiPolicy.h"
 #include "OnlineAlignmentInitializer.h"
+#include "OnlineVioFcGaugeAligner.h"
 #include "VioManagerOptions.h"
 
 namespace ov_core {
@@ -84,6 +88,57 @@ class PoseJPL;
 } // namespace ov_type
 
 namespace ov_msckf {
+
+struct DynamicTurnRoiRuntimeStats {
+  bool enabled = false;
+  DynamicTurnRoiDecision decision;
+  int detection_masked_pixels = 0;
+  int msckf_available = 0;
+  int msckf_selected_preferred = 0;
+  int msckf_selected_other = 0;
+  int slam_available = 0;
+  int slam_selected_preferred = 0;
+  int slam_selected_other = 0;
+  int delayed_slam_available = 0;
+  int delayed_slam_selected_preferred = 0;
+  int delayed_slam_selected_other = 0;
+};
+
+enum class AglSceneScaleMode {
+  OFF = 0,
+  SHADOW = 1,
+  SINGLE_RESET = 2,
+  GUARDED_REPEAT_RESET = 3
+};
+
+struct AglSceneScaleRuntimeStats {
+  AglSceneScaleMode mode = AglSceneScaleMode::OFF;
+  std::string mode_name = "off";
+  double timestamp = -1.0;
+  double agl_timestamp = -1.0;
+  double agl_m = std::numeric_limits<double>::quiet_NaN();
+  double agl_age_s = std::numeric_limits<double>::infinity();
+  AglGroundEstimate ground;
+  AglSceneScaleDecision decision;
+  bool reset_attempted = false;
+  bool reset_succeeded = false;
+  bool state_modified = false;
+  double applied_scale = std::numeric_limits<double>::quiet_NaN();
+  Eigen::Vector3d pivot_camera_center = Eigen::Vector3d::Constant(
+      std::numeric_limits<double>::quiet_NaN());
+  double covariance_min_eigenvalue =
+      std::numeric_limits<double>::quiet_NaN();
+  bool covariance_psd_projected = false;
+  double covariance_psd_projection_magnitude = 0.0;
+  double covariance_psd_projection_limit =
+      std::numeric_limits<double>::quiet_NaN();
+  std::string reset_reason = "not_attempted";
+  size_t evaluation_count = 0;
+  size_t valid_ground_count = 0;
+  size_t proposal_count = 0;
+  size_t reset_attempt_count = 0;
+  size_t reset_success_count = 0;
+};
 
 class State;
 class StateHelper;
@@ -154,9 +209,13 @@ public:
   bool feed_measurement_fc_navigation(const FCNavigationSample &message);
 
   bool online_alignment_enabled() const { return online_alignment_initializer_ != nullptr; }
+  bool online_alignment_uses_upstream_dynamic_init() const {
+    return online_alignment_initializer_ != nullptr &&
+           online_alignment_initializer_->upstream_dynamic_init_fc_gauge();
+  }
   bool online_alignment_complete() const {
     return online_alignment_initializer_ != nullptr &&
-           online_alignment_initializer_->alignment_window_closed();
+           online_alignment_result_valid_;
   }
   const OnlineAlignmentDiagnostics &online_alignment_diagnostics() const;
   std::string online_alignment_rejection() const;
@@ -197,16 +256,14 @@ public:
   /// before clone augmentation or MSCKF/SLAM selection.
   void feed_measurement_camera_cadence(const ov_core::CameraData &message,
                                        bool backend_eligible) {
-    track_image_and_update(message, backend_eligible, false, false, false);
+    track_image_and_update(message, backend_eligible, false);
   }
 
   /// Tracking is already due. The backend decision is made after KLT from the
   /// information accumulated since the last backend frame.
   void feed_measurement_camera_information_cadence(
-      const ov_core::CameraData &message, bool safety_forced,
-      bool visual_health_bad) {
-    track_image_and_update(message, false, true, safety_forced,
-                           visual_health_bad);
+      const ov_core::CameraData &message) {
+    track_image_and_update(message, false, true);
   }
 
   /**
@@ -242,6 +299,30 @@ public:
 
   /// Atomic release boundary for a quality-gated causal online result.
   void initialize_with_online_alignment(const OnlineAlignmentResult &result);
+
+  /// Promote a provisionally running VIO into G_nav by changing only its
+  /// global yaw and translation gauge. Velocity is rotated with the frame;
+  /// roll/pitch, biases, clones, landmarks, FEJ, and filter history are kept.
+  bool anchor_with_online_alignment(const OnlineAlignmentResult &result);
+
+  /// Diagnostic-only release contract: keep the P4 nominal state and release
+  /// timestamp, but replace its 15x15 covariance with a diagonal covariance.
+  /// This isolates initialization covariance from every other P4 output.
+  bool set_online_alignment_release_covariance_override(
+      double sigma_att_rad, double sigma_pos, double sigma_vel,
+      double sigma_bg, double sigma_ba);
+
+  /// Keep the P4 absolute position in the release result/output transform while
+  /// running the estimator itself in a release-centered local W0 frame.
+  void set_online_alignment_local_estimator_origin(bool enabled) {
+    online_alignment_local_estimator_origin_enabled_ = enabled;
+  }
+
+  /// Diagnostic-only post-P4 camera/IMU rotation perturbation. P4 itself uses
+  /// the configured fixed extrinsic; this left rotation is applied to camera 0
+  /// only at the accepted online-alignment release boundary.
+  bool configure_post_alignment_camera_extrinsic_rotation(
+      const Eigen::Vector3d &left_rotvec_rad);
 
   /**
    * @brief Feed a scalar GPS altitude (world Z) measurement, performs a 1D EKF
@@ -317,6 +398,13 @@ public:
   /// Ported from PX4-Autopilot fuseHaglRng, commit d5a0ca1bbc5e932bba5dc5b2bb58e0e0147f9909.
   /// Only p_z state DOF and p_z column/row of P are updated; all others unchanged.
   void set_gps_alt_joseph_update(bool v) { gps_alt_joseph_update_ = v; }
+
+  /// In guarded coupled mode, fall back to the p_z-only masked Joseph update
+  /// when a cross-covariance guard rejects the full-state correction. This
+  /// preserves height aiding without applying the unsafe XY/attitude/bias gain.
+  void set_gps_alt_guard_fallback_joseph_pz(bool v) {
+    gps_alt_guard_fallback_joseph_pz_ = v;
+  }
 
   /// Set innovation rejection gate (meters). Updates with |residual| > threshold
   /// are skipped entirely (no EKF update). Default = 1e9 (off).
@@ -403,6 +491,14 @@ public:
     slam_freeze_t0_ = t0;
     slam_freeze_t1_ = t1;
   }
+  void set_msckf_yaw_freeze_window(double t0, double t1) {
+    msckf_yaw_freeze_t0_ = t0;
+    msckf_yaw_freeze_t1_ = t1;
+  }
+  void set_visual_yaw_gain_zero_window(double t0, double t1) {
+    visual_yaw_gain_zero_t0_ = t0;
+    visual_yaw_gain_zero_t1_ = t1;
+  }
 
   /// Per-call diagnostic snapshot populated by every GPS altitude update.
   struct GpsAltLastUpdate {
@@ -484,6 +580,18 @@ public:
   };
   VisualResidualHealth get_latest_visual_residual_health() const;
 
+  struct VisualUpdateStateCorrection {
+    bool valid = false;
+    double timestamp = -1.0;
+    double position_m = 0.0;
+    double velocity_mps = 0.0;
+    double attitude_deg = 0.0;
+  };
+  const VisualUpdateStateCorrection &
+  get_latest_visual_update_state_correction() const {
+    return latest_visual_update_state_correction_;
+  }
+
   struct VisualUpdateCounters {
     size_t msckf_update_count = 0;
     size_t regular_slam_update_count = 0;
@@ -522,15 +630,41 @@ public:
     size_t tracking_only_frame_count = 0;
     size_t tracking_only_observation_drop_count = 0;
     size_t tracking_only_clone_violation_count = 0;
+    size_t backend_trigger_count = 0;
+    size_t backend_clone_commit_count = 0;
+    size_t backend_trigger_without_clone_count = 0;
+    size_t backend_bootstrap_trigger_count = 0;
     size_t backend_information_trigger_count = 0;
     size_t backend_latency_fallback_count = 0;
-    size_t backend_safety_trigger_count = 0;
+    size_t backend_termination_trigger_count = 0;
+    size_t backend_pure_rotation_hold_count = 0;
     double visual_update_adaptive_last_dt_s = 0.0;
     double visual_update_adaptive_last_frame_flow_px = 0.0;
     double visual_update_adaptive_last_accum_flow_px = 0.0;
     int visual_update_adaptive_last_track_count = -1;
   };
   const VisualUpdateCounters &get_visual_update_counters() const { return visual_update_counters_; }
+  const AdaptiveBackendDecision &get_last_backend_update_decision() const {
+    return last_backend_update_decision_;
+  }
+  void configure_dynamic_turn_roi(bool enabled) {
+    dynamic_turn_roi_enabled_ = enabled;
+    dynamic_turn_roi_runtime_.enabled = enabled;
+    if (!enabled)
+      dynamic_turn_roi_policy_.reset();
+  }
+  const DynamicTurnRoiRuntimeStats &get_dynamic_turn_roi_runtime_stats() const {
+    return dynamic_turn_roi_runtime_;
+  }
+  bool configure_agl_scene_scale(const std::string &mode);
+  bool feed_measurement_agl(double timestamp, double agl_m,
+                            bool valid = true);
+  const AglSceneScaleRuntimeStats &get_agl_scene_scale_runtime_stats() const {
+    return agl_scene_scale_runtime_;
+  }
+  bool last_backend_reference_committed() const {
+    return last_backend_reference_committed_;
+  }
 
   /// Reset GPS altitude bootstrap state (for all modes). Call between runs.
   void reset_gps_altitude_bootstrap() {
@@ -588,6 +722,10 @@ public:
   /// If we are initialized or not
   /// [中文] 判断系统是否已初始化: 必须既完成初始化又至少做过一次更新。
   bool initialized() { return is_initialized_vio && timelastupdate != -1; }
+
+  /// Internal filter lifecycle bit. Unlike initialized(), this becomes true
+  /// immediately after a provisional seed, before the first backend update.
+  bool internal_vio_initialized() const { return is_initialized_vio; }
 
   /// Timestamp that the system was initialized at
   double initialized_time() { return startup_time; }
@@ -663,9 +801,13 @@ protected:
    */
   void track_image_and_update(const ov_core::CameraData &message,
                               bool backend_eligible = true,
-                              bool information_trigger_backend = false,
-                              bool backend_safety_forced = false,
-                              bool backend_visual_health_bad = false);
+                              bool information_trigger_backend = false);
+
+  /// Convert each solved P4 fixed-time window into a yaw+translation gauge
+  /// observation against the provisionally running VIO. Formal release occurs
+  /// only after continuous sensor-time gauge agreement.
+  bool process_online_alignment_shadow_window(
+      const OnlineAlignmentResult &window_result);
 
   /**
    * @brief This will do the propagation and feature updates to the state
@@ -717,7 +859,8 @@ protected:
                           double yaw_before_deg, double yaw_after_deg,
                           double delta_yaw_deg, double bg_z,
                           int num_features, double chi2, int accepted, int rejected,
-                          int tracking_feature_count);
+                          int tracking_feature_count,
+                          const Eigen::Matrix3d &R_ItoG_before);
 
   /// Write one row to visual_observability_diag CSV, if enabled.
   void log_visual_obs_diag(double timestamp, const std::string &update_type,
@@ -795,6 +938,11 @@ protected:
    */
   void retriangulate_active_tracks(const ov_core::CameraData &message);
 
+  void evaluate_agl_scene_scale_after_backend(
+      const ov_core::CameraData &message);
+  void transform_visual_scene_scale_caches(
+      double scale, const Eigen::Vector3d &pivot_camera_center);
+
   /// Manager parameters
   /// [中文] 启动时整体加载的配置 (时间窗、最大克隆数、各种阈值等)
   VioManagerOptions params;
@@ -824,8 +972,27 @@ protected:
 
   /// Optional outer supervisor. It never performs continuous FC fusion.
   std::shared_ptr<OnlineAlignmentInitializer> online_alignment_initializer_;
+  OnlineAlignmentOptions online_alignment_options_;
   OnlineAlignmentResult online_alignment_result_;
   bool online_alignment_result_valid_ = false;
+  struct OnlineAlignmentLocalStateSnapshot {
+    double timestamp = -1.0;
+    Eigen::Vector4d q_GtoI = Eigen::Vector4d(0.0, 0.0, 0.0, 1.0);
+    Eigen::Vector3d p_IinG = Eigen::Vector3d::Zero();
+    Eigen::Vector3d v_IinG = Eigen::Vector3d::Zero();
+  };
+  OnlineVioFcGaugeAligner online_alignment_gauge_aligner_;
+  std::deque<OnlineAlignmentLocalStateSnapshot>
+      online_alignment_local_state_history_;
+  int online_alignment_gauge_window_count_ = 0;
+  bool online_alignment_release_covariance_override_enabled_ = false;
+  Eigen::Matrix<double, 15, 15>
+      online_alignment_release_covariance_override_ =
+          Eigen::Matrix<double, 15, 15>::Identity();
+  bool online_alignment_local_estimator_origin_enabled_ = false;
+  bool post_alignment_camera_extrinsic_rotation_enabled_ = false;
+  Eigen::Vector3d post_alignment_camera_extrinsic_left_rotvec_rad_ =
+      Eigen::Vector3d::Zero();
 
   /// Boolean if we are initialized or not
   /// [中文] 初始化完成标记, 影响 track_image_and_update 的分支逻辑
@@ -865,6 +1032,7 @@ protected:
   std::ofstream of_vio_yaw_update_diag;
   double vio_yaw_update_diag_cumsum_deg = 0.0;
   VisualUpdateCounters visual_update_counters_;
+  VisualUpdateStateCorrection latest_visual_update_state_correction_;
   std::ofstream of_visual_obs_diag;
   double visual_obs_diag_cumsum_yaw_deg = 0.0;
   std::ofstream of_visual_flow_curl_diag;
@@ -879,6 +1047,10 @@ protected:
   bool reference_course_valid_ = false;
   double slam_freeze_t0_ = -1.0;
   double slam_freeze_t1_ = -1.0;
+  double msckf_yaw_freeze_t0_ = -1.0;
+  double msckf_yaw_freeze_t1_ = -1.0;
+  double visual_yaw_gain_zero_t0_ = -1.0;
+  double visual_yaw_gain_zero_t1_ = -1.0;
   std::unordered_map<size_t, VisualFlowSummary> latest_visual_flow_by_cam_;
   std::unordered_map<size_t, std::unordered_map<size_t, int>> flow_track_age_by_cam_;
   std::unordered_map<size_t, std::unordered_set<size_t>> flow_prev_ids_by_cam_;
@@ -977,6 +1149,8 @@ private:
   // [Joseph masked] PX4-style masked Joseph update: only p_z state DOF and p_z row/col updated.
   // Ported from PX4-Autopilot fuseHaglRng, commit d5a0ca1bbc5e932bba5dc5b2bb58e0e0147f9909.
   bool gps_alt_joseph_update_ = false;
+  // Guard fallback: rejected coupled updates may still update p_z only.
+  bool gps_alt_guard_fallback_joseph_pz_ = false;
 
 public:
   /// Per-evaluation statistics for GPS altitude fusion diagnostics.
@@ -1022,19 +1196,30 @@ private:
   // gyro integration. Initialised to -1 (no previous image) so the first
   // frame falls back to the identity rotation.
   std::unordered_map<size_t, double> last_track_image_time_;
+  bool dynamic_turn_roi_enabled_ = false;
+  DynamicTurnRoiPolicy dynamic_turn_roi_policy_;
+  DynamicTurnRoiRuntimeStats dynamic_turn_roi_runtime_;
+  AglSceneScaleMode agl_scene_scale_mode_ = AglSceneScaleMode::OFF;
+  AglSceneScaleGroundEstimator agl_scene_scale_ground_estimator_;
+  AglSceneScaleController agl_scene_scale_controller_;
+  AglSceneScaleRuntimeStats agl_scene_scale_runtime_;
+  double latest_agl_timestamp_ = -1.0;
+  double latest_agl_m_ = std::numeric_limits<double>::quiet_NaN();
+  bool latest_agl_valid_ = false;
 
   // [Ground-parallel warp] Stores the PREVIOUS frame's R_GtoC per camera.
   // R_comp = R_GtoC_curr * R_GtoC_prev^T (frame-to-frame) is passed to TrackKLT.
   // Updated to R_GtoC_curr each frame after the warp is computed.
   bool gravity_warp_ref_set_ = false;
   std::unordered_map<size_t, Eigen::Matrix3d> gravity_warp_R_ref_;
-  BackendUpdateTrigger backend_update_trigger_;
+  AdaptiveBackendScheduler backend_update_scheduler_;
   double latest_board_imu_angular_rate_rad_s_ = 0.0;
   double latest_board_imu_timestamp_ = -1.0;
   VisualFrameSnapshot last_backend_visual_snapshot_;
   Eigen::Matrix3d last_backend_R_GtoC_ = Eigen::Matrix3d::Identity();
   double last_information_backend_timestamp_ = -1.0;
-  BackendUpdateDecision last_backend_update_decision_;
+  AdaptiveBackendDecision last_backend_update_decision_;
+  bool last_backend_reference_committed_ = false;
 
   /// [Landing watch] rolling (t, n_slam) for drop-rate detection
   std::deque<std::pair<double, int>> slam_count_history_;

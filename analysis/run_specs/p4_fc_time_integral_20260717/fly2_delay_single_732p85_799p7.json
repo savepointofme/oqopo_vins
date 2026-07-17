@@ -1,0 +1,17 @@
+{
+  "experiment_id": "p4_fc_time_integral_20260717",
+  "flight_name": "fly2",
+  "method_name": "delay_matched_single_row_732p85_799p7",
+  "date": "20260717",
+  "status": "diagnostic",
+  "gps_csv": "/mnt/c/Users/baloney/Desktop/20260518_gsmq_d455_fly2/result/fc_rebuild_20260614/gps_refined_finealign.csv",
+  "vio_traj": "/mnt/c/Users/baloney/Desktop/实验目录/P4_direct_sliding_state_20260717/delay_matched_single_fly2/20260717_043334_fly2_single_row_nasa_stride12/traj_nav.txt",
+  "vio_bias": "/mnt/c/Users/baloney/Desktop/实验目录/P4_direct_sliding_state_20260717/delay_matched_single_fly2/20260717_043334_fly2_single_row_nasa_stride12/traj.txt.bias",
+  "diag_csv": "/mnt/c/Users/baloney/Desktop/实验目录/P4_direct_sliding_state_20260717/delay_matched_single_fly2/20260717_043334_fly2_single_row_nasa_stride12/diag.csv",
+  "t0": 732.849630833,
+  "t1": 799.7,
+  "alignment": {"mode": "start_heading", "course_window_s": 60.0},
+  "sampling": {"mode": "gps_update_after_vio", "max_delay_s": 0.2},
+  "segmentation": {"mode": "geometry"},
+  "notes": "Delay-matched single-row control cropped to the new P4 short interval."
+}

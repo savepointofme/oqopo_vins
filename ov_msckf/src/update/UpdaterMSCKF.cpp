@@ -558,11 +558,12 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
   if (vop_active) {
     StateHelper::EKFUpdate(state, Hx_order_big, Hx_big, res_big, R_big,
                            StateHelper::VisualYawUpdateMode::ORIGINAL, 1.0, 0.0,
-                           visual_bgz_update_scale_);
+                           visual_bgz_update_scale_, current_imu_yaw_gain_scale_);
   } else {
     StateHelper::EKFUpdate(state, Hx_order_big, Hx_big, res_big, R_big,
                            visual_yaw_update_mode_, visual_yaw_update_scale_,
-                           visual_global_yaw_oc_alpha_, visual_bgz_update_scale_);
+                           visual_global_yaw_oc_alpha_, visual_bgz_update_scale_,
+                           current_imu_yaw_gain_scale_);
   }
   rT5 = boost::posix_time::microsec_clock::local_time();
 

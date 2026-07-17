@@ -70,6 +70,12 @@ struct CameraData {
   /// Tracking masks for each camera we have
   std::vector<cv::Mat> masks;
 
+  /// Optional masks used only when detecting new features. Existing KLT tracks
+  /// are validated against `masks`, so a policy can bias feature replenishment
+  /// without turning otherwise healthy tracks into artificial lost features.
+  /// Empty preserves the historical behavior where `masks` serve both roles.
+  std::vector<cv::Mat> detection_masks;
+
   /// Sort function to allow for using of STL containers
   bool operator<(const CameraData &other) const {
     if (timestamp == other.timestamp) {

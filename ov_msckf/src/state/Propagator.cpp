@@ -77,7 +77,13 @@ void Propagator::set_yaw_diag_path(const std::string &path) {
       << "gyro_bias_x,gyro_bias_y,gyro_bias_z,"
       << "omega_world_x,omega_world_y,omega_world_z,"
       << "state_yaw_before,state_yaw_after,delta_yaw_prop,"
-      << "roll,pitch,yaw,camera_imu_timeoffset,propagation_valid\n";
+      << "roll,pitch,yaw,camera_imu_timeoffset,propagation_valid,"
+      << "R_ItoG_before_00,R_ItoG_before_01,R_ItoG_before_02,"
+      << "R_ItoG_before_10,R_ItoG_before_11,R_ItoG_before_12,"
+      << "R_ItoG_before_20,R_ItoG_before_21,R_ItoG_before_22,"
+      << "R_ItoG_after_00,R_ItoG_after_01,R_ItoG_after_02,"
+      << "R_ItoG_after_10,R_ItoG_after_11,R_ItoG_after_12,"
+      << "R_ItoG_after_20,R_ItoG_after_21,R_ItoG_after_22\n";
   of_yaw_diag_.flush();
   PRINT_INFO(GREEN "[IMU-PROP-YAW-DIAG] writing %s window=[%.3f, %.3f]\n" RESET,
              path.c_str(), yaw_diag_t0_, yaw_diag_t1_);
@@ -199,39 +205,117 @@ void Propagator::propagate_and_clone(std::shared_ptr<State> state, double timest
   StateHelper::augment_clone(state, last_w);
 }
 
+void Propagator::invalidate_cache() noexcept {
+  // Invalidation is an epoch change rather than a naked valid-bit store. An
+  // old propagation may still be computing, but its epoch can never become
+  // current again when it tries to publish.
+  cache_epoch.fetch_add(1, std::memory_order_acq_rel);
+}
+
+Propagator::FastStateCacheStatus Propagator::fast_state_cache_status() const {
+  std::lock_guard<std::mutex> lock(cache_imu_mtx);
+  FastStateCacheStatus status;
+  status.epoch = cache_epoch.load(std::memory_order_acquire);
+  status.published_epoch = cache_published_epoch;
+  status.valid = cache_imu_valid &&
+                 cache_published_epoch == status.epoch;
+  return status;
+}
+
 bool Propagator::fast_state_propagate(std::shared_ptr<State> state, double timestamp, Eigen::Matrix<double, 13, 1> &state_plus,
                                       Eigen::Matrix<double, 12, 12> &covariance) {
 
-  // First we will store the current calibration / estimates of the state
-  if (!cache_imu_valid) {
-    cache_state_time = state->_timestamp;
-    cache_state_est = state->_imu->value();
-    cache_state_covariance = StateHelper::get_marginal_covariance(state, {state->_imu});
-    cache_t_off = state->_calib_dt_CAMtoIMU->value()(0);
-    cache_imu_valid = true;
+  if (state == nullptr)
+    return false;
+
+  // Every cache field is protected by this mutex. Invalidation itself only
+  // advances the atomic epoch, so it cannot deadlock with a caller holding the
+  // state mutex and it can invalidate an in-flight computation immediately.
+  std::lock_guard<std::mutex> cache_lock(cache_imu_mtx);
+  const std::uint64_t operation_epoch =
+      cache_epoch.load(std::memory_order_acquire);
+  const bool have_current_cache =
+      cache_imu_valid && cache_published_epoch == operation_epoch;
+
+  // Multiple causal consumers can request the same camera timestamp (for
+  // example the backend scheduler and the ros-free trajectory writer).  The
+  // first request advances the fast cache; return that exact result to later
+  // consumers instead of reporting a false "no IMU interval" failure.
+  if (have_current_cache && std::isfinite(cache_output_timestamp) &&
+      std::fabs(timestamp - cache_output_timestamp) < 1e-12) {
+    const Eigen::Matrix<double, 13, 1> output_state =
+        cache_output_state_plus;
+    const Eigen::Matrix<double, 12, 12> output_covariance =
+        cache_output_covariance;
+    if (cache_epoch.load(std::memory_order_acquire) != operation_epoch)
+      return false;
+    state_plus = output_state;
+    covariance = output_covariance;
+    return true;
   }
 
+  double propagated_state_time = 0.0;
+  Eigen::MatrixXd propagated_state_est;
+  Eigen::MatrixXd propagated_state_covariance;
+  double propagated_t_off = 0.0;
+  StateOptions::ImuModel imu_model;
+  Eigen::Matrix3d Dw;
+  Eigen::Matrix3d Da;
+  Eigen::Matrix3d Tg;
+  Eigen::Matrix3d R_ACCtoIMU;
+  Eigen::Matrix3d R_GYROtoIMU;
+  {
+    std::lock_guard<std::mutex> state_lock(state->_mutex_state);
+    if (have_current_cache) {
+      propagated_state_time = cache_state_time;
+      propagated_state_est = cache_state_est;
+      propagated_state_covariance = cache_state_covariance;
+      propagated_t_off = cache_t_off;
+    } else {
+      propagated_state_time = state->_timestamp;
+      propagated_state_est = state->_imu->value();
+      propagated_state_covariance =
+          StateHelper::get_marginal_covariance(state, {state->_imu});
+      propagated_t_off = state->_calib_dt_CAMtoIMU->value()(0);
+    }
+
+    // Snapshot every state-backed calibration used below so one fast result is
+    // computed from a coherent state generation.
+    imu_model = state->_options.imu_model;
+    Dw = State::Dm(imu_model, state->_calib_imu_dw->value());
+    Da = State::Dm(imu_model, state->_calib_imu_da->value());
+    Tg = State::Tg(state->_calib_imu_tg->value());
+    R_ACCtoIMU = state->_calib_imu_ACCtoIMU->Rot();
+    R_GYROtoIMU = state->_calib_imu_GYROtoIMU->Rot();
+  }
+  if (cache_epoch.load(std::memory_order_acquire) != operation_epoch)
+    return false;
+
   // First lets construct an IMU vector of measurements we need
-  double time0 = cache_state_time + cache_t_off;
-  double time1 = timestamp + cache_t_off;
+  double time0 = propagated_state_time + propagated_t_off;
+  double time1 = timestamp + propagated_t_off;
   std::vector<ov_core::ImuData> prop_data;
   {
     std::lock_guard<std::mutex> lck(imu_data_mtx);
     prop_data = Propagator::select_imu_readings(imu_data, time0, time1, false);
   }
-  if (prop_data.size() < 2)
+  if (prop_data.size() < 2) {
+    if (!have_current_cache &&
+        cache_epoch.load(std::memory_order_acquire) == operation_epoch) {
+      cache_state_time = propagated_state_time;
+      cache_state_est = propagated_state_est;
+      cache_state_covariance = propagated_state_covariance;
+      cache_t_off = propagated_t_off;
+      cache_output_timestamp = std::numeric_limits<double>::quiet_NaN();
+      cache_published_epoch = operation_epoch;
+      cache_imu_valid = true;
+    }
     return false;
+  }
 
   // Biases
-  Eigen::Vector3d bias_g = cache_state_est.block(10, 0, 3, 1);
-  Eigen::Vector3d bias_a = cache_state_est.block(13, 0, 3, 1);
-
-  // IMU intrinsic calibration estimates (static)
-  Eigen::Matrix3d Dw = State::Dm(state->_options.imu_model, state->_calib_imu_dw->value());
-  Eigen::Matrix3d Da = State::Dm(state->_options.imu_model, state->_calib_imu_da->value());
-  Eigen::Matrix3d Tg = State::Tg(state->_calib_imu_tg->value());
-  Eigen::Matrix3d R_ACCtoIMU = state->_calib_imu_ACCtoIMU->Rot();
-  Eigen::Matrix3d R_GYROtoIMU = state->_calib_imu_GYROtoIMU->Rot();
+  Eigen::Vector3d bias_g = propagated_state_est.block(10, 0, 3, 1);
+  Eigen::Vector3d bias_a = propagated_state_est.block(13, 0, 3, 1);
 
   // Loop through all IMU messages, and use them to move the state forward in time
   // This uses the zero'th order quat, and then constant acceleration discrete
@@ -253,9 +337,9 @@ bool Propagator::fast_state_propagate(std::shared_ptr<State> state, double times
     Eigen::Vector3d w_hat = 0.5 * (w_hat1 + w_hat2);
 
     // Current state estimates
-    Eigen::Matrix3d R_Gtoi = quat_2_Rot(cache_state_est.block(0, 0, 4, 1));
-    Eigen::Vector3d v_iinG = cache_state_est.block(7, 0, 3, 1);
-    Eigen::Vector3d p_iinG = cache_state_est.block(4, 0, 3, 1);
+    Eigen::Matrix3d R_Gtoi = quat_2_Rot(propagated_state_est.block(0, 0, 4, 1));
+    Eigen::Vector3d v_iinG = propagated_state_est.block(7, 0, 3, 1);
+    Eigen::Vector3d p_iinG = propagated_state_est.block(4, 0, 3, 1);
 
     // State transition and noise matrix
     // TODO: should probably track the correlations with the IMU intrinsics if we are calibrating
@@ -290,41 +374,69 @@ bool Propagator::fast_state_propagate(std::shared_ptr<State> state, double times
     Qc.block(9, 9, 3, 3) = _noises.sigma_ab_2 * dt * Eigen::Matrix3d::Identity();
     Qd = G * Qc * G.transpose();
     Qd = 0.5 * (Qd + Qd.transpose());
-    cache_state_covariance = F * cache_state_covariance * F.transpose() + Qd;
+    propagated_state_covariance =
+        F * propagated_state_covariance * F.transpose() + Qd;
 
     // Propagate the mean forward
-    cache_state_est.block(0, 0, 4, 1) = rot_2_quat(exp_so3(-w_hat * dt) * R_Gtoi);
-    cache_state_est.block(4, 0, 3, 1) = p_iinG + v_iinG * dt + 0.5 * R_Gtoi.transpose() * a_hat * dt * dt - 0.5 * _gravity * dt * dt;
-    cache_state_est.block(7, 0, 3, 1) = v_iinG + R_Gtoi.transpose() * a_hat * dt - _gravity * dt;
+    propagated_state_est.block(0, 0, 4, 1) =
+        rot_2_quat(exp_so3(-w_hat * dt) * R_Gtoi);
+    propagated_state_est.block(4, 0, 3, 1) =
+        p_iinG + v_iinG * dt +
+        0.5 * R_Gtoi.transpose() * a_hat * dt * dt -
+        0.5 * _gravity * dt * dt;
+    propagated_state_est.block(7, 0, 3, 1) =
+        v_iinG + R_Gtoi.transpose() * a_hat * dt - _gravity * dt;
   }
 
   // Move the time forward
   // This time will now be in the IMU clock, so reset the toff to zero
-  cache_state_time = time1;
-  cache_t_off = 0.0;
+  propagated_state_time = time1;
+  propagated_t_off = 0.0;
 
   // Now record what the predicted state should be
-  Eigen::Vector4d q_Gtoi = cache_state_est.block(0, 0, 4, 1);
-  Eigen::Vector3d v_iinG = cache_state_est.block(7, 0, 3, 1);
-  Eigen::Vector3d p_iinG = cache_state_est.block(4, 0, 3, 1);
-  state_plus.setZero();
-  state_plus.block(0, 0, 4, 1) = q_Gtoi;
-  state_plus.block(4, 0, 3, 1) = p_iinG;
-  state_plus.block(7, 0, 3, 1) = quat_2_Rot(q_Gtoi) * v_iinG; // local frame v_iini
+  Eigen::Vector4d q_Gtoi = propagated_state_est.block(0, 0, 4, 1);
+  Eigen::Vector3d v_iinG = propagated_state_est.block(7, 0, 3, 1);
+  Eigen::Vector3d p_iinG = propagated_state_est.block(4, 0, 3, 1);
+  Eigen::Matrix<double, 13, 1> output_state_plus =
+      Eigen::Matrix<double, 13, 1>::Zero();
+  output_state_plus.block(0, 0, 4, 1) = q_Gtoi;
+  output_state_plus.block(4, 0, 3, 1) = p_iinG;
+  output_state_plus.block(7, 0, 3, 1) =
+      quat_2_Rot(q_Gtoi) * v_iinG; // local frame v_iini
   Eigen::Vector3d last_a = R_ACCtoIMU * Da * (prop_data.at(prop_data.size() - 1).am - bias_a);
   Eigen::Vector3d last_w = R_GYROtoIMU * Dw * (prop_data.at(prop_data.size() - 1).wm - bias_g - Tg * last_a);
-  state_plus.block(10, 0, 3, 1) = last_w;
+  output_state_plus.block(10, 0, 3, 1) = last_w;
 
   // Do a covariance propagation for our velocity (needs to be in local frame)
   // TODO: more properly do the covariance of the angular velocity here...
   // TODO: it should be dependent on the state bias, thus correlated with the pose..
-  covariance.setZero();
+  Eigen::Matrix<double, 12, 12> output_covariance =
+      Eigen::Matrix<double, 12, 12>::Zero();
   Eigen::Matrix<double, 15, 15> Phi = Eigen::Matrix<double, 15, 15>::Identity();
   Phi.block(6, 6, 3, 3) = quat_2_Rot(q_Gtoi);
-  Eigen::MatrixXd covariance_tmp = Phi * cache_state_covariance * Phi.transpose();
-  covariance.block(0, 0, 9, 9) = covariance_tmp.block(0, 0, 9, 9);
+  Eigen::MatrixXd covariance_tmp =
+      Phi * propagated_state_covariance * Phi.transpose();
+  output_covariance.block(0, 0, 9, 9) =
+      covariance_tmp.block(0, 0, 9, 9);
   double dt = prop_data.at(prop_data.size() - 1).timestamp - prop_data.at(prop_data.size() - 2).timestamp;
-  covariance.block(9, 9, 3, 3) = _noises.sigma_w_2 / dt * Eigen::Matrix3d::Identity();
+  output_covariance.block(9, 9, 3, 3) =
+      _noises.sigma_w_2 / dt * Eigen::Matrix3d::Identity();
+
+  // Publish only if no invalidation happened after this operation took its
+  // state snapshot. Otherwise the old generation is discarded in full.
+  if (cache_epoch.load(std::memory_order_acquire) != operation_epoch)
+    return false;
+  cache_state_time = propagated_state_time;
+  cache_state_est = propagated_state_est;
+  cache_state_covariance = propagated_state_covariance;
+  cache_t_off = propagated_t_off;
+  cache_output_timestamp = timestamp;
+  cache_output_state_plus = output_state_plus;
+  cache_output_covariance = output_covariance;
+  cache_published_epoch = operation_epoch;
+  cache_imu_valid = true;
+  state_plus = output_state_plus;
+  covariance = output_covariance;
   return true;
 }
 
@@ -581,7 +693,14 @@ void Propagator::predict_and_compute(std::shared_ptr<State> state, const ov_core
         << rpy_after(0) * 180.0 / M_PI << ","
         << rpy_after(1) * 180.0 / M_PI << ","
         << yaw_after_deg << ","
-        << t_off << ",1\n";
+        << t_off << ",1";
+      for (int row = 0; row < 3; ++row)
+        for (int col = 0; col < 3; ++col)
+          of_yaw_diag_ << "," << R_ItoG_before(row, col);
+      for (int row = 0; row < 3; ++row)
+        for (int col = 0; col < 3; ++col)
+          of_yaw_diag_ << "," << R_ItoG_after(row, col);
+      of_yaw_diag_ << "\n";
     }
   }
 

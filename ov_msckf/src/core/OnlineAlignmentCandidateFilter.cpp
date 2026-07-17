@@ -85,6 +85,8 @@ bool gate_valid(const CandidateGroupGate &gate) {
        std::isfinite(gate.history_duration_s)) ||
       (gate.history_length_updates > 0 && gate.min_supported_updates > 0);
   return depth_valid &&
+         gate.post_feedback_validation_duration_s >= 0.0 &&
+         std::isfinite(gate.post_feedback_validation_duration_s) &&
          gate.required_post_feedback_stable_updates >= 0 &&
          limits_valid(gate.max_abs_error) && limits_valid(gate.max_std) &&
          limits_valid(gate.max_std_step) &&
@@ -121,7 +123,9 @@ bool config_valid(const CandidateFilterConfig &config) {
        {CandidateStateGroup::ATTITUDE, CandidateStateGroup::GYRO_BIAS,
         CandidateStateGroup::ACCEL_BIAS}) {
     const CandidateGroupGate &gate = config.group_gates[group_index(group)];
-    if (gate.configured && gate.required_post_feedback_stable_updates <= 0)
+    if (gate.configured &&
+        !(gate.post_feedback_validation_duration_s > 0.0) &&
+        gate.required_post_feedback_stable_updates <= 0)
       return false;
   }
   return true;
@@ -642,6 +646,7 @@ void OnlineAlignmentCandidateFilter::updateGroupHistories(
       group_runtime.history.clear();
       group_runtime.consecutive_stable_updates = 0;
       group_runtime.post_first_feedback_stable_updates = 0;
+      group_runtime.post_feedback_stable_duration_s = 0.0;
       group_runtime.converged = false;
       group_runtime.last_gate_passed = false;
       continue;
@@ -660,9 +665,12 @@ void OnlineAlignmentCandidateFilter::updateGroupHistories(
     const CandidateGroupGate &gate = config_.group_gates[index];
     if (gate.configured && gate.history_duration_s > 0.0 &&
         std::isfinite(gate.history_duration_s)) {
-      while (group_runtime.history.size() > 1 &&
+      // Retain one sample on or before the time boundary. Otherwise regular
+      // streams whose period does not divide the duration can never show a
+      // complete causal interval after pruning.
+      while (group_runtime.history.size() > 2 &&
              group_runtime.history.back().board_time -
-                     group_runtime.history.front().board_time >
+                     group_runtime.history[1].board_time >=
                  gate.history_duration_s)
         group_runtime.history.pop_front();
     } else {
@@ -678,15 +686,27 @@ void OnlineAlignmentCandidateFilter::updateGroupHistories(
     group_runtime.last_gate_passed = passed;
     if (passed) {
       ++group_runtime.consecutive_stable_updates;
-      if (group_runtime.feedback_count > 0)
+      if (group_runtime.feedback_count > 0) {
         ++group_runtime.post_first_feedback_stable_updates;
+        group_runtime.post_feedback_stable_duration_s =
+            group_runtime.first_feedback_board_time >= 0.0
+                ? std::max(0.0, board_time -
+                                    group_runtime.first_feedback_board_time)
+                : 0.0;
+      }
+      const bool post_feedback_ready =
+          gate.post_feedback_validation_duration_s > 0.0
+              ? group_runtime.post_feedback_stable_duration_s +
+                        config_.time_tolerance_s >=
+                    gate.post_feedback_validation_duration_s
+              : group_runtime.post_first_feedback_stable_updates >=
+                    gate.required_post_feedback_stable_updates;
       group_runtime.converged =
-          group_runtime.feedback_count == 0 ||
-          group_runtime.post_first_feedback_stable_updates >=
-              gate.required_post_feedback_stable_updates;
+          group_runtime.feedback_count == 0 || post_feedback_ready;
     } else {
       group_runtime.consecutive_stable_updates = 0;
       group_runtime.post_first_feedback_stable_updates = 0;
+      group_runtime.post_feedback_stable_duration_s = 0.0;
       group_runtime.converged = false;
     }
   }
@@ -817,18 +837,22 @@ CandidateFeedbackResult OnlineAlignmentCandidateFilter::feedbackGroup(
   if (result.clipped)
     ++group_runtime.clipped_feedback_count;
   ++group_runtime.feedback_count;
+  if (group_runtime.feedback_count == 1)
+    group_runtime.first_feedback_board_time = trial.board_time;
   if (group == CandidateStateGroup::ATTITUDE ||
       group == CandidateStateGroup::GYRO_BIAS ||
       group == CandidateStateGroup::ACCEL_BIAS) {
     group_runtime.converged = false;
     group_runtime.consecutive_stable_updates = 0;
     group_runtime.post_first_feedback_stable_updates = 0;
+    group_runtime.post_feedback_stable_duration_s = 0.0;
     group_runtime.last_gate_passed = false;
   }
   if (result.clipped) {
     group_runtime.last_gate_passed = false;
     group_runtime.consecutive_stable_updates = 0;
     group_runtime.post_first_feedback_stable_updates = 0;
+    group_runtime.post_feedback_stable_duration_s = 0.0;
   }
   trial.safety_violation = trial.safety_violation || cumulative_violation;
   result.safety_violation = trial.safety_violation;
@@ -848,7 +872,7 @@ bool OnlineAlignmentCandidateFilter::groupReady(
       group_runtime.last_feedback_clipped || !group_runtime.converged)
     return false;
   if (group == CandidateStateGroup::POSITION ||
-      group == CandidateStateGroup::VELOCITY)
+      group == CandidateStateGroup::VELOCITY) {
     if (gate.history_duration_s > 0.0 &&
         std::isfinite(gate.history_duration_s))
       return group_runtime.history.size() >= 2 &&
@@ -859,9 +883,15 @@ bool OnlineAlignmentCandidateFilter::groupReady(
     else
       return group_runtime.supported_update_count >=
              gate.min_supported_updates;
-  return group_runtime.feedback_count > 0 &&
-         group_runtime.post_first_feedback_stable_updates >=
-             gate.required_post_feedback_stable_updates;
+  }
+  if (group_runtime.feedback_count <= 0)
+    return false;
+  if (gate.post_feedback_validation_duration_s > 0.0)
+    return group_runtime.post_feedback_stable_duration_s +
+               config_.time_tolerance_s >=
+           gate.post_feedback_validation_duration_s;
+  return group_runtime.post_first_feedback_stable_updates >=
+         gate.required_post_feedback_stable_updates;
 }
 
 bool OnlineAlignmentCandidateFilter::navigationReady() const {

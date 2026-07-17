@@ -442,6 +442,9 @@ Eigen::MatrixXd project_for_update_diag_local(
     return project_global_yaw_from_H_local(state, H_order, H, alpha, false);
   if (mode == StateHelper::VisualYawUpdateMode::GLOBAL_YAW_OC_FEJ_PROJECTION)
     return project_global_yaw_from_H_local(state, H_order, H, alpha, true);
+  if (mode == StateHelper::VisualYawUpdateMode::GLOBAL_4DOF_OC_PROJECTION)
+    return StateHelper::project_visual_measurement_jacobian(
+        state, H_order, H, mode, 1.0, alpha);
   return H;
 }
 
@@ -909,7 +912,8 @@ void UpdaterSLAM::delayed_init(std::shared_ptr<State> state, std::vector<std::sh
     }
     if (StateHelper::initialize(state, landmark, Hx_order, H_x, H_f, R, res, chi2_multipler,
                                 visual_yaw_update_mode_, visual_yaw_update_scale_,
-                                visual_global_yaw_oc_alpha_, oc_fn_delayed)) {
+                                visual_global_yaw_oc_alpha_, oc_fn_delayed,
+                                current_imu_yaw_gain_scale_)) {
       state->_features_SLAM.insert({(*it2)->featid, landmark});
       auto &meta = slam_landmark_metadata_[(*it2)->featid];
       LatestFeatureObs obs = latest_feature_obs(*it2);
@@ -1891,7 +1895,7 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
   const double yaw_before_update = yaw_deg_from_state(state);
   StateHelper::EKFUpdate(state, Hx_order_big, Hx_big, res_big, R_big,
                          update_mode, update_scale, update_alpha,
-                         visual_bgz_update_scale_);
+                         visual_bgz_update_scale_, current_imu_yaw_gain_scale_);
   const double yaw_after_update = yaw_deg_from_state(state);
   const double actual_delta_yaw_update =
       (std::isfinite(yaw_before_update) && std::isfinite(yaw_after_update)) ?
@@ -1918,7 +1922,8 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
     const double nis_after = ct_meas > 0 ? chi2_total_after_projection / (double)ct_meas : diag_nan();
     const bool oc_projection_applied =
         update_mode == StateHelper::VisualYawUpdateMode::GLOBAL_YAW_OC_PROJECTION ||
-        update_mode == StateHelper::VisualYawUpdateMode::GLOBAL_YAW_OC_FEJ_PROJECTION;
+        update_mode == StateHelper::VisualYawUpdateMode::GLOBAL_YAW_OC_FEJ_PROJECTION ||
+        update_mode == StateHelper::VisualYawUpdateMode::GLOBAL_4DOF_OC_PROJECTION;
     const bool fej_used =
         update_mode == StateHelper::VisualYawUpdateMode::GLOBAL_YAW_OC_FEJ_PROJECTION;
     const bool final_ekf_uses_projected = vop_active || oc_projection_applied;

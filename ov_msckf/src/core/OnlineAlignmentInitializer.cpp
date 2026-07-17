@@ -35,18 +35,13 @@ Eigen::Vector3d so3_log(const Eigen::Matrix3d &R) {
 
 double rotation_angle(const Eigen::Matrix3d &R) { return so3_log(R).norm(); }
 
-Eigen::Matrix3d skew(const Eigen::Vector3d &value) {
-  Eigen::Matrix3d out;
-  out << 0.0, -value.z(), value.y(), value.z(), 0.0, -value.x(), -value.y(),
-      value.x(), 0.0;
-  return out;
+double wrap_radians(double angle) {
+  return std::atan2(std::sin(angle), std::cos(angle));
 }
 
-Eigen::Matrix3d so3_exp(const Eigen::Vector3d &value) {
-  const double angle = value.norm();
-  if (angle < 1.0e-12)
-    return Eigen::Matrix3d::Identity() + skew(value);
-  return Eigen::AngleAxisd(angle, value / angle).toRotationMatrix();
+double yaw_from_R_GtoI(const Eigen::Matrix3d &R_GtoI) {
+  const Eigen::Matrix3d R_ItoG = R_GtoI.transpose();
+  return std::atan2(R_ItoG(1, 0), R_ItoG(0, 0));
 }
 
 Eigen::Quaterniond eigen_quaternion_from_jpl(const Eigen::Vector4d &q) {
@@ -350,11 +345,8 @@ public:
       : p_IinG_(p_IinG), v_IinG_(v_IinG), position_sigma_(position_sigma),
         velocity_sigma_(velocity_sigma) {}
 
-  // FC attitude is deliberately not a Ceres residual. It remains an
-  // evaluation-only diagnostic in candidate validation because transient
-  // board flex can make a turn attitude inconsistent with the fixed
-  // full-flight FC-to-board calibration. FC position/velocity still constrain
-  // the graph and retain the historical diagnostic family name.
+  // This factor contributes FC position/velocity only. Terminal attitude and
+  // relative attitude increments are represented by separate factors.
   bool operator()(const double *p_ptr, const double *v_ptr,
                   double *residuals) const {
     Eigen::Map<Eigen::Matrix<double, 6, 1>> residual(residuals);
@@ -372,6 +364,67 @@ private:
   Eigen::Vector3d v_IinG_;
   double position_sigma_;
   double velocity_sigma_;
+};
+
+class FCNavigationIncrementFunctor {
+public:
+  FCNavigationIncrementFunctor(const Eigen::Vector3d &delta_position_G,
+                               const Eigen::Vector3d &delta_velocity_G,
+                               double position_sigma,
+                               double velocity_sigma)
+      : delta_position_G_(delta_position_G),
+        delta_velocity_G_(delta_velocity_G),
+        position_sigma_(position_sigma), velocity_sigma_(velocity_sigma) {}
+
+  bool operator()(const double *p0_ptr, const double *v0_ptr,
+                  const double *p1_ptr, const double *v1_ptr,
+                  double *residuals) const {
+    const Eigen::Map<const Eigen::Vector3d> p0(p0_ptr);
+    const Eigen::Map<const Eigen::Vector3d> v0(v0_ptr);
+    const Eigen::Map<const Eigen::Vector3d> p1(p1_ptr);
+    const Eigen::Map<const Eigen::Vector3d> v1(v1_ptr);
+    Eigen::Map<Eigen::Matrix<double, 6, 1>> residual(residuals);
+    residual.segment<3>(0) =
+        ((p1 - p0) - delta_position_G_) /
+        std::max(1e-8, position_sigma_);
+    residual.segment<3>(3) =
+        ((v1 - v0) - delta_velocity_G_) /
+        std::max(1e-8, velocity_sigma_);
+    return residual.allFinite();
+  }
+
+private:
+  Eigen::Vector3d delta_position_G_;
+  Eigen::Vector3d delta_velocity_G_;
+  double position_sigma_;
+  double velocity_sigma_;
+};
+
+class FCAttitudeIncrementFunctor {
+public:
+  FCAttitudeIncrementFunctor(const Eigen::Matrix3d &R_target_previous,
+                             const Eigen::Matrix3d &R_target_current,
+                             double sigma_rad)
+      : R_target_relative_(R_target_current *
+                           R_target_previous.transpose()),
+        sigma_rad_(sigma_rad) {}
+
+  bool operator()(const double *q_previous_ptr, const double *q_current_ptr,
+                  double *residuals) const {
+    const Eigen::Matrix3d R_previous =
+        ov_core::quat_2_Rot(normalized_jpl(q_previous_ptr));
+    const Eigen::Matrix3d R_current =
+        ov_core::quat_2_Rot(normalized_jpl(q_current_ptr));
+    const Eigen::Matrix3d R_relative = R_current * R_previous.transpose();
+    Eigen::Map<Eigen::Vector3d> residual(residuals);
+    residual = so3_log(R_relative * R_target_relative_.transpose()) /
+               std::max(1e-8, sigma_rad_);
+    return residual.allFinite();
+  }
+
+private:
+  Eigen::Matrix3d R_target_relative_;
+  double sigma_rad_;
 };
 
 class QuaternionPriorFunctor {
@@ -412,12 +465,17 @@ private:
 using FCObservationCost =
     ceres::NumericDiffCostFunction<FCObservationFunctor, ceres::CENTRAL, 6, 3,
                                    3>;
+using FCNavigationIncrementCost =
+    ceres::NumericDiffCostFunction<FCNavigationIncrementFunctor,
+                                   ceres::CENTRAL, 6, 3, 3, 3, 3>;
+using FCAttitudeIncrementCost =
+    ceres::NumericDiffCostFunction<FCAttitudeIncrementFunctor,
+                                   ceres::CENTRAL, 3, 4, 4>;
 using QuaternionPriorCost =
     ceres::NumericDiffCostFunction<QuaternionPriorFunctor, ceres::CENTRAL, 3,
                                    4>;
 using VectorPriorCost =
     ceres::NumericDiffCostFunction<VectorPriorFunctor, ceres::CENTRAL, 3, 3>;
-
 struct FactorFamilies {
   std::vector<ceres::ResidualBlockId> prior;
   std::vector<ceres::ResidualBlockId> imu;
@@ -494,6 +552,40 @@ FactorContribution evaluate_family(
       global_squared += value * value;
     contribution.jacobian_frobenius = std::sqrt(global_squared);
   }
+  return contribution;
+}
+
+FactorContribution evaluate_family_residuals(
+    ceres::Problem &problem, const std::string &name,
+    const std::vector<ceres::ResidualBlockId> &blocks,
+    bool apply_loss_function = true) {
+  FactorContribution contribution;
+  contribution.family = name;
+  contribution.residual_blocks = static_cast<int>(blocks.size());
+  if (blocks.empty())
+    return contribution;
+  ceres::Problem::EvaluateOptions options;
+  options.apply_loss_function = apply_loss_function;
+  options.residual_blocks = blocks;
+  double cost = 0.0;
+  std::vector<double> residuals;
+  if (!problem.Evaluate(options, &cost, &residuals, nullptr, nullptr))
+    return contribution;
+  contribution.residual_dimension = static_cast<int>(residuals.size());
+  double squared = 0.0;
+  double maximum = 0.0;
+  std::vector<double> absolute_residuals;
+  absolute_residuals.reserve(residuals.size());
+  for (double residual : residuals) {
+    squared += residual * residual;
+    maximum = std::max(maximum, std::fabs(residual));
+    absolute_residuals.push_back(std::fabs(residual));
+  }
+  contribution.residual_rms = residuals.empty()
+                                  ? std::numeric_limits<double>::infinity()
+                                  : std::sqrt(squared / residuals.size());
+  contribution.residual_p95 = percentile(std::move(absolute_residuals), 0.95);
+  contribution.residual_max_abs = maximum;
   return contribution;
 }
 
@@ -625,7 +717,18 @@ const char *estimate_source_status_name(EstimateSourceStatus status) {
 OnlineAlignmentInitializer::OnlineAlignmentInitializer(
     const OnlineAlignmentOptions &options)
     : options_(options) {
-  if (options_.sliding_window_shadow_only) {
+  if (options_.upstream_dynamic_init_fc_gauge) {
+    options_.sliding_window_duration_s = std::max(
+        0.5, std::min(12.0, options_.sliding_window_duration_s));
+    options_.sliding_window_shadow_only = false;
+    options_.sliding_window_direct_state_release = false;
+    options_.sliding_window_deferred_release_certification = false;
+    options_.sliding_window_terminal_state_covariance_only = false;
+    options_.reference_window_duration_s =
+        options_.sliding_window_duration_s;
+    options_.candidate_window_durations_s = {
+        options_.sliding_window_duration_s};
+  } else if (options_.sliding_window_shadow_only) {
     options_.sliding_window_duration_s = std::max(
         0.5, std::min(12.0, options_.sliding_window_duration_s));
     options_.sliding_window_min_advance_s =
@@ -650,9 +753,39 @@ OnlineAlignmentInitializer::OnlineAlignmentInitializer(
   }
   maximum_window_duration_s_ = options_.candidate_window_durations_s.back();
   options_.window_duration_s = maximum_window_duration_s_;
+  options_.sliding_window_min_advance_s =
+      std::max(1.0e-3, options_.sliding_window_min_advance_s);
+  options_.sliding_window_gauge_stability_duration_s =
+      std::max(options_.sliding_window_min_advance_s,
+               options_.sliding_window_gauge_stability_duration_s);
+  options_.sliding_window_overlap_stability_duration_s =
+      std::max(options_.sliding_window_min_advance_s,
+               options_.sliding_window_overlap_stability_duration_s);
+  options_.sliding_window_min_overlap_states =
+      std::max(2, options_.sliding_window_min_overlap_states);
+  options_.sliding_window_overlap_max_normalized_sigma =
+      std::max(1.0, options_.sliding_window_overlap_max_normalized_sigma);
+  options_.sliding_window_bias_trend_max_normalized_sigma =
+      std::max(0.0,
+               options_.sliding_window_bias_trend_max_normalized_sigma);
+  if (options_.sliding_window_direct_state_release &&
+      !options_.sliding_window_shadow_only) {
+    fatal_configuration_error_ = true;
+    last_rejection_ =
+        "direct_state_release_requires_repeated_sliding_windows";
+    phase_ = AlignmentPhase::FATAL_CONFIGURATION_ERROR;
+  }
+  options_.candidate_short_validation_duration_s = std::max(
+      options_.sliding_window_min_advance_s,
+      options_.candidate_short_validation_duration_s);
   options_.min_keyframes = std::max(3, options_.min_keyframes);
   options_.max_keyframes =
       std::max(options_.min_keyframes, options_.max_keyframes);
+  options_.max_initial_clones = std::max(0, options_.max_initial_clones);
+  if (options_.sliding_window_terminal_state_covariance_only) {
+    options_.max_initial_clones = 0;
+    options_.max_initial_slam_features = 0;
+  }
   const bool calibration_valid =
       options_.fc_board_calibration_locked &&
       options_.R_FtoI_declared.allFinite() &&
@@ -678,19 +811,17 @@ OnlineAlignmentInitializer::OnlineAlignmentInitializer(
       options_.alignment_target_compensated_parallax_px;
   selector_config.minimum_common_tracks =
       std::max(4, options_.min_feature_tracks / 4);
-  selector_config.maximum_selected_frames =
-      options_.sliding_window_shadow_only
-          ? std::max(
-                2, static_cast<int>(std::ceil(
-                       (maximum_window_duration_s_ + options_.buffer_margin_s +
-                        options_.max_time_offset_s) /
-                       std::max(1.0e-3,
-                                options_.alignment_frame_minimum_interval_s))) +
-                       2)
-          : options_.maximum_selected_alignment_frames;
+  selector_config.maximum_selected_frames = std::max(
+      2, static_cast<int>(std::ceil(
+             (maximum_window_duration_s_ + options_.buffer_margin_s +
+              options_.max_time_offset_s) /
+             std::max(1.0e-3,
+                      options_.alignment_frame_minimum_interval_s))) +
+             2);
   frame_selector_ = AlignmentFrameSelector(selector_config);
 
-  if (!options_.sliding_window_shadow_only) {
+  if (!options_.sliding_window_shadow_only &&
+      !options_.upstream_dynamic_init_fc_gauge) {
     options_.candidate_filter_config.gravity_G = options_.gravity_G;
     options_.candidate_filter_config.noise.sigma_w = options_.imu_sigma_w;
     options_.candidate_filter_config.noise.sigma_wb = options_.imu_sigma_wb;
@@ -789,6 +920,10 @@ void OnlineAlignmentInitializer::fail_retry(double stream_time,
   last_diagnostics_.full_alignment_ready_time = full_alignment_ready_time_;
   last_diagnostics_.decision_time = navigation_ready_time_;
   last_diagnostics_.release_policy = options_.release_policy;
+  last_diagnostics_.sliding_overlap_stability_required_s =
+      options_.sliding_window_overlap_stability_duration_s;
+  last_diagnostics_.direct_sliding_state_release =
+      options_.sliding_window_direct_state_release;
   last_diagnostics_.readiness = navigation_released_
                                     ? AlignmentReadiness::NAVIGATION_READY
                                     : AlignmentReadiness::NOT_READY;
@@ -1075,11 +1210,6 @@ bool OnlineAlignmentInitializer::feed_stereo(const StereoAlignmentFrame &frame) 
   if (selection.selected) {
     stereo_buffer_.push_back(std::move(buffered));
     ++selected_frame_serial_;
-    if (!options_.sliding_window_shadow_only) {
-      while (stereo_buffer_.size() > static_cast<size_t>(
-                                        options_.maximum_selected_alignment_frames))
-        stereo_buffer_.pop_front();
-    }
   }
   prune(frame.left_timestamp);
   return true;
@@ -1088,24 +1218,10 @@ bool OnlineAlignmentInitializer::feed_stereo(const StereoAlignmentFrame &frame) 
 void OnlineAlignmentInitializer::prune(double newest_timestamp) {
   double keep_after = newest_timestamp - maximum_window_duration_s_ -
                       options_.buffer_margin_s - options_.max_time_offset_s;
-  if (candidate_active_) {
-    // The persistent filter has already summarized older samples. Retain one
-    // interpolation bracket before its causal IMU and FC cursors, not the
-    // entire candidate history.
-    const double candidate_board_time = candidate_filter_.runtime().active
-                                            ? candidate_filter_.runtime().board_time
-                                            : candidate_result_.timestamp +
-                                                  options_.camera_to_imu_time_offset_s;
-    const double earliest_candidate_time = std::min(
-        {candidate_board_time,
-         candidate_board_time -
-             candidate_result_.fc_attitude_to_board_time_offset_s,
-         candidate_board_time -
-             candidate_result_.fc_navigation_to_board_time_offset_s});
-    const double interpolation_margin =
-        std::max(options_.max_fc_gap_s, options_.max_imu_gap_s);
-    keep_after = earliest_candidate_time - interpolation_margin;
-  }
+  // Candidate validation is bounded and may reject into a newly advanced
+  // refinement/current window. Retain the same finite raw-data horizon while
+  // a candidate is active; summarizing it down to the filter cursor would make
+  // that required re-solve impossible.
   while (fc_buffer_.size() > 2 && fc_buffer_[1].timestamp < keep_after)
     fc_buffer_.pop_front();
   while (imu_buffer_.size() > 2 && imu_buffer_[1].timestamp < keep_after)
@@ -1192,10 +1308,18 @@ void OnlineAlignmentInitializer::reset() {
   candidate_gate_depth_counts_.fill(0);
   candidate_gate_depth_source_ = "explicit_gate_configuration";
   previous_window_states_.clear();
+  previous_window_covariance_.setZero();
+  previous_window_covariance_valid_ = false;
   latest_shadow_window_result_ = AlignmentResult();
   latest_shadow_window_result_valid_ = false;
+  latest_evidence_diagnostics_ = OnlineAlignmentDiagnostics();
+  latest_evidence_diagnostics_valid_ = false;
   last_sliding_window_end_time_ = -1.0;
   sliding_window_id_ = 0;
+  sliding_overlap_stable_since_ = -1.0;
+  sliding_overlap_last_window_end_ = -1.0;
+  sliding_prevalidation_stable_since_ = -1.0;
+  sliding_prevalidation_last_window_end_ = -1.0;
 }
 
 bool OnlineAlignmentInitializer::interpolate_previous_window_state(
@@ -1410,6 +1534,14 @@ bool OnlineAlignmentInitializer::validate_candidate(double now,
            candidate_result_.fc_navigation_to_board_time_offset_s,
        fc_buffer_.back().timestamp +
            candidate_result_.fc_attitude_to_board_time_offset_s});
+  const double candidate_board_time =
+      candidate_result_.timestamp + options_.camera_to_imu_time_offset_s;
+  const double validation_deadline_s =
+      options_.candidate_short_validation_duration_s +
+      std::max(options_.max_fc_gap_s, options_.max_stereo_gap_s);
+  const auto validation_elapsed = [&](double board_time) {
+    return std::max(0.0, board_time - candidate_board_time);
+  };
   if (supported_board_time <
       candidate_filter_.runtime().board_time -
           candidate_filter_.config().time_tolerance_s) {
@@ -1426,8 +1558,14 @@ bool OnlineAlignmentInitializer::validate_candidate(double now,
         reason.find("non_finite") != std::string::npos ||
         (reason.find("covariance") != std::string::npos &&
          reason.find("invalid") != std::string::npos);
+    const bool deadline_reached =
+        validation_elapsed(supported_board_time) + 1.0e-9 >=
+        validation_deadline_s;
     if (hard_failure)
       reject_candidate(now, reason, false);
+    else if (deadline_reached)
+      reject_candidate(now, "candidate_validation_deadline:" + reason,
+                       true);
     else {
       last_rejection_ = reason;
       transition(AlignmentPhase::CANDIDATE_VALIDATING, now, reason);
@@ -1566,6 +1704,10 @@ bool OnlineAlignmentInitializer::validate_candidate(double now,
   const double attitude_residual_deg =
       rotation_angle(runtime.nominal.R_GtoI * fc_implied_R.transpose()) *
       180.0 / kPi;
+  const double yaw_residual_deg =
+      std::fabs(wrap_radians(yaw_from_R_GtoI(runtime.nominal.R_GtoI) -
+                             yaw_from_R_GtoI(fc_implied_R))) *
+      180.0 / kPi;
   const double position_residual_m =
       (runtime.nominal.p_IinG - target_p).norm();
   const double velocity_residual_mps =
@@ -1579,6 +1721,7 @@ bool OnlineAlignmentInitializer::validate_candidate(double now,
       velocity_residual_mps;
   diagnostics.candidate_fc_imu_rotation_residual_deg =
       attitude_residual_deg;
+  diagnostics.candidate_fc_imu_yaw_residual_deg = yaw_residual_deg;
   diagnostics.candidate_relative_position_residual_m = position_residual_m;
   diagnostics.candidate_relative_velocity_residual_mps =
       velocity_residual_mps;
@@ -1587,7 +1730,8 @@ bool OnlineAlignmentInitializer::validate_candidate(double now,
   diagnostics.candidate_last_velocity_nis = runtime.last_velocity_nis;
   diagnostics.candidate_max_position_nis = runtime.max_position_nis;
   diagnostics.candidate_max_velocity_nis = runtime.max_velocity_nis;
-  diagnostics.candidate_fc_attitude_evaluation_only = true;
+  diagnostics.candidate_fc_attitude_evaluation_only =
+      !diagnostics.fc_attitude_gauge_factor_enabled;
   last_candidate_rotation_residual_deg_ = attitude_residual_deg;
   last_candidate_position_residual_m_ = position_residual_m;
   last_candidate_velocity_residual_mps_ = velocity_residual_mps;
@@ -1684,9 +1828,12 @@ bool OnlineAlignmentInitializer::validate_candidate(double now,
       candidate_filter_.groupReady(CandidateStateGroup::GYRO_BIAS);
   diagnostics.candidate_accel_bias_feedback_allowed =
       candidate_filter_.groupReady(CandidateStateGroup::ACCEL_BIAS);
-  diagnostics.candidate_attitude_stable_duration_s = 0.0;
-  diagnostics.candidate_gyro_bias_stable_duration_s = 0.0;
-  diagnostics.candidate_accel_bias_stable_duration_s = 0.0;
+  diagnostics.candidate_attitude_stable_duration_s =
+      attitude_group.post_feedback_stable_duration_s;
+  diagnostics.candidate_gyro_bias_stable_duration_s =
+      gyro_bias_group.post_feedback_stable_duration_s;
+  diagnostics.candidate_accel_bias_stable_duration_s =
+      accel_bias_group.post_feedback_stable_duration_s;
   const CandidateFeedbackTier tier = candidate_filter_.feedbackTier();
   diagnostics.candidate_feedback_tier =
       candidate_feedback_tier_name(tier);
@@ -1740,6 +1887,14 @@ bool OnlineAlignmentInitializer::validate_candidate(double now,
           diagnostics.candidate_visual_reprojection_trend_pxps) ||
       diagnostics.candidate_visual_reprojection_trend_pxps <=
           options_.candidate_max_visual_reprojection_trend_pxps;
+  const double fc_attitude_holdout_limit_deg = std::min(
+      options_.candidate_max_fc_imu_rotation_residual_deg,
+      std::hypot(options_.fc_attitude_sigma_deg,
+                 options_.fc_board_mount_sigma_deg));
+  const bool fc_attitude_holdout_healthy =
+      !options_.fc_attitude_gauge_factor_enabled ||
+      (std::isfinite(yaw_residual_deg) &&
+       yaw_residual_deg <= fc_attitude_holdout_limit_deg);
   const bool trust_gyro_bias =
       candidate_filter_.groupReady(CandidateStateGroup::GYRO_BIAS);
   const bool trust_accel_bias =
@@ -1752,8 +1907,13 @@ bool OnlineAlignmentInitializer::validate_candidate(double now,
       trust_accel_bias ||
       runtime.dx.segment<3>(12).norm() <=
           options_.candidate_max_closed_loop_accel_bias_correction_mps2;
+  const bool short_causal_hold_complete =
+      diagnostics.candidate_validation_duration_s + 1.0e-9 >=
+      options_.candidate_short_validation_duration_s;
   const bool navigation_ready =
-      candidate_filter_.navigationReady() && visual_motion_healthy &&
+      short_causal_hold_complete && candidate_filter_.navigationReady() &&
+      fc_attitude_holdout_healthy &&
+      visual_motion_healthy &&
       visual_reprojection_healthy && visual_trend_healthy &&
       retained_gyro_bias_bounded && retained_accel_bias_bounded;
   const bool full_ready = navigation_ready && !navigation_only_without_visual &&
@@ -1767,13 +1927,18 @@ bool OnlineAlignmentInitializer::validate_candidate(double now,
   diagnostics.full_alignment_quality_passed = full_ready;
   diagnostics.quality_passed = accepted;
   if (!accepted) {
-    if (!candidate_filter_.groupReady(CandidateStateGroup::ATTITUDE))
+    if (!short_causal_hold_complete)
+      last_rejection_ = "candidate_short_causal_hold_pending";
+    else if (!candidate_filter_.groupReady(CandidateStateGroup::ATTITUDE))
       last_rejection_ =
           "candidate_attitude_waiting_for_observability_convergence_feedback";
     else if (!candidate_filter_.groupReady(CandidateStateGroup::POSITION) ||
              !candidate_filter_.groupReady(CandidateStateGroup::VELOCITY))
       last_rejection_ =
           "candidate_position_velocity_waiting_for_convergence";
+    else if (!fc_attitude_holdout_healthy)
+      last_rejection_ =
+          "candidate_fc_attitude_holdout_waiting_for_joint_window_refinement";
     else if (!visual_motion_healthy || !visual_reprojection_healthy ||
              !visual_trend_healthy)
       last_rejection_ = "candidate_visual_health_waiting_for_recovery";
@@ -1790,6 +1955,16 @@ bool OnlineAlignmentInitializer::validate_candidate(double now,
     diagnostics.state_transitions = transitions_;
     copy_runtime_counters(diagnostics);
     last_diagnostics_ = diagnostics;
+    if (diagnostics.candidate_validation_duration_s + 1.0e-9 >=
+        validation_deadline_s) {
+      const std::string deadline_reason =
+          "candidate_validation_deadline:" + last_rejection_;
+      reject_candidate(now, deadline_reason, true);
+      diagnostics.readiness_reason = deadline_reason;
+      diagnostics.state_transitions = transitions_;
+      copy_runtime_counters(diagnostics);
+      last_diagnostics_ = diagnostics;
+    }
     return false;
   }
 
@@ -1993,7 +2168,7 @@ bool OnlineAlignmentInitializer::provisional_navigation(
   if (!interpolate_fc(fc_buffer_, supported_fc_time, fc_seed))
     return false;
   const Eigen::Matrix3d R_GtoF = ov_core::quat_2_Rot(fc_seed.q_GtoF);
-  R_GtoI = options_.R_FtoI_declared * R_GtoF;
+  R_GtoI = options_.R_FtoI_provisional_seed * R_GtoF;
   output.p_IinG =
       fc_seed.position_G + R_GtoF.transpose() * options_.p_IinF;
   output.v_IinG = fc_seed.velocity_G;
@@ -2032,6 +2207,287 @@ bool OnlineAlignmentInitializer::provisional_navigation(
   return output.valid;
 }
 
+bool OnlineAlignmentInitializer::make_fc_gauge_target(
+    double camera_timestamp, AlignmentResult &result) {
+  result = AlignmentResult();
+  last_diagnostics_ = OnlineAlignmentDiagnostics();
+  last_diagnostics_.solve_time = camera_timestamp;
+  last_diagnostics_.decision_time = camera_timestamp;
+  last_diagnostics_.future_data_used = false;
+  last_diagnostics_.post_alignment_used = false;
+  last_diagnostics_.provenance = options_.provenance;
+  last_diagnostics_.release_policy = options_.release_policy;
+  last_diagnostics_.selected_window_duration_s =
+      options_.sliding_window_duration_s;
+  if (!options_.upstream_dynamic_init_fc_gauge) {
+    last_rejection_ = "fc_gauge_target_mode_disabled";
+    return false;
+  }
+  if (fatal_configuration_error_ || alignment_window_closed_ ||
+      !std::isfinite(camera_timestamp)) {
+    last_rejection_ = fatal_configuration_error_
+                          ? "fatal_configuration_error"
+                          : (alignment_window_closed_
+                                 ? "alignment_window_closed"
+                                 : "camera_timestamp_non_finite");
+    return false;
+  }
+
+  if (fc_buffer_.empty() || imu_buffer_.empty()) {
+    last_rejection_ = "fc_gauge_waiting_for_sensor_data";
+    return false;
+  }
+  const double requested_board_time =
+      camera_timestamp + options_.camera_to_imu_time_offset_s;
+  // The ROS-free runner is strictly causal: when a camera frame is handled,
+  // the latest IMU sample is normally just before that frame and there is no
+  // future sample available for a right-hand interpolation bracket.  Use the
+  // newest board time supported by all three streams instead of requiring a
+  // non-causal sample after the current camera timestamp.
+  const double board_time = std::min(
+      {requested_board_time, imu_buffer_.back().timestamp,
+       fc_buffer_.back().timestamp +
+           options_.fc_attitude_to_board_time_offset_s,
+       fc_buffer_.back().timestamp +
+           options_.fc_navigation_to_board_time_offset_s});
+  const double supported_camera_time =
+      board_time - options_.camera_to_imu_time_offset_s;
+  last_diagnostics_.solve_time = supported_camera_time;
+  last_diagnostics_.decision_time = supported_camera_time;
+  const double window_start_board =
+      board_time - options_.sliding_window_duration_s;
+  const double attitude_time =
+      board_time - options_.fc_attitude_to_board_time_offset_s;
+  const double navigation_time =
+      board_time - options_.fc_navigation_to_board_time_offset_s;
+  const double start_attitude_time =
+      window_start_board - options_.fc_attitude_to_board_time_offset_s;
+  const double start_navigation_time =
+      window_start_board - options_.fc_navigation_to_board_time_offset_s;
+
+  FCNavigationSample fc_attitude;
+  FCNavigationSample fc_navigation;
+  FCNavigationSample fc_attitude_start;
+  FCNavigationSample fc_navigation_start;
+  BoardImuSample imu_start;
+  BoardImuSample imu_end;
+  double attitude_bracket_gap = std::numeric_limits<double>::infinity();
+  double navigation_bracket_gap = std::numeric_limits<double>::infinity();
+  if (!interpolate_fc(fc_buffer_, attitude_time, fc_attitude,
+                      &attitude_bracket_gap) ||
+      !interpolate_fc(fc_buffer_, navigation_time, fc_navigation,
+                      &navigation_bracket_gap) ||
+      !interpolate_fc(fc_buffer_, start_attitude_time, fc_attitude_start) ||
+      !interpolate_fc(fc_buffer_, start_navigation_time,
+                      fc_navigation_start) ||
+      !interpolate_imu(imu_buffer_, window_start_board, imu_start) ||
+      !interpolate_imu(imu_buffer_, board_time, imu_end)) {
+    last_rejection_ = "fc_gauge_waiting_for_complete_causal_window";
+    transition(AlignmentPhase::COLLECTING, supported_camera_time,
+               last_rejection_);
+    return false;
+  }
+  if (attitude_bracket_gap > options_.max_fc_gap_s ||
+      navigation_bracket_gap > options_.max_fc_gap_s) {
+    last_rejection_ = "fc_gauge_terminal_fc_gap";
+    return false;
+  }
+
+  std::vector<const FCNavigationSample *> fc_window;
+  std::vector<const BoardImuSample *> imu_window;
+  const double fc_window_begin =
+      std::min(start_attitude_time, start_navigation_time) -
+      options_.max_fc_gap_s;
+  const double fc_window_end =
+      std::max(attitude_time, navigation_time) + options_.max_fc_gap_s;
+  for (const auto &sample : fc_buffer_) {
+    if (sample.timestamp >= fc_window_begin &&
+        sample.timestamp <= fc_window_end)
+      fc_window.push_back(&sample);
+  }
+  for (const auto &sample : imu_buffer_) {
+    if (sample.timestamp >= window_start_board &&
+        sample.timestamp <= board_time)
+      imu_window.push_back(&sample);
+  }
+  const double fc_gap = max_gap(fc_window);
+  const double imu_gap = max_gap(imu_window);
+  if (!(fc_gap <= options_.max_fc_gap_s) ||
+      !(imu_gap <= options_.max_imu_gap_s)) {
+    last_diagnostics_.max_fc_gap_s = fc_gap;
+    last_diagnostics_.max_imu_gap_s = imu_gap;
+    last_rejection_ = !(fc_gap <= options_.max_fc_gap_s)
+                          ? "fc_gauge_window_fc_gap"
+                          : "fc_gauge_window_imu_gap";
+    return false;
+  }
+
+  const std::vector<FCRateSample> fc_rates = make_fc_rates(fc_window);
+  std::vector<Eigen::Vector3d> raw_rate_residuals;
+  std::vector<double> paired_board_times;
+  double angular_excitation = 0.0;
+  for (const auto &rate : fc_rates) {
+    const double rate_board_time =
+        rate.timestamp + options_.fc_attitude_to_board_time_offset_s;
+    if (rate_board_time < window_start_board - 1.0e-9 ||
+        rate_board_time > board_time + 1.0e-9)
+      continue;
+    BoardImuSample imu;
+    if (!interpolate_imu(imu_buffer_, rate_board_time, imu))
+      continue;
+    raw_rate_residuals.push_back(
+        imu.angular_velocity - options_.R_FtoI_declared * rate.omega_F);
+    paired_board_times.push_back(rate_board_time);
+    angular_excitation =
+        std::max(angular_excitation, rate.omega_F.norm());
+  }
+  if (raw_rate_residuals.size() < 2) {
+    last_rejection_ = "fc_gauge_insufficient_rate_pairs";
+    return false;
+  }
+  double paired_gap = 0.0;
+  for (std::size_t index = 1; index < paired_board_times.size(); ++index)
+    paired_gap = std::max(
+        paired_gap, paired_board_times[index] - paired_board_times[index - 1]);
+  if (paired_board_times.front() >
+          window_start_board + options_.max_fc_gap_s ||
+      board_time - paired_board_times.back() > options_.max_fc_gap_s ||
+      paired_gap > options_.max_fc_gap_s) {
+    last_rejection_ = "fc_gauge_rate_pair_duration_or_gap";
+    return false;
+  }
+  const Eigen::Vector3d rate_bias = component_median(raw_rate_residuals);
+  double rate_squared_error = 0.0;
+  for (const auto &residual : raw_rate_residuals)
+    rate_squared_error += (residual - rate_bias).squaredNorm();
+  const double rate_residual_rms = std::sqrt(
+      rate_squared_error / static_cast<double>(raw_rate_residuals.size()));
+  if (!std::isfinite(rate_residual_rms) ||
+      rate_residual_rms > options_.max_rate_residual_rms_rad_s) {
+    last_diagnostics_.rate_residual_rms_rad_s = rate_residual_rms;
+    last_rejection_ = "fc_gauge_locked_mount_rate_residual";
+    return false;
+  }
+
+  Eigen::Vector3d omega_F = Eigen::Vector3d::Zero();
+  if (!fc_angular_rate_at(fc_buffer_, attitude_time, options_.max_fc_gap_s,
+                          omega_F)) {
+    last_rejection_ = "fc_gauge_terminal_angular_rate_unavailable";
+    return false;
+  }
+  const Eigen::Matrix3d R_GtoF =
+      ov_core::quat_2_Rot(fc_attitude.q_GtoF);
+  const Eigen::Matrix3d R_GtoI =
+      options_.R_FtoI_declared * R_GtoF;
+  result.timestamp = supported_camera_time;
+  result.q_GtoI = ov_core::rot_2_quat(R_GtoI);
+  result.p_IinG =
+      fc_navigation.position_G + R_GtoF.transpose() * options_.p_IinF;
+  result.v_IinG =
+      fc_navigation.velocity_G +
+      R_GtoF.transpose() * omega_F.cross(options_.p_IinF);
+  result.R_FtoI_nominal = options_.R_FtoI_declared;
+  result.R_mount_residual = Eigen::Matrix3d::Identity();
+  result.mount_covariance = Eigen::Matrix3d::Zero();
+  result.fc_to_board_time_offset_s =
+      options_.fc_attitude_to_board_time_offset_s;
+  result.fc_attitude_to_board_time_offset_s =
+      options_.fc_attitude_to_board_time_offset_s;
+  result.fc_navigation_to_board_time_offset_s =
+      options_.fc_navigation_to_board_time_offset_s;
+  result.camera_to_imu_time_offset_s =
+      options_.camera_to_imu_time_offset_s;
+  result.release_policy = options_.release_policy;
+  result.released_to_openvins = false;
+  result.readiness = AlignmentReadiness::NOT_READY;
+  result.covariance.setZero();
+  const double attitude_sigma_rad =
+      options_.fc_attitude_sigma_deg * kPi / 180.0;
+  result.covariance.block<3, 3>(0, 0).diagonal().array() =
+      attitude_sigma_rad * attitude_sigma_rad;
+  result.covariance.block<3, 3>(3, 3).diagonal().array() =
+      options_.fc_position_sigma_m * options_.fc_position_sigma_m;
+  result.covariance.block<3, 3>(6, 6).diagonal().array() =
+      options_.fc_velocity_sigma_mps * options_.fc_velocity_sigma_mps;
+  result.covariance.block<3, 3>(9, 9).diagonal().array() = 1.0e6;
+  result.covariance.block<3, 3>(12, 12).diagonal().array() = 1.0e6;
+
+  auto &diagnostics = last_diagnostics_;
+  diagnostics.collection_start_time = collection_start_time_;
+  diagnostics.window_start =
+      window_start_board - options_.camera_to_imu_time_offset_s;
+  diagnostics.init_time = supported_camera_time;
+  diagnostics.initialization_duration_s =
+      options_.sliding_window_duration_s;
+  diagnostics.fc_samples = static_cast<int>(fc_window.size());
+  diagnostics.imu_samples = static_cast<int>(imu_window.size());
+  diagnostics.max_fc_gap_s = fc_gap;
+  diagnostics.max_imu_gap_s = imu_gap;
+  diagnostics.angular_excitation_rad_s = angular_excitation;
+  diagnostics.rate_residual_rms_rad_s = rate_residual_rms;
+  diagnostics.estimated_fc_to_board_time_offset_s =
+      options_.fc_attitude_to_board_time_offset_s;
+  diagnostics.navigation_quality_passed = true;
+  diagnostics.quality_passed = true;
+  diagnostics.readiness = AlignmentReadiness::NOT_READY;
+  diagnostics.readiness_reason =
+      "causal_fc_target_ready_for_metric_vio_yaw_translation_window";
+  diagnostics.gauge_window_quality_passed = true;
+  copy_runtime_counters(diagnostics);
+  result.diagnostics = diagnostics;
+  last_rejection_.clear();
+  transition(AlignmentPhase::VALIDATING, supported_camera_time,
+             "causal_fc_gauge_target_ready");
+  return true;
+}
+
+bool OnlineAlignmentInitializer::commit_shadow_gauge_release(
+    const AlignmentResult &result) {
+  if ((!options_.sliding_window_shadow_only &&
+       !options_.upstream_dynamic_init_fc_gauge) ||
+      alignment_window_closed_ ||
+      navigation_released_ || !result.released_to_openvins ||
+      !result.diagnostics.quality_passed ||
+      result.readiness == AlignmentReadiness::NOT_READY)
+    return false;
+
+  const double decision_time =
+      std::isfinite(result.diagnostics.decision_time)
+          ? result.diagnostics.decision_time
+          : result.timestamp;
+  navigation_released_ = true;
+  ++successful_release_count_;
+  navigation_ready_time_ = decision_time;
+  alignment_window_closed_ = true;
+  alignment_window_close_time_ = decision_time;
+  candidate_active_ = false;
+  candidate_visual_snapshots_.clear();
+  transition(AlignmentPhase::NAVIGATION_READY, decision_time,
+             "sliding_window_gauge_stability_release");
+
+  latest_shadow_window_result_ = result;
+  latest_shadow_window_result_valid_ = true;
+  last_diagnostics_ = result.diagnostics;
+  last_diagnostics_.navigation_ready_time = navigation_ready_time_;
+  last_diagnostics_.alignment_window_closed = true;
+  last_diagnostics_.alignment_window_close_time =
+      alignment_window_close_time_;
+  copy_runtime_counters(last_diagnostics_);
+  last_diagnostics_.state_transitions = transitions_;
+  last_rejection_.clear();
+
+  if (!attempt_receipts_.empty()) {
+    attempt_receipts_.back().outcome = "gauge_stability_release";
+    attempt_receipts_.back().failed_gate.clear();
+    attempt_receipts_.back().next_eligible_condition =
+        "closed_after_release";
+  }
+  fc_buffer_.clear();
+  imu_buffer_.clear();
+  stereo_buffer_.clear();
+  return true;
+}
+
 bool OnlineAlignmentInitializer::try_initialize(double now,
                                                  AlignmentResult &result) {
   if (fatal_configuration_error_) {
@@ -2061,6 +2517,10 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
   last_diagnostics_.full_alignment_ready_time = full_alignment_ready_time_;
   last_diagnostics_.decision_time = navigation_ready_time_;
   last_diagnostics_.release_policy = options_.release_policy;
+  last_diagnostics_.sliding_overlap_stability_required_s =
+      options_.sliding_window_overlap_stability_duration_s;
+  last_diagnostics_.direct_sliding_state_release =
+      options_.sliding_window_direct_state_release;
   copy_runtime_counters(last_diagnostics_);
   if (!std::isfinite(now)) {
     fail_retry(now, "solve_time_non_finite");
@@ -2258,35 +2718,17 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
                      << diag.fc_samples << ':' << diag.imu_samples << ':'
                      << diag.feature_tracks;
   diag.window_fingerprint = fingerprint_stream.str();
-  const int new_selected_frames =
-      selected_frame_serial_ - selected_frame_serial_at_last_solve_;
-  if (options_.sliding_window_shadow_only) {
-    if (last_sliding_window_end_time_ >= 0.0 &&
-        init_time - last_sliding_window_end_time_ + 1.0e-9 <
-            options_.sliding_window_min_advance_s) {
-      ++solve_eligibility_skip_count_;
-      last_rejection_ = "sliding_window_waiting_for_time_advance";
-      copy_runtime_counters(diag);
-      return false;
-    }
-  } else {
-    if (!force_refinement_solve_ && last_solve_stream_time_ >= 0.0 &&
-        now - last_solve_stream_time_ < options_.minimum_solve_interval_s) {
-      ++solve_eligibility_skip_count_;
-      last_rejection_ = "solve_minimum_interval";
-      copy_runtime_counters(diag);
-      return false;
-    }
-    if (!force_refinement_solve_ && last_solve_stream_time_ >= 0.0 &&
-        new_selected_frames < options_.minimum_new_selected_frames_for_resolve) {
-      ++solve_eligibility_skip_count_;
-      last_rejection_ = "solve_waiting_for_new_selected_frame";
-      copy_runtime_counters(diag);
-      return false;
-    }
+  if (last_sliding_window_end_time_ >= 0.0 &&
+      init_time - last_sliding_window_end_time_ + 1.0e-9 <
+          options_.sliding_window_min_advance_s) {
+    ++solve_eligibility_skip_count_;
+    last_rejection_ = force_refinement_solve_
+                          ? "refinement_waiting_for_new_window_time_advance"
+                          : "sliding_window_waiting_for_time_advance";
+    copy_runtime_counters(diag);
+    return false;
   }
-  if (!force_refinement_solve_ &&
-      diag.window_fingerprint == last_window_fingerprint_) {
+  if (diag.window_fingerprint == last_window_fingerprint_) {
     ++duplicate_window_skip_count_;
     last_rejection_ = "duplicate_window_fingerprint";
     copy_runtime_counters(diag);
@@ -2396,18 +2838,15 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
           ? std::max(0.0, now - last_solve_stream_time_)
           : std::numeric_limits<double>::infinity();
   last_solve_stream_time_ = now;
-  if (options_.sliding_window_shadow_only)
-    last_sliding_window_end_time_ = init_time;
+  last_sliding_window_end_time_ = init_time;
   selected_frames_at_last_solve_ = static_cast<int>(stereo_buffer_.size());
   selected_frame_serial_at_last_solve_ = selected_frame_serial_;
   last_window_fingerprint_ = diag.window_fingerprint;
   force_refinement_solve_ = false;
   diag.nonlinear_solve_attempt_count = nonlinear_solve_attempt_count_;
   AlignmentAttemptReceipt receipt;
-  if (options_.sliding_window_shadow_only) {
-    receipt.window_id = ++sliding_window_id_;
-    receipt.optimizer_invocation_index = 0;
-  }
+  receipt.window_id = ++sliding_window_id_;
+  receipt.optimizer_invocation_index = 0;
   receipt.attempt_timestamp = now;
   if (options_.sliding_window_shadow_only) {
     std::ostringstream trigger;
@@ -2417,8 +2856,8 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
     receipt.trigger = "single_candidate_refinement";
   } else {
     std::ostringstream trigger;
-    trigger << "new_alignment_frames=" << new_selected_frames
-            << ";attempt_interval_s=" << seconds_since_last_attempt
+    trigger << "fixed_time_window_advanced;attempt_interval_s="
+            << seconds_since_last_attempt
             << ";window_fingerprint_changed=true";
     receipt.trigger = trigger.str();
   }
@@ -2442,36 +2881,25 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
   receipt.outcome = "solving";
   receipt.next_eligible_condition = "candidate_or_new_window_information";
   attempt_receipts_.push_back(receipt);
-  while (attempt_receipts_.size() > 128)
+  // A difficult flight can legitimately require more than 128 advanced
+  // windows before release. Preserve the complete causal trace for formal
+  // validation instead of silently discarding its beginning.
+  while (attempt_receipts_.size() > 2048)
     attempt_receipts_.pop_front();
   transition(AlignmentPhase::ALIGNING, now, "immutable_causal_window_ready");
 
-  std::vector<Eigen::Vector3d> accel_bias_seed_samples;
-  for (const auto &rate : fc_rates) {
-    BoardImuSample measured;
-    FCNavigationSample fc_attitude_mid;
-    const double board_time = rate.timestamp + best_offset;
-    if (!interpolate_imu(causal_imu_buffer, board_time, measured) ||
-        !interpolate_fc(causal_fc_buffer, rate.timestamp, fc_attitude_mid))
-      continue;
-    const Eigen::Matrix3d R_GtoI_mid =
-        best_fit.R_FtoI * ov_core::quat_2_Rot(fc_attitude_mid.q_GtoF);
-    const double navigation_time =
-        board_time - options_.fc_navigation_to_board_time_offset_s;
-    const auto nearest_navigation_rate = std::min_element(
-        fc_rates.begin(), fc_rates.end(),
-        [&](const FCRateSample &a, const FCRateSample &b) {
-          return std::fabs(a.timestamp - navigation_time) <
-                 std::fabs(b.timestamp - navigation_time);
-        });
-    if (nearest_navigation_rate == fc_rates.end())
-      continue;
-    accel_bias_seed_samples.push_back(
-        measured.linear_acceleration -
-        R_GtoI_mid *
-            (nearest_navigation_rate->acceleration_G + options_.gravity_G));
+  if (!attempt_receipts_.empty() &&
+      attempt_receipts_.back().window_id == sliding_window_id_) {
+    attempt_receipts_.back().bg_prior_center = Eigen::Vector3d::Zero();
+    attempt_receipts_.back().ba_prior_center = Eigen::Vector3d::Zero();
   }
-  const Eigen::Vector3d ba_seed = component_median(accel_bias_seed_samples);
+
+  Eigen::Vector3d bg_seed = best_fit.bg;
+  Eigen::Vector3d ba_seed = Eigen::Vector3d::Zero();
+  if (!previous_window_states_.empty()) {
+    bg_seed = previous_window_states_.back().bg;
+    ba_seed = previous_window_states_.back().ba;
+  }
 
   std::vector<GraphState> states;
   states.reserve(usable_frames.size());
@@ -2517,9 +2945,9 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
     assign(state.v,
            fc_navigation_state.velocity_G +
                R_FtoG * omega_F.cross(options_.p_IinF));
-    assign(state.bg, best_fit.bg);
+    assign(state.bg, bg_seed);
     assign(state.ba, ba_seed);
-    if (options_.sliding_window_shadow_only) {
+    {
       SlidingWindowStateEstimate warm_state;
       if (interpolate_previous_window_state(frame->left_timestamp,
                                             warm_state)) {
@@ -2530,10 +2958,9 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
         assign(state.ba, warm_state.ba);
         window_warm_start_used = true;
       } else if (!previous_window_states_.empty()) {
-        // A new tail state has no previous-window timestamp support. Keep the
-        // current FC/IMU q/p/v seed but carry the latest solved biases.
-        assign(state.bg, previous_window_states_.back().bg);
-        assign(state.ba, previous_window_states_.back().ba);
+        // A new tail state has no previous-window timestamp support. Its
+        // The new tail state retains the current FC q/p/v seed and the previous
+        // terminal bias seed; the IMU chain will refine both endpoint biases.
         window_warm_start_used = true;
       }
     }
@@ -2573,8 +3000,27 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
   families.prior.push_back(problem.AddResidualBlock(
       ba_prior, nullptr, states.front().ba.data()));
 
-  // FC position/velocity observations are factors, not copied outputs. FC
-  // attitude is evaluated separately and is intentionally absent here.
+  // Preserve the synchronized terminal navigation row with its full declared
+  // uncertainty. Earlier FC rows are outputs of the same navigation filter and
+  // must not be counted as independent absolute measurements. They constrain
+  // only trajectory increments. Increment covariance is proportional to dt,
+  // so splitting one physical interval into more keyframes does not increase
+  // the total FC trajectory information. This prevents the old normalized
+  // window-average model from diluting the state that is actually released.
+  const double fc_window_span_s =
+      states.back().camera_time - states.front().camera_time;
+  if (!(fc_window_span_s > 1.0e-9)) {
+    fail_retry(now, "fc_increment_span");
+    return false;
+  }
+  std::vector<Eigen::Matrix3d> fc_target_rotations;
+  std::vector<Eigen::Vector3d> fc_target_positions;
+  std::vector<Eigen::Vector3d> fc_target_velocities;
+  std::vector<Eigen::Vector3d> fc_target_rates;
+  fc_target_rotations.reserve(states.size());
+  fc_target_positions.reserve(states.size());
+  fc_target_velocities.reserve(states.size());
+  fc_target_rates.reserve(states.size());
   for (size_t i = 0; i < states.size(); ++i) {
     const Eigen::Matrix3d R_GtoF =
         ov_core::quat_2_Rot(fc_attitude_at_state[i].q_GtoF);
@@ -2591,21 +3037,102 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
           });
       omega_F = nearest->omega_F;
     }
-    const Eigen::Vector3d p_IinG =
+    fc_target_rotations.push_back(best_fit.R_FtoI * R_GtoF);
+    fc_target_positions.push_back(
         fc_navigation_at_state[i].position_G +
-        R_FtoG * options_.p_IinF;
-    const Eigen::Vector3d v_IinG =
+        R_FtoG * options_.p_IinF);
+    fc_target_velocities.push_back(
         fc_navigation_at_state[i].velocity_G +
-        R_FtoG * omega_F.cross(options_.p_IinF);
-    auto *cost = new FCObservationCost(new FCObservationFunctor(
-        p_IinG, v_IinG, options_.fc_position_sigma_m,
-        options_.fc_velocity_sigma_mps));
-    families.fc.push_back(problem.AddResidualBlock(
-        cost, new ceres::CauchyLoss(2.0), states[i].p.data(),
-        states[i].v.data()));
+        R_FtoG * omega_F.cross(options_.p_IinF));
+    fc_target_rates.push_back(omega_F);
   }
 
-  // CPI factors with analytic bias/pose/velocity Jacobians and covariance.
+  if (options_.fc_attitude_gauge_factor_enabled) {
+    auto *terminal_attitude_cost = new QuaternionPriorCost(
+        new QuaternionPriorFunctor(
+            fc_target_rotations.back(),
+            options_.fc_attitude_sigma_deg * kPi / 180.0));
+    families.fc.push_back(problem.AddResidualBlock(
+        terminal_attitude_cost, nullptr, states.back().q.data()));
+    const double terminal_board_time =
+        states.back().camera_time + options_.camera_to_imu_time_offset_s;
+    BoardImuSample terminal_imu;
+    double terminal_rate_residual =
+        std::numeric_limits<double>::infinity();
+    if (interpolate_imu(causal_imu_buffer, terminal_board_time,
+                        terminal_imu)) {
+      terminal_rate_residual =
+          (terminal_imu.angular_velocity -
+           best_fit.R_FtoI * fc_target_rates.back() - best_fit.bg)
+              .norm();
+    }
+    diag.fc_attitude_gauge_factor_enabled = true;
+    diag.fc_attitude_gauge_factor_count = 1;
+    diag.fc_attitude_gauge_anchor_timestamp_s =
+        states.back().camera_time;
+    diag.fc_attitude_gauge_anchor_rate_rad_s =
+        fc_target_rates.back().norm();
+    diag.fc_attitude_gauge_anchor_rate_residual_rad_s =
+        terminal_rate_residual;
+    diag.fc_attitude_gauge_sigma_deg = options_.fc_attitude_sigma_deg;
+  }
+
+  auto *terminal_navigation_cost = new FCObservationCost(
+      new FCObservationFunctor(
+          fc_target_positions.back(), fc_target_velocities.back(),
+          options_.fc_position_sigma_m, options_.fc_velocity_sigma_mps));
+  families.fc.push_back(problem.AddResidualBlock(
+      terminal_navigation_cost, nullptr, states.back().p.data(),
+      states.back().v.data()));
+
+  double increment_time_fraction_sum = 0.0;
+  for (size_t i = 1; i < states.size(); ++i) {
+    const double dt = states[i].camera_time - states[i - 1].camera_time;
+    const double time_fraction = dt / fc_window_span_s;
+    if (!(dt > 1.0e-9) || !std::isfinite(time_fraction) ||
+        !(time_fraction > 0.0)) {
+      fail_retry(now, "fc_increment_interval");
+      return false;
+    }
+    increment_time_fraction_sum += time_fraction;
+    const double sqrt_fraction = std::sqrt(time_fraction);
+    if (options_.fc_attitude_gauge_factor_enabled) {
+      auto *attitude_increment_cost = new FCAttitudeIncrementCost(
+          new FCAttitudeIncrementFunctor(
+              fc_target_rotations[i - 1], fc_target_rotations[i],
+              options_.fc_attitude_sigma_deg * kPi / 180.0 *
+                  sqrt_fraction));
+      families.fc.push_back(problem.AddResidualBlock(
+          attitude_increment_cost, new ceres::CauchyLoss(2.0),
+          states[i - 1].q.data(), states[i].q.data()));
+    }
+    auto *navigation_increment_cost = new FCNavigationIncrementCost(
+        new FCNavigationIncrementFunctor(
+            fc_target_positions[i] - fc_target_positions[i - 1],
+            fc_target_velocities[i] - fc_target_velocities[i - 1],
+            options_.fc_position_sigma_m * sqrt_fraction,
+            options_.fc_velocity_sigma_mps * sqrt_fraction));
+    families.fc.push_back(problem.AddResidualBlock(
+        navigation_increment_cost, new ceres::CauchyLoss(2.0),
+        states[i - 1].p.data(), states[i - 1].v.data(),
+        states[i].p.data(), states[i].v.data()));
+  }
+  if (!std::isfinite(increment_time_fraction_sum) ||
+      std::fabs(increment_time_fraction_sum - 1.0) > 1.0e-9) {
+    fail_retry(now, "fc_increment_time_fraction");
+    return false;
+  }
+  diag.fc_position_velocity_factor_count =
+      static_cast<int>(states.size());
+  diag.fc_position_velocity_time_weight_sum =
+      increment_time_fraction_sum;
+  diag.fc_position_velocity_weight_model =
+      "terminal_absolute_plus_density_invariant_increments";
+
+  // Match the upstream dynamic initializer: every keyframe owns bg/ba and the
+  // complete 15-D CPI factor connects adjacent states, including bias random
+  // walk. This prevents one shared bias from absorbing window-wide motion or
+  // FC model disagreement.
   for (size_t i = 1; i < states.size(); ++i) {
     const double t0 = states[i - 1].camera_time +
                       options_.camera_to_imu_time_offset_s;
@@ -2619,8 +3146,9 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
     auto cpi = std::make_shared<ov_core::CpiV1>(
         options_.imu_sigma_w, options_.imu_sigma_wb, options_.imu_sigma_a,
         options_.imu_sigma_ab, true);
-    cpi->setLinearizationPoints(map3(states[i - 1].bg),
-                                map3(states[i - 1].ba));
+    Eigen::Vector3d bg_linearization = map3(states[i - 1].bg);
+    Eigen::Vector3d ba_linearization = map3(states[i - 1].ba);
+    cpi->setLinearizationPoints(bg_linearization, ba_linearization);
     for (size_t j = 1; j < segment.size(); ++j)
       cpi->feed_IMU(segment[j - 1].timestamp, segment[j].timestamp,
                     segment[j - 1].angular_velocity,
@@ -2820,13 +3348,16 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
   solver_options.num_threads = 1;
   solver_options.function_tolerance = 1e-7;
   solver_options.gradient_tolerance = 1e-10;
+  diag.shared_window_bias_model = false;
+  diag.staged_solver_enabled = false;
   ceres::Solver::Summary summary;
   ++nonlinear_solve_attempt_count_;
   diag.nonlinear_solve_attempt_count = nonlinear_solve_attempt_count_;
-  const auto ceres_wall_start = std::chrono::steady_clock::now();
+  const auto solve_wall_start = std::chrono::steady_clock::now();
   ceres::Solve(solver_options, &problem, &summary);
   const double ceres_solve_wall_time_s = std::chrono::duration<double>(
-      std::chrono::steady_clock::now() - ceres_wall_start).count();
+      std::chrono::steady_clock::now() - solve_wall_start).count();
+  diag.final_stage_solve_wall_time_s = ceres_solve_wall_time_s;
   if (!attempt_receipts_.empty() &&
       attempt_receipts_.back().outcome == "solving") {
     attempt_receipts_.back().factor_count =
@@ -2836,6 +3367,11 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
     attempt_receipts_.back().solve_wall_time_s = ceres_solve_wall_time_s;
     attempt_receipts_.back().optimizer_invocation_index =
         nonlinear_solve_attempt_count_;
+    attempt_receipts_.back().optimizer_invocation_count = 1;
+    attempt_receipts_.back().shared_window_bias_model = false;
+    attempt_receipts_.back().staged_solver_enabled = false;
+    attempt_receipts_.back().final_stage_solve_wall_time_s =
+        ceres_solve_wall_time_s;
     attempt_receipts_.back().initial_cost = summary.initial_cost;
     attempt_receipts_.back().final_cost = summary.final_cost;
     attempt_receipts_.back().warm_start_used = window_warm_start_used;
@@ -2846,7 +3382,345 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
   diag.solver_converged = summary.IsSolutionUsable();
   transition(AlignmentPhase::VALIDATING, now, "joint_solver_finished");
 
+  // Compare the two independently optimized trajectories at identical camera
+  // timestamps in their overlap. Comparing adjacent window endpoints would
+  // mix estimator disagreement with the aircraft's real motion.
+  if (summary.IsSolutionUsable() && !previous_window_states_.empty()) {
+    double attitude_max_deg = 0.0;
+    double position_max_m = 0.0;
+    double velocity_max_mps = 0.0;
+    double gyro_bias_max_rad_s = 0.0;
+    double accel_bias_max_mps2 = 0.0;
+    int overlap_count = 0;
+    for (const GraphState &current : states) {
+      SlidingWindowStateEstimate previous;
+      if (!interpolate_previous_window_state(current.camera_time, previous))
+        continue;
+      const Eigen::Matrix3d current_rotation =
+          ov_core::quat_2_Rot(normalized_jpl(current.q.data()));
+      const Eigen::Matrix3d previous_rotation =
+          ov_core::quat_2_Rot(previous.q_GtoI);
+      attitude_max_deg = std::max(
+          attitude_max_deg,
+          rotation_angle(current_rotation * previous_rotation.transpose()) *
+              180.0 / kPi);
+      position_max_m =
+          std::max(position_max_m,
+                   (map3(current.p) - previous.p_IinG).norm());
+      velocity_max_mps =
+          std::max(velocity_max_mps,
+                   (map3(current.v) - previous.v_IinG).norm());
+      gyro_bias_max_rad_s =
+          std::max(gyro_bias_max_rad_s,
+                   (map3(current.bg) - previous.bg).norm());
+      accel_bias_max_mps2 =
+          std::max(accel_bias_max_mps2,
+                   (map3(current.ba) - previous.ba).norm());
+      ++overlap_count;
+    }
+    diag.sliding_overlap_state_count = overlap_count;
+    diag.sliding_overlap_attitude_max_deg = attitude_max_deg;
+    diag.sliding_overlap_position_max_m = position_max_m;
+    diag.sliding_overlap_velocity_max_mps = velocity_max_mps;
+    diag.sliding_overlap_gyro_bias_max_rad_s = gyro_bias_max_rad_s;
+    diag.sliding_overlap_accel_bias_max_mps2 = accel_bias_max_mps2;
+  }
+  if (summary.IsSolutionUsable()) {
+    previous_window_states_.clear();
+    previous_window_states_.reserve(states.size());
+    for (const GraphState &state : states) {
+      SlidingWindowStateEstimate estimate;
+      estimate.timestamp = state.camera_time;
+      estimate.q_GtoI = normalized_jpl(state.q.data());
+      estimate.p_IinG = map3(state.p);
+      estimate.v_IinG = map3(state.v);
+      estimate.bg = map3(state.bg);
+      estimate.ba = map3(state.ba);
+      previous_window_states_.push_back(estimate);
+    }
+  }
+
   GraphState &final_state = states.back();
+  const Eigen::Matrix3d final_rotation =
+      ov_core::quat_2_Rot(normalized_jpl(final_state.q.data()));
+  diag.fc_terminal_attitude_residual_deg =
+      rotation_angle(final_rotation * fc_target_rotations.back().transpose()) *
+      180.0 / kPi;
+  diag.fc_terminal_position_residual_m =
+      (map3(final_state.p) - fc_target_positions.back()).norm();
+  diag.fc_terminal_velocity_residual_mps =
+      (map3(final_state.v) - fc_target_velocities.back()).norm();
+  diag.fc_terminal_max_normalized_residual = std::max(
+      {diag.fc_terminal_attitude_residual_deg /
+           std::max(1.0e-8, options_.fc_attitude_sigma_deg),
+       diag.fc_terminal_position_residual_m /
+           std::max(1.0e-8, options_.fc_position_sigma_m),
+       diag.fc_terminal_velocity_residual_mps /
+           std::max(1.0e-8, options_.fc_velocity_sigma_mps)});
+  const Eigen::Vector3d final_bg = map3(final_state.bg);
+  const Eigen::Vector3d final_ba = map3(final_state.ba);
+  const Eigen::Matrix3d final_mount =
+      ov_core::quat_2_Rot(normalized_jpl(mount_q.data()));
+  const double final_mount_residual_deg =
+      rotation_angle(final_mount * options_.R_FtoI_declared.transpose()) *
+      180.0 / kPi;
+
+  const bool deferred_release_certification =
+      options_.sliding_window_shadow_only &&
+      options_.sliding_window_direct_state_release &&
+      options_.sliding_window_deferred_release_certification;
+  if (deferred_release_certification) {
+    diag.factor_contributions = {
+        evaluate_family_residuals(problem, "prior", families.prior),
+        evaluate_family_residuals(problem, "imu_preintegration", families.imu),
+        evaluate_family_residuals(problem, "visual_reprojection",
+                                  families.visual, false),
+        evaluate_family_residuals(problem, "fc_pose_velocity_attitude",
+                                  families.fc)};
+    const FactorContribution *rolling_imu =
+        find_contribution(diag.factor_contributions, "imu_preintegration");
+    const FactorContribution *rolling_visual =
+        find_contribution(diag.factor_contributions, "visual_reprojection");
+    const FactorContribution *rolling_fc = find_contribution(
+        diag.factor_contributions, "fc_pose_velocity_attitude");
+    if (rolling_visual != nullptr && rolling_visual->residual_blocks > 0) {
+      diag.visual_statistics.reprojection_rmse_px =
+          rolling_visual->residual_rms * options_.visual_pixel_sigma;
+      diag.visual_statistics.reprojection_p95_px =
+          rolling_visual->residual_p95 * options_.visual_pixel_sigma;
+    }
+
+    const bool physical_overlap_passed =
+        diag.sliding_overlap_state_count >=
+            options_.sliding_window_min_overlap_states &&
+        diag.sliding_overlap_attitude_max_deg <=
+            options_.sliding_window_max_overlap_attitude_deg &&
+        diag.sliding_overlap_position_max_m <=
+            options_.sliding_window_max_overlap_position_m &&
+        diag.sliding_overlap_velocity_max_mps <=
+            options_.sliding_window_max_overlap_velocity_mps &&
+        diag.sliding_overlap_gyro_bias_max_rad_s <=
+            options_.sliding_window_max_overlap_gyro_bias_rad_s &&
+        diag.sliding_overlap_accel_bias_max_mps2 <=
+            options_.sliding_window_max_overlap_accel_bias_mps2;
+    const bool rolling_visual_supported =
+        rolling_visual != nullptr &&
+        rolling_visual->residual_blocks >=
+            options_.min_visual_residual_blocks &&
+        accepted_features >= options_.min_stereo_depths;
+    const bool rolling_factor_quality_passed =
+        rolling_imu != nullptr && rolling_imu->residual_blocks > 0 &&
+        rolling_imu->residual_rms <=
+            options_.navigation_max_imu_residual_rms &&
+        rolling_fc != nullptr && rolling_fc->residual_blocks > 0 &&
+        rolling_fc->residual_rms <= options_.navigation_max_fc_residual_rms &&
+        (options_.navigation_allow_without_visual ||
+         (rolling_visual_supported &&
+          diag.visual_statistics.reprojection_rmse_px <=
+              options_.navigation_max_reprojection_rmse_px &&
+          diag.visual_statistics.reprojection_p95_px <=
+              options_.navigation_max_reprojection_p95_px));
+    const bool rolling_state_quality_passed =
+        summary.IsSolutionUsable() && physical_overlap_passed &&
+        rolling_factor_quality_passed &&
+        diag.fc_terminal_max_normalized_residual <=
+            options_.navigation_max_fc_residual_rms &&
+        final_bg.norm() <= options_.max_gyro_bias_norm_rad_s &&
+        final_ba.norm() <= options_.max_accel_bias_norm_mps2 &&
+        final_mount_residual_deg <= options_.max_mount_residual_deg;
+
+    const double maximum_continuous_gap = std::max(
+        2.0 * options_.sliding_window_min_advance_s,
+        options_.max_stereo_gap_s);
+    const bool continuous_with_previous =
+        sliding_prevalidation_last_window_end_ >= 0.0 &&
+        diag.init_time > sliding_prevalidation_last_window_end_ &&
+        diag.init_time - sliding_prevalidation_last_window_end_ <=
+            maximum_continuous_gap + 1.0e-9;
+    if (!rolling_state_quality_passed) {
+      sliding_prevalidation_stable_since_ = -1.0;
+    } else if (sliding_prevalidation_stable_since_ < 0.0 ||
+               !continuous_with_previous) {
+      sliding_prevalidation_stable_since_ = diag.init_time;
+    }
+    sliding_prevalidation_last_window_end_ = diag.init_time;
+    if (rolling_state_quality_passed &&
+        sliding_prevalidation_stable_since_ >= 0.0) {
+      diag.sliding_overlap_stable_duration_s = std::max(
+          0.0, diag.init_time - sliding_prevalidation_stable_since_);
+    }
+
+    double bias_history_span_s = 0.0;
+    double bias_history_bg_max_rad_s = 0.0;
+    double bias_history_ba_max_mps2 = 0.0;
+    int bias_history_count = 1;
+    for (auto receipt = attempt_receipts_.rbegin();
+         receipt != attempt_receipts_.rend(); ++receipt) {
+      if (receipt->window_id == sliding_window_id_ ||
+          receipt->window_end_timestamp < 0.0 ||
+          receipt->window_end_timestamp >= diag.init_time ||
+          !receipt->bg.allFinite() || !receipt->ba.allFinite())
+        continue;
+      bias_history_span_s =
+          std::max(bias_history_span_s,
+                   diag.init_time - receipt->window_end_timestamp);
+      bias_history_bg_max_rad_s = std::max(
+          bias_history_bg_max_rad_s, (final_bg - receipt->bg).norm());
+      bias_history_ba_max_mps2 = std::max(
+          bias_history_ba_max_mps2, (final_ba - receipt->ba).norm());
+      ++bias_history_count;
+      if (bias_history_span_s + 1.0e-9 >=
+          options_.sliding_window_overlap_stability_duration_s)
+        break;
+    }
+    diag.sliding_bias_trend_sample_count = bias_history_count;
+    diag.sliding_bias_trend_span_s = bias_history_span_s;
+    const bool rolling_bias_history_passed =
+        bias_history_span_s + 1.0e-9 >=
+            options_.sliding_window_overlap_stability_duration_s &&
+        bias_history_bg_max_rad_s <=
+            options_.sliding_window_max_overlap_gyro_bias_rad_s &&
+        bias_history_ba_max_mps2 <=
+            options_.sliding_window_max_overlap_accel_bias_mps2;
+    const bool run_release_certification =
+        rolling_state_quality_passed && rolling_bias_history_passed &&
+        diag.sliding_overlap_stable_duration_s + 1.0e-9 >=
+            options_.sliding_window_overlap_stability_duration_s;
+
+    if (!run_release_certification) {
+      AlignmentResult shadow_result;
+      shadow_result.timestamp = final_state.camera_time;
+      shadow_result.q_GtoI = normalized_jpl(final_state.q.data());
+      shadow_result.p_IinG = map3(final_state.p);
+      shadow_result.v_IinG = map3(final_state.v);
+      shadow_result.bg = final_bg;
+      shadow_result.ba = final_ba;
+      shadow_result.covariance =
+          previous_window_covariance_valid_
+              ? previous_window_covariance_
+              : Eigen::Matrix<double, 15, 15>::Identity() * 1.0e4;
+      shadow_result.R_FtoI_nominal = final_mount;
+      shadow_result.R_mount_residual =
+          final_mount * options_.R_FtoI_declared.transpose();
+      const double mount_sigma_rad =
+          options_.fc_board_mount_sigma_deg * kPi / 180.0;
+      shadow_result.mount_covariance = mount_sigma_rad * mount_sigma_rad *
+                                       Eigen::Matrix3d::Identity();
+      shadow_result.fc_to_board_time_offset_s =
+          options_.fc_navigation_to_board_time_offset_s;
+      shadow_result.fc_attitude_to_board_time_offset_s = best_offset;
+      shadow_result.fc_navigation_to_board_time_offset_s =
+          options_.fc_navigation_to_board_time_offset_s;
+      shadow_result.camera_to_imu_time_offset_s =
+          options_.camera_to_imu_time_offset_s;
+      shadow_result.readiness = AlignmentReadiness::NOT_READY;
+      shadow_result.release_policy = options_.release_policy;
+      shadow_result.released_to_openvins = false;
+
+      diag.mount_residual_deg = final_mount_residual_deg;
+      diag.decision_time = -1.0;
+      diag.quality_passed = false;
+      diag.navigation_quality_passed = false;
+      diag.full_alignment_quality_passed = false;
+      diag.readiness = AlignmentReadiness::NOT_READY;
+      diag.readiness_reason =
+          "rolling_window_stable_evidence_or_release_certification_pending";
+      diag.sliding_overlap_consistency_passed = false;
+      diag.initialization_duration_s = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - wall_start).count();
+      copy_runtime_counters(diag);
+
+      if (!attempt_receipts_.empty() &&
+          attempt_receipts_.back().window_id == sliding_window_id_) {
+        AlignmentAttemptReceipt &window = attempt_receipts_.back();
+        window.q_GtoI = shadow_result.q_GtoI;
+        window.p_IinG = shadow_result.p_IinG;
+        window.v_IinG = shadow_result.v_IinG;
+        window.bg = shadow_result.bg;
+        window.ba = shadow_result.ba;
+        window.imu_residual_rms =
+            rolling_imu != nullptr
+                ? rolling_imu->residual_rms
+                : std::numeric_limits<double>::infinity();
+        window.fc_residual_rms =
+            rolling_fc != nullptr
+                ? rolling_fc->residual_rms
+                : std::numeric_limits<double>::infinity();
+        window.visual_reprojection_rmse_px =
+            diag.visual_statistics.reprojection_rmse_px;
+        window.visual_reprojection_p95_px =
+            diag.visual_statistics.reprojection_p95_px;
+        int residual_dimension = 0;
+        for (const auto &family : diag.factor_contributions)
+          residual_dimension += family.residual_dimension;
+        if (residual_dimension > 0 && std::isfinite(summary.final_cost))
+          window.joint_normalized_cost =
+              2.0 * summary.final_cost / residual_dimension;
+        window.angular_excitation_rad_s = diag.angular_excitation_rad_s;
+        window.second_axis_ratio = diag.second_axis_ratio;
+        if (latest_shadow_window_result_valid_) {
+          const Eigen::Matrix3d current_rotation =
+              ov_core::quat_2_Rot(shadow_result.q_GtoI);
+          const Eigen::Matrix3d previous_rotation =
+              ov_core::quat_2_Rot(latest_shadow_window_result_.q_GtoI);
+          window.previous_attitude_delta_deg =
+              rotation_angle(current_rotation *
+                             previous_rotation.transpose()) *
+              180.0 / kPi;
+          window.previous_position_delta_m =
+              (shadow_result.p_IinG -
+               latest_shadow_window_result_.p_IinG)
+                  .norm();
+          window.previous_velocity_delta_mps =
+              (shadow_result.v_IinG -
+               latest_shadow_window_result_.v_IinG)
+                  .norm();
+          window.previous_gyro_bias_delta_rad_s =
+              (shadow_result.bg - latest_shadow_window_result_.bg).norm();
+          window.previous_accel_bias_delta_mps2 =
+              (shadow_result.ba - latest_shadow_window_result_.ba).norm();
+        }
+        window.overlap_state_count = diag.sliding_overlap_state_count;
+        window.overlap_attitude_max_deg =
+            diag.sliding_overlap_attitude_max_deg;
+        window.overlap_position_max_m =
+            diag.sliding_overlap_position_max_m;
+        window.overlap_velocity_max_mps =
+            diag.sliding_overlap_velocity_max_mps;
+        window.overlap_gyro_bias_max_rad_s =
+            diag.sliding_overlap_gyro_bias_max_rad_s;
+        window.overlap_accel_bias_max_mps2 =
+            diag.sliding_overlap_accel_bias_max_mps2;
+        window.overlap_stable_duration_s =
+            diag.sliding_overlap_stable_duration_s;
+        window.bias_trend_sample_count =
+            diag.sliding_bias_trend_sample_count;
+        window.bias_trend_span_s = diag.sliding_bias_trend_span_s;
+        window.outcome = summary.IsSolutionUsable()
+                             ? "shadow_window_solved"
+                             : "shadow_window_solver_unusable";
+        window.failed_gate = run_release_certification
+                                 ? "release_certification_pending"
+                                 : "rolling_stability_pending";
+        window.next_eligible_condition =
+            "sensor_time_stability_then_release_certification";
+      }
+
+      transition(AlignmentPhase::COLLECTING, now,
+                 "rolling_window_recorded_without_release_certification");
+      diag.state_transitions = transitions_;
+      shadow_result.diagnostics = diag;
+      if (summary.IsSolutionUsable()) {
+        latest_shadow_window_result_ = shadow_result;
+        latest_shadow_window_result_valid_ = true;
+      }
+      last_diagnostics_ = diag;
+      last_rejection_ = "p4_r1_release_certification_pending";
+      result = shadow_result;
+      return true;
+    }
+  }
+
   std::vector<double *> tracked_blocks = {
       final_state.q.data(), final_state.p.data(), final_state.v.data(),
       final_state.bg.data(), final_state.ba.data(), mount_q.data()};
@@ -2927,13 +3801,67 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
           tracked_names[state_index]] = 0.0;
   }
 
-  // Recover the full final-state tangent covariance and mounting covariance.
+  // Recover one coherent covariance for the active IMU, the terminal
+  // consecutive historical poses that fit the EKF clone capacity, and every
+  // release-visible landmark that will become an OpenVINS state. Earlier graph
+  // poses still contribute as nuisance variables to this exact marginal.
+  // The ordering is a release contract:
+  // [active q,p,v,bg,ba, clone_0 q,p, ..., landmark_0 xyz, ...]. Historical
+  // velocities and non-persistent landmarks remain nuisance variables.
+  std::vector<size_t> persistent_landmark_indices;
+  if (options_.visual_factors_enabled &&
+      options_.max_initial_slam_features > 0) {
+    persistent_landmark_indices.reserve(std::min(
+        static_cast<size_t>(options_.max_initial_slam_features),
+        landmark_feature_ids.size()));
+    const size_t final_state_index = states.size() - 1;
+    for (size_t landmark_index = 0;
+         landmark_index < landmark_feature_ids.size() &&
+         persistent_landmark_indices.size() <
+             static_cast<size_t>(options_.max_initial_slam_features);
+         ++landmark_index) {
+      const auto track = tracks.find(landmark_feature_ids[landmark_index]);
+      if (track == tracks.end())
+        continue;
+      const bool observed_at_release = std::any_of(
+          track->second.begin(), track->second.end(),
+          [final_state_index](const FeatureTrackEntry &entry) {
+            return entry.state_index == final_state_index &&
+                   entry.observation != nullptr &&
+                   entry.observation->left_valid;
+          });
+      if (observed_at_release)
+        persistent_landmark_indices.push_back(landmark_index);
+    }
+  }
+
+  const size_t available_historical_states = states.size() - 1;
+  const size_t transferred_clone_count = std::min(
+      available_historical_states,
+      static_cast<size_t>(options_.max_initial_clones));
+  const size_t transferred_clone_start =
+      available_historical_states - transferred_clone_count;
+
+  std::vector<double *> initialization_covariance_blocks = {
+      final_state.q.data(), final_state.p.data(), final_state.v.data(),
+      final_state.bg.data(), final_state.ba.data()};
+  for (size_t state_index = transferred_clone_start;
+       state_index + 1 < states.size(); ++state_index) {
+    initialization_covariance_blocks.push_back(states[state_index].q.data());
+    initialization_covariance_blocks.push_back(states[state_index].p.data());
+  }
+  for (size_t landmark_index : persistent_landmark_indices)
+    initialization_covariance_blocks.push_back(
+        landmarks[landmark_index].data());
+  std::vector<double *> covariance_parameter_blocks =
+      initialization_covariance_blocks;
+  if (!mount_fixed_external_calibration)
+    covariance_parameter_blocks.push_back(mount_q.data());
   std::vector<std::pair<const double *, const double *>> covariance_blocks;
-  const size_t covariance_tracked_count =
-      mount_fixed_external_calibration ? 5 : tracked_blocks.size();
-  for (size_t i = 0; i < covariance_tracked_count; ++i)
-    for (size_t j = i; j < covariance_tracked_count; ++j)
-      covariance_blocks.emplace_back(tracked_blocks[i], tracked_blocks[j]);
+  for (size_t i = 0; i < covariance_parameter_blocks.size(); ++i)
+    for (size_t j = i; j < covariance_parameter_blocks.size(); ++j)
+      covariance_blocks.emplace_back(covariance_parameter_blocks[i],
+                                     covariance_parameter_blocks[j]);
   ceres::Covariance::Options covariance_options;
   covariance_options.algorithm_type = ceres::DENSE_SVD;
   covariance_options.apply_loss_function = true;
@@ -2944,22 +3872,49 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
   covariance_options.null_space_rank = -1;
   ceres::Covariance covariance_solver(covariance_options);
   bool covariance_ok = covariance_solver.Compute(covariance_blocks, &problem);
-  Eigen::Matrix<double, 18, 18> covariance18 =
-      Eigen::Matrix<double, 18, 18>::Zero();
+  Eigen::MatrixXd covariance_tangent = Eigen::MatrixXd::Zero(
+      3 * static_cast<Eigen::Index>(covariance_parameter_blocks.size()),
+      3 * static_cast<Eigen::Index>(covariance_parameter_blocks.size()));
   if (covariance_ok) {
-    for (size_t i = 0; i < covariance_tracked_count; ++i) {
-      for (size_t j = i; j < covariance_tracked_count; ++j) {
+    for (size_t i = 0; i < covariance_parameter_blocks.size(); ++i) {
+      for (size_t j = i; j < covariance_parameter_blocks.size(); ++j) {
         Eigen::Matrix<double, 3, 3, Eigen::RowMajor> block;
         if (!covariance_solver.GetCovarianceBlockInTangentSpace(
-                tracked_blocks[i], tracked_blocks[j], block.data())) {
+                covariance_parameter_blocks[i], covariance_parameter_blocks[j],
+                block.data())) {
           covariance_ok = false;
           break;
         }
-        covariance18.block<3, 3>(3 * i, 3 * j) = block;
-        covariance18.block<3, 3>(3 * j, 3 * i) = block.transpose();
+        covariance_tangent.block<3, 3>(3 * i, 3 * j) = block;
+        covariance_tangent.block<3, 3>(3 * j, 3 * i) = block.transpose();
       }
       if (!covariance_ok)
         break;
+    }
+  }
+  const Eigen::Index initial_joint_covariance_dimension =
+      15 + 6 * static_cast<Eigen::Index>(transferred_clone_count) +
+      3 * static_cast<Eigen::Index>(persistent_landmark_indices.size());
+  Eigen::MatrixXd initial_joint_covariance = Eigen::MatrixXd::Zero(
+      initial_joint_covariance_dimension, initial_joint_covariance_dimension);
+  Eigen::Matrix<double, 18, 18> covariance18 =
+      Eigen::Matrix<double, 18, 18>::Zero();
+  if (covariance_ok) {
+    initial_joint_covariance = covariance_tangent.topLeftCorner(
+        initial_joint_covariance_dimension,
+        initial_joint_covariance_dimension);
+    covariance18.block<15, 15>(0, 0) =
+        initial_joint_covariance.block<15, 15>(0, 0);
+    if (!mount_fixed_external_calibration) {
+      const Eigen::Index mount_offset = initial_joint_covariance_dimension;
+      covariance18.block<3, 3>(15, 15) =
+          covariance_tangent.block<3, 3>(mount_offset, mount_offset);
+      for (Eigen::Index block_index = 0; block_index < 5; ++block_index) {
+        covariance18.block<3, 3>(3 * block_index, 15) =
+            covariance_tangent.block<3, 3>(3 * block_index, mount_offset);
+        covariance18.block<3, 3>(15, 3 * block_index) =
+            covariance18.block<3, 3>(3 * block_index, 15).transpose();
+      }
     }
   }
   if (mount_fixed_external_calibration) {
@@ -2968,6 +3923,16 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
         sigma * sigma * Eigen::Matrix3d::Identity();
   }
   covariance18 = 0.5 * (covariance18 + covariance18.transpose());
+  initial_joint_covariance =
+      0.5 * (initial_joint_covariance + initial_joint_covariance.transpose());
+  diag.initial_history_clone_count =
+      static_cast<int>(transferred_clone_count);
+  diag.initial_persistent_landmark_count =
+      static_cast<int>(persistent_landmark_indices.size());
+  diag.initial_joint_covariance_dimension =
+      static_cast<int>(initial_joint_covariance_dimension);
+  diag.initial_history_covariance_recovered =
+      covariance_ok && initial_joint_covariance.allFinite();
   if (!covariance_ok || !covariance18.allFinite())
     diag.navigation_failed_gates.push_back("covariance_recovery");
 
@@ -2979,6 +3944,14 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
       find_contribution(diag.factor_contributions, "visual_reprojection");
   const FactorContribution *fc_factor = find_contribution(
       diag.factor_contributions, "fc_pose_velocity_attitude");
+  // The absolute attitude boundary is attached directly to the released
+  // terminal state; relative FC attitude increments support the intervening
+  // trajectory without multiplying absolute gauge information.
+  const bool fc_attitude_gauge_support =
+      options_.fc_attitude_gauge_factor_enabled &&
+      diag.fc_attitude_gauge_factor_count == 1 && fc_factor != nullptr &&
+      fc_factor->residual_blocks > 0 &&
+      fc_factor->jacobian_frobenius > 1.0e-10;
   // Navigation-only control may use the IMU+FC p/v graph without visual
   // support. Keep this explicit mode separate from normal visual release.
   const bool navigation_only_without_visual =
@@ -3048,15 +4021,18 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
         observability.visual_jacobian_norm > 1e-10 && visual_factor
             ? visual_factor->residual_dimension
             : 0;
+    const bool state_fc_support =
+        observability.fc_jacobian_norm > 1e-10 ||
+        (observability.state == "attitude" && fc_attitude_gauge_support);
     observability.fc_residual_count =
-        observability.fc_jacobian_norm > 1e-10 && fc_factor
+        state_fc_support && fc_factor
             ? fc_factor->residual_dimension
             : 0;
     observability.prior_only =
         observability.prior_jacobian_norm > 1e-10 &&
         observability.imu_jacobian_norm <= 1e-10 &&
         observability.visual_jacobian_norm <= 1e-10 &&
-        observability.fc_jacobian_norm <= 1e-10;
+        !state_fc_support;
     const bool information_ok =
         observability.data_information_min_eigenvalue >=
             options_.min_information_eigenvalue &&
@@ -3069,6 +4045,7 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
           std::fabs(diag.visual_statistics.information_contribution_by_state[
               observability.state]);
       factor_support = observability.imu_jacobian_norm > 1e-10 &&
+                       fc_attitude_gauge_support &&
                        (navigation_only_without_visual ||
                         observability.visual_jacobian_norm > 1e-10 ||
                         visual_information > 1e-10);
@@ -3181,10 +4158,10 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
     const double visual_information =
         std::fabs(diag.visual_statistics.information_contribution_by_state[
             name]);
-    const bool attitude_uses_imu_visual_only = name == "attitude";
     const bool source_support =
         state->imu_jacobian_norm > 1e-10 &&
-        (attitude_uses_imu_visual_only || state->fc_jacobian_norm > 1e-10) &&
+        (state->fc_jacobian_norm > 1e-10 ||
+         (name == "attitude" && fc_attitude_gauge_support)) &&
         (!require_visual || state->visual_jacobian_norm > 1e-10 ||
          visual_information > 1e-10 ||
          navigation_only_without_visual);
@@ -3243,14 +4220,10 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
   if (fc_factor != nullptr &&
       !(fc_factor->residual_rms <= options_.navigation_max_fc_residual_rms))
     fail_common("fc_residual_rms");
+  if (!(diag.fc_terminal_max_normalized_residual <=
+        options_.navigation_max_fc_residual_rms))
+    fail_common("terminal_fc_boundary_residual");
 
-  const Eigen::Vector3d final_bg = map3(final_state.bg);
-  const Eigen::Vector3d final_ba = map3(final_state.ba);
-  const Eigen::Matrix3d final_mount =
-      ov_core::quat_2_Rot(normalized_jpl(mount_q.data()));
-  const double final_mount_residual_deg =
-      rotation_angle(final_mount * options_.R_FtoI_declared.transpose()) *
-      180.0 / kPi;
   if (final_bg.norm() > options_.max_gyro_bias_norm_rad_s)
     fail_common("gyro_bias_norm");
   if (final_ba.norm() > options_.max_accel_bias_norm_mps2)
@@ -3276,6 +4249,174 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
   if (release_eig.info() != Eigen::Success ||
       release_eig.eigenvalues().minCoeff() <= 0.0)
     fail_common("release_covariance_not_positive_definite");
+
+  Eigen::MatrixXd release_joint_covariance = initial_joint_covariance;
+  if (release_joint_covariance.rows() >= 15 &&
+      release_joint_covariance.cols() >= 15) {
+    release_joint_covariance.block<15, 15>(0, 0) = release_covariance;
+    release_joint_covariance =
+        0.5 * (release_joint_covariance + release_joint_covariance.transpose());
+  }
+  bool release_joint_covariance_valid =
+      covariance_ok && release_joint_covariance.rows() ==
+                           initial_joint_covariance_dimension &&
+      release_joint_covariance.cols() == initial_joint_covariance_dimension &&
+      release_joint_covariance.allFinite();
+  if (release_joint_covariance_valid) {
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> joint_eig(
+        release_joint_covariance);
+    release_joint_covariance_valid =
+        joint_eig.info() == Eigen::Success &&
+        joint_eig.eigenvalues().minCoeff() > 0.0;
+  }
+  if (options_.sliding_window_direct_state_release &&
+      !release_joint_covariance_valid)
+    fail_common("initial_joint_covariance_not_positive_definite");
+
+  // A fixed one-degree test is not a confidence test: on real flight windows
+  // it can be tighter than the graph's own one-sigma attitude uncertainty.
+  // Normalize each same-timestamp trajectory disagreement by the combined
+  // covariance of the two complete joint solutions. Absolute limits remain as
+  // independent physical fail-closed guards.
+  const bool release_covariance_valid =
+      release_eig.info() == Eigen::Success &&
+      release_eig.eigenvalues().minCoeff() > 0.0 &&
+      release_covariance.allFinite();
+
+  // Pairwise overlap consistency can accept a bias that moves by a modest
+  // amount in the same direction on every advanced window. Fit the causal
+  // terminal shared-bias history over a real sensor-time span and project its
+  // slope over one complete solve window. A converged bias must move by no
+  // more than one posterior sigma over that horizon.
+  struct BiasTrendSample {
+    double timestamp = -1.0;
+    Eigen::Vector3d bg = Eigen::Vector3d::Zero();
+    Eigen::Vector3d ba = Eigen::Vector3d::Zero();
+  };
+  std::vector<BiasTrendSample> bias_trend_samples;
+  bias_trend_samples.push_back({diag.init_time, final_bg, final_ba});
+  for (auto receipt = attempt_receipts_.rbegin();
+       receipt != attempt_receipts_.rend(); ++receipt) {
+    if (receipt->window_id == sliding_window_id_ ||
+        receipt->window_end_timestamp < 0.0 ||
+        receipt->window_end_timestamp >= diag.init_time ||
+        !receipt->bg.allFinite() || !receipt->ba.allFinite())
+      continue;
+    bias_trend_samples.push_back(
+        {receipt->window_end_timestamp, receipt->bg, receipt->ba});
+    if (diag.init_time - receipt->window_end_timestamp + 1.0e-9 >=
+        options_.sliding_window_overlap_stability_duration_s)
+      break;
+  }
+  const bool bias_trend_gate_enabled =
+      std::isfinite(options_.sliding_window_bias_trend_max_normalized_sigma);
+  if (bias_trend_samples.size() >= 3) {
+    double mean_time = 0.0;
+    Eigen::Vector3d mean_bg = Eigen::Vector3d::Zero();
+    Eigen::Vector3d mean_ba = Eigen::Vector3d::Zero();
+    double earliest_time = diag.init_time;
+    for (const auto &sample : bias_trend_samples) {
+      mean_time += sample.timestamp;
+      mean_bg += sample.bg;
+      mean_ba += sample.ba;
+      earliest_time = std::min(earliest_time, sample.timestamp);
+    }
+    const double inverse_count =
+        1.0 / static_cast<double>(bias_trend_samples.size());
+    mean_time *= inverse_count;
+    mean_bg *= inverse_count;
+    mean_ba *= inverse_count;
+    double time_information = 0.0;
+    Eigen::Vector3d bg_time_cross = Eigen::Vector3d::Zero();
+    Eigen::Vector3d ba_time_cross = Eigen::Vector3d::Zero();
+    for (const auto &sample : bias_trend_samples) {
+      const double centered_time = sample.timestamp - mean_time;
+      time_information += centered_time * centered_time;
+      bg_time_cross += centered_time * (sample.bg - mean_bg);
+      ba_time_cross += centered_time * (sample.ba - mean_ba);
+    }
+    diag.sliding_bias_trend_sample_count =
+        static_cast<int>(bias_trend_samples.size());
+    diag.sliding_bias_trend_span_s = diag.init_time - earliest_time;
+    if (time_information > 1.0e-12 && release_covariance_valid) {
+      const Eigen::Vector3d bg_slope = bg_time_cross / time_information;
+      const Eigen::Vector3d ba_slope = ba_time_cross / time_information;
+      diag.sliding_bg_trend_projected_change_rad_s =
+          options_.window_duration_s * bg_slope.cwiseAbs();
+      diag.sliding_ba_trend_projected_change_mps2 =
+          options_.window_duration_s * ba_slope.cwiseAbs();
+      const Eigen::Vector3d bg_std =
+          release_covariance.block<3, 3>(9, 9)
+              .diagonal()
+              .cwiseMax(1.0e-18)
+              .cwiseSqrt();
+      const Eigen::Vector3d ba_std =
+          release_covariance.block<3, 3>(12, 12)
+              .diagonal()
+              .cwiseMax(1.0e-18)
+              .cwiseSqrt();
+      diag.sliding_bias_trend_normalized_max_sigma = std::max(
+          (diag.sliding_bg_trend_projected_change_rad_s
+               .cwiseQuotient(bg_std))
+              .maxCoeff(),
+          (diag.sliding_ba_trend_projected_change_mps2
+               .cwiseQuotient(ba_std))
+              .maxCoeff());
+      diag.sliding_bias_trend_passed =
+          diag.sliding_bias_trend_span_s + 1.0e-9 >=
+              options_.sliding_window_overlap_stability_duration_s &&
+          diag.sliding_bias_trend_normalized_max_sigma <=
+              options_.sliding_window_bias_trend_max_normalized_sigma;
+    }
+  }
+  if (!bias_trend_gate_enabled)
+    diag.sliding_bias_trend_passed = true;
+  if (summary.IsSolutionUsable() && previous_window_covariance_valid_ &&
+      release_covariance_valid &&
+      diag.sliding_overlap_state_count >=
+          options_.sliding_window_min_overlap_states) {
+    const Eigen::Matrix<double, 15, 15> combined_covariance =
+        release_covariance + previous_window_covariance_;
+    const auto normalized_group_difference =
+        [&combined_covariance](int offset, double difference) {
+          const double radial_variance =
+              combined_covariance.block<3, 3>(offset, offset).trace();
+          if (!std::isfinite(radial_variance) || radial_variance <= 0.0 ||
+              !std::isfinite(difference))
+            return std::numeric_limits<double>::infinity();
+          return difference / std::sqrt(radial_variance);
+        };
+    diag.sliding_overlap_normalized_max_sigma = std::max(
+        {normalized_group_difference(
+             0, diag.sliding_overlap_attitude_max_deg * kPi / 180.0),
+         normalized_group_difference(3, diag.sliding_overlap_position_max_m),
+         normalized_group_difference(6, diag.sliding_overlap_velocity_max_mps),
+         normalized_group_difference(
+             9, diag.sliding_overlap_gyro_bias_max_rad_s),
+         normalized_group_difference(
+             12, diag.sliding_overlap_accel_bias_max_mps2)});
+    const bool physical_safety_passed =
+        diag.sliding_overlap_attitude_max_deg <=
+            options_.sliding_window_max_overlap_attitude_deg &&
+        diag.sliding_overlap_position_max_m <=
+            options_.sliding_window_max_overlap_position_m &&
+        diag.sliding_overlap_velocity_max_mps <=
+            options_.sliding_window_max_overlap_velocity_mps &&
+        diag.sliding_overlap_gyro_bias_max_rad_s <=
+            options_.sliding_window_max_overlap_gyro_bias_rad_s &&
+        diag.sliding_overlap_accel_bias_max_mps2 <=
+            options_.sliding_window_max_overlap_accel_bias_mps2;
+    diag.sliding_overlap_consistency_passed =
+        physical_safety_passed &&
+        diag.sliding_overlap_normalized_max_sigma <=
+            options_.sliding_window_overlap_max_normalized_sigma;
+  }
+  if (summary.IsSolutionUsable() && release_covariance_valid) {
+    previous_window_covariance_ = release_covariance;
+    previous_window_covariance_valid_ = true;
+  } else {
+    previous_window_covariance_valid_ = false;
+  }
 
   for (const auto &observability : diag.state_observability) {
     switch (observability.estimate_status) {
@@ -3322,15 +4463,122 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
   const bool release_navigation =
       options_.release_policy == AlignmentReleasePolicy::PRACTICAL_NAVIGATION_START &&
       diag.navigation_quality_passed;
+
+  bool direct_sliding_release_ready = false;
+  if (options_.sliding_window_direct_state_release) {
+    // The overlap clock and the bias-trend window are parallel pieces of
+    // evidence. The bias trend already spans
+    // sliding_window_overlap_stability_duration_s in sensor time; including it
+    // in the overlap clock condition would require that full trend gate to stay
+    // true for another complete duration (roughly doubling the intended
+    // maturation time). Accumulate q/p/v overlap and navigation quality on
+    // their own clock, then intersect that mature evidence with the current
+    // time-domain bias trend at release.
+    const bool current_overlap_consistent =
+        summary.IsSolutionUsable() && (release_full || release_navigation) &&
+        diag.sliding_overlap_consistency_passed;
+    if (deferred_release_certification) {
+      direct_sliding_release_ready =
+          current_overlap_consistent &&
+          diag.sliding_overlap_stable_duration_s + 1.0e-9 >=
+              options_.sliding_window_overlap_stability_duration_s &&
+          diag.sliding_bias_trend_passed;
+    } else {
+      const double maximum_continuous_gap = std::max(
+          2.0 * options_.sliding_window_min_advance_s,
+          options_.max_stereo_gap_s);
+      const bool continuous_with_previous =
+          sliding_overlap_last_window_end_ >= 0.0 &&
+          diag.init_time > sliding_overlap_last_window_end_ &&
+          diag.init_time - sliding_overlap_last_window_end_ <=
+              maximum_continuous_gap + 1.0e-9;
+      if (!current_overlap_consistent) {
+        sliding_overlap_stable_since_ = -1.0;
+      } else if (sliding_overlap_stable_since_ < 0.0 ||
+                 !continuous_with_previous) {
+        sliding_overlap_stable_since_ = diag.init_time;
+      }
+      sliding_overlap_last_window_end_ = diag.init_time;
+      if (current_overlap_consistent && sliding_overlap_stable_since_ >= 0.0) {
+        diag.sliding_overlap_stable_duration_s =
+            std::max(0.0, diag.init_time - sliding_overlap_stable_since_);
+        direct_sliding_release_ready =
+            diag.sliding_overlap_stable_duration_s + 1.0e-9 >=
+                options_.sliding_window_overlap_stability_duration_s &&
+            diag.sliding_bias_trend_passed;
+      }
+    }
+  }
   if (options_.sliding_window_shadow_only) {
     AlignmentResult shadow_result;
     shadow_result.timestamp = final_state.camera_time;
     shadow_result.q_GtoI = normalized_jpl(final_state.q.data());
+    if (options_.diagnostic_release_attitude_from_fc) {
+      const Eigen::Matrix3d R_GtoF_release =
+          ov_core::quat_2_Rot(fc_attitude_at_state.back().q_GtoF);
+      shadow_result.q_GtoI =
+          ov_core::rot_2_quat(final_mount * R_GtoF_release);
+    }
     shadow_result.p_IinG = map3(final_state.p);
     shadow_result.v_IinG = map3(final_state.v);
     shadow_result.bg = final_bg;
     shadow_result.ba = final_ba;
+    if (options_.diagnostic_release_graph_attitude_fc_pv_zero_bias) {
+      const Eigen::Matrix3d R_GtoF_release =
+          ov_core::quat_2_Rot(fc_attitude_at_state.back().q_GtoF);
+      const Eigen::Matrix3d R_FtoG_release = R_GtoF_release.transpose();
+      Eigen::Vector3d omega_F_release = Eigen::Vector3d::Zero();
+      if (!fc_rates.empty()) {
+        const auto nearest = std::min_element(
+            fc_rates.begin(), fc_rates.end(),
+            [&](const FCRateSample &a, const FCRateSample &b) {
+              return std::fabs(a.timestamp -
+                               fc_attitude_at_state.back().timestamp) <
+                     std::fabs(b.timestamp -
+                               fc_attitude_at_state.back().timestamp);
+            });
+        omega_F_release = nearest->omega_F;
+      }
+      shadow_result.p_IinG =
+          fc_navigation_at_state.back().position_G +
+          R_FtoG_release * options_.p_IinF;
+      shadow_result.v_IinG =
+          fc_navigation_at_state.back().velocity_G +
+          R_FtoG_release * omega_F_release.cross(options_.p_IinF);
+      shadow_result.bg.setZero();
+      shadow_result.ba.setZero();
+      diag.readiness_reason =
+          "diagnostic_mixed_graph_attitude_fc_pv_zero_bias";
+    }
     shadow_result.covariance = release_covariance;
+    const bool coherent_history_release =
+        release_joint_covariance_valid &&
+        !options_.diagnostic_release_attitude_from_fc &&
+        !options_.diagnostic_release_graph_attitude_fc_pv_zero_bias;
+    if (coherent_history_release) {
+      shadow_result.initial_clones.reserve(transferred_clone_count);
+      for (size_t state_index = transferred_clone_start;
+           state_index + 1 < states.size();
+           ++state_index) {
+        AlignmentCloneState clone;
+        clone.timestamp = states[state_index].camera_time;
+        clone.q_GtoI = normalized_jpl(states[state_index].q.data());
+        clone.p_IinG = map3(states[state_index].p);
+        shadow_result.initial_clones.push_back(clone);
+      }
+      shadow_result.initial_landmarks.reserve(
+          persistent_landmark_indices.size());
+      for (size_t landmark_index : persistent_landmark_indices) {
+        AlignmentLandmarkState landmark;
+        landmark.feature_id = landmark_feature_ids[landmark_index];
+        landmark.p_FinG = Eigen::Vector3d(
+            landmarks[landmark_index][0], landmarks[landmark_index][1],
+            landmarks[landmark_index][2]);
+        shadow_result.initial_landmarks.push_back(landmark);
+      }
+      shadow_result.startup_consumed_feature_ids = landmark_feature_ids;
+      shadow_result.initial_joint_covariance = release_joint_covariance;
+    }
     shadow_result.R_FtoI_nominal = final_mount;
     shadow_result.R_mount_residual =
         final_mount * options_.R_FtoI_declared.transpose();
@@ -3342,16 +4590,24 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
         options_.fc_navigation_to_board_time_offset_s;
     shadow_result.camera_to_imu_time_offset_s =
         options_.camera_to_imu_time_offset_s;
-    shadow_result.readiness = AlignmentReadiness::NOT_READY;
+    shadow_result.readiness =
+        direct_sliding_release_ready
+            ? (release_full ? AlignmentReadiness::FULL_ALIGNMENT_READY
+                            : AlignmentReadiness::NAVIGATION_READY)
+            : AlignmentReadiness::NOT_READY;
     shadow_result.release_policy = options_.release_policy;
-    shadow_result.released_to_openvins = false;
+    const bool formal_direct_release =
+        direct_sliding_release_ready &&
+        !options_.sliding_window_diagnostic_never_anchor;
+    shadow_result.released_to_openvins = formal_direct_release;
 
     diag.mount_residual_deg = final_mount_residual_deg;
-    diag.decision_time = -1.0;
-    diag.quality_passed = false;
-    diag.readiness = AlignmentReadiness::NOT_READY;
-    diag.readiness_reason =
-        "p4_r1_shadow_window_solved_no_state_release";
+    diag.decision_time = direct_sliding_release_ready ? now : -1.0;
+    diag.quality_passed = direct_sliding_release_ready;
+    diag.readiness = shadow_result.readiness;
+    diag.readiness_reason = direct_sliding_release_ready
+                                ? "time_based_overlap_consistency_direct_state_release"
+                                : "sliding_window_overlap_evidence_pending";
     diag.failed_gates =
         options_.release_policy == AlignmentReleasePolicy::STRICT_FULL_ALIGNMENT
             ? diag.full_alignment_failed_gates
@@ -3414,39 +4670,95 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
         window.previous_accel_bias_delta_mps2 =
             (shadow_result.ba - latest_shadow_window_result_.ba).norm();
       }
-      window.outcome = summary.IsSolutionUsable()
-                           ? "shadow_window_solved"
-                           : "shadow_window_solver_unusable";
+      window.overlap_state_count = diag.sliding_overlap_state_count;
+      window.overlap_attitude_max_deg =
+          diag.sliding_overlap_attitude_max_deg;
+      window.overlap_position_max_m =
+          diag.sliding_overlap_position_max_m;
+      window.overlap_velocity_max_mps =
+          diag.sliding_overlap_velocity_max_mps;
+      window.overlap_gyro_bias_max_rad_s =
+          diag.sliding_overlap_gyro_bias_max_rad_s;
+      window.overlap_accel_bias_max_mps2 =
+          diag.sliding_overlap_accel_bias_max_mps2;
+      window.overlap_normalized_max_sigma =
+          diag.sliding_overlap_normalized_max_sigma;
+      window.overlap_stable_duration_s =
+          diag.sliding_overlap_stable_duration_s;
+      window.overlap_consistency_passed =
+          diag.sliding_overlap_consistency_passed;
+      window.bias_trend_sample_count =
+          diag.sliding_bias_trend_sample_count;
+      window.bias_trend_span_s = diag.sliding_bias_trend_span_s;
+      window.bg_trend_projected_change_rad_s =
+          diag.sliding_bg_trend_projected_change_rad_s;
+      window.ba_trend_projected_change_mps2 =
+          diag.sliding_ba_trend_projected_change_mps2;
+      window.bias_trend_normalized_max_sigma =
+          diag.sliding_bias_trend_normalized_max_sigma;
+      window.bias_trend_passed = diag.sliding_bias_trend_passed;
+      window.outcome = formal_direct_release
+                           ? "direct_state_release"
+                           : (direct_sliding_release_ready
+                                  ? "diagnostic_release_suppressed"
+                           : (summary.IsSolutionUsable()
+                                  ? "shadow_window_solved"
+                                  : "shadow_window_solver_unusable"));
       window.failed_gate = join(diag.failed_gates);
       window.next_eligible_condition =
           "fixed_window_end_advance_s>=" +
           std::to_string(options_.sliding_window_min_advance_s);
     }
 
-    if (summary.IsSolutionUsable()) {
-      previous_window_states_.clear();
-      previous_window_states_.reserve(states.size());
-      for (const GraphState &state : states) {
-        SlidingWindowStateEstimate estimate;
-        estimate.timestamp = state.camera_time;
-        estimate.q_GtoI = normalized_jpl(state.q.data());
-        estimate.p_IinG = map3(state.p);
-        estimate.v_IinG = map3(state.v);
-        estimate.bg = map3(state.bg);
-        estimate.ba = map3(state.ba);
-        previous_window_states_.push_back(estimate);
+    shadow_result.diagnostics = diag;
+    if (formal_direct_release) {
+      navigation_released_ = true;
+      ++successful_release_count_;
+      navigation_ready_time_ = now;
+      if (release_full) {
+        full_alignment_recorded_ = true;
+        full_alignment_ready_time_ = now;
       }
+      alignment_window_closed_ = true;
+      alignment_window_close_time_ = now;
+      transition(shadow_result.readiness ==
+                         AlignmentReadiness::FULL_ALIGNMENT_READY
+                     ? AlignmentPhase::FULL_ALIGNMENT_READY
+                     : AlignmentPhase::NAVIGATION_READY,
+                 now, "direct_sliding_window_state_release");
+      copy_runtime_counters(diag);
+      diag.navigation_ready_time = navigation_ready_time_;
+      diag.full_alignment_ready_time = full_alignment_ready_time_;
+      diag.alignment_window_closed = true;
+      diag.alignment_window_close_time = alignment_window_close_time_;
+      diag.state_transitions = transitions_;
+      shadow_result.diagnostics = diag;
       latest_shadow_window_result_ = shadow_result;
       latest_shadow_window_result_valid_ = true;
+      latest_evidence_diagnostics_ = diag;
+      latest_evidence_diagnostics_valid_ = true;
+      last_diagnostics_ = diag;
+      last_rejection_.clear();
+      result = shadow_result;
+      return true;
     }
-    shadow_result.diagnostics = diag;
-    latest_shadow_window_result_.diagnostics = diag;
     transition(AlignmentPhase::COLLECTING, now,
                "p4_r1_shadow_window_recorded_waiting_for_next_window");
     diag.state_transitions = transitions_;
+    shadow_result.diagnostics = diag;
+    if (summary.IsSolutionUsable()) {
+      latest_shadow_window_result_ = shadow_result;
+      latest_shadow_window_result_valid_ = true;
+      latest_evidence_diagnostics_ = diag;
+      latest_evidence_diagnostics_valid_ = true;
+    }
     last_diagnostics_ = diag;
-    last_rejection_ = "p4_r1_shadow_only_no_formal_release";
-    return false;
+    last_rejection_ =
+        direct_sliding_release_ready
+            ? "p4_r1_diagnostic_release_suppressed"
+            : "p4_r1_shadow_only_no_formal_release";
+    result = shadow_result;
+    return true;
   }
   if (!release_full && !release_navigation) {
     diag.failed_gates =
@@ -3472,6 +4784,12 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
   result = AlignmentResult();
   result.timestamp = final_state.camera_time;
   result.q_GtoI = normalized_jpl(final_state.q.data());
+  if (options_.diagnostic_release_attitude_from_fc) {
+    const Eigen::Matrix3d R_GtoF_release =
+        ov_core::quat_2_Rot(fc_attitude_at_state.back().q_GtoF);
+    result.q_GtoI =
+        ov_core::rot_2_quat(final_mount * R_GtoF_release);
+  }
   result.p_IinG = map3(final_state.p);
   result.v_IinG = map3(final_state.v);
   result.bg = final_bg;
@@ -3573,16 +4891,24 @@ bool OnlineAlignmentInitializer::try_initialize(double now,
                           std::to_string(index));
       return false;
     }
-    // The sliding-window duration defines the amount of causal evidence to
-    // retain after feedback.  The FC rate may vary and therefore the number
-    // of valid updates is observed from the stream, never prescribed here.
-    gate.history_duration_s = options_.window_duration_s;
+    // Candidate certification is a short post-solve holdout, not a second
+    // solve-window-length wait. The actual number of valid FC events remains
+    // determined by the causal stream.
+    gate.history_duration_s =
+        options_.candidate_short_validation_duration_s;
+    if (index == static_cast<std::size_t>(CandidateStateGroup::ATTITUDE) ||
+        index == static_cast<std::size_t>(CandidateStateGroup::GYRO_BIAS) ||
+        index == static_cast<std::size_t>(CandidateStateGroup::ACCEL_BIAS)) {
+      gate.post_feedback_validation_duration_s =
+          options_.candidate_short_validation_duration_s;
+      gate.required_post_feedback_stable_updates = 0;
+    }
     gate.derive_depth_from_sliding_window = false;
     derived_gate_depth = true;
   }
   candidate_gate_depth_counts_ = window_measurement_counts;
   candidate_gate_depth_source_ =
-      derived_gate_depth ? "sliding_window_duration_with_observed_fc_rows"
+      derived_gate_depth ? "short_causal_duration_with_observed_fc_rows"
                          : "explicit_gate_configuration";
   candidate_filter_ = OnlineAlignmentCandidateFilter(candidate_filter_config);
   std::string candidate_filter_reason;

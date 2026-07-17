@@ -1,0 +1,258 @@
+{
+  "schema_version": 1,
+  "generated_at_utc": "2026-07-17T04:24:13.112736+00:00",
+  "repo": "D:/vscode_dir/open_vins_p4_sliding_r1",
+  "experiment_root": "C:/Users/baloney/Desktop/实验目录",
+  "legacy_roots": [
+    "C:/Users/baloney/Desktop"
+  ],
+  "record_count": 1321,
+  "counts_by_type": {
+    "batch": 201,
+    "evaluation": 571,
+    "raw_run": 492,
+    "run_spec": 57
+  },
+  "counts_by_experiment_domain": {
+    "P4": 156,
+    "P4_RELATED_UNCLASSIFIED": 727,
+    "P4_WITH_P5": 388,
+    "P5_ONLY_IN_P4_CAMPAIGN": 50
+  },
+  "counts_by_status": {
+    "ARTIFACT_WITHOUT_EXIT_RECEIPT": 63,
+    "BATCH_RECEIPT_PRESENT": 151,
+    "EVALUATED": 563,
+    "EVALUATION_WITH_NA_PRIMARY_METRICS": 8,
+    "FAILED": 109,
+    "INCOMPLETE_OR_ABANDONED": 3,
+    "SPEC_INPUTS_PRESENT": 57,
+    "SUCCESS_NO_TRAJECTORY": 2,
+    "SUCCESS_WITH_TRAJECTORY": 365
+  },
+  "counts_by_evidence_grade": {
+    "DIAGNOSTIC_EVALUATION": 447,
+    "FORMAL_MAIN": 116,
+    "INVALID_OR_INCOMPLETE_EVALUATION": 8,
+    "ORCHESTRATION_ONLY": 201,
+    "RUNTIME_ONLY": 492,
+    "SPEC_ONLY": 57
+  },
+  "counts_by_location_contract": {
+    "COMPLIANT_EXPERIMENT_ROOT": 1135,
+    "LEGACY_OUTSIDE_EXPERIMENT_ROOT": 186
+  },
+  "counts_by_campaign": [
+    {
+      "campaign": "P4_P5_batch_ascii_20260714",
+      "count": 1
+    },
+    {
+      "campaign": "P4_P5_mainline_20260712",
+      "count": 33
+    },
+    {
+      "campaign": "P4_P5_redesign_20260713",
+      "count": 119
+    },
+    {
+      "campaign": "P4_P5_redesign_20260714",
+      "count": 13
+    },
+    {
+      "campaign": "P4_P5_window_count_full_20260714_v1",
+      "count": 2
+    },
+    {
+      "campaign": "P4_P5_window_count_full_20260714_v1_eval",
+      "count": 2
+    },
+    {
+      "campaign": "P4_P5_window_count_full_20260714_v2",
+      "count": 2
+    },
+    {
+      "campaign": "P4_P5_window_count_full_20260714_v2_eval",
+      "count": 2
+    },
+    {
+      "campaign": "P4_P5_window_count_short_20260714",
+      "count": 2
+    },
+    {
+      "campaign": "P4_P5_window_count_short_20260714_v2",
+      "count": 2
+    },
+    {
+      "campaign": "P4_P5_window_count_short_20260714_v3",
+      "count": 2
+    },
+    {
+      "campaign": "P4_P5_window_count_short_20260714_v3_eval",
+      "count": 2
+    },
+    {
+      "campaign": "P4_P5_window_count_short_20260714_v4",
+      "count": 2
+    },
+    {
+      "campaign": "P4_P5_window_count_short_20260714_v4_eval",
+      "count": 2
+    },
+    {
+      "campaign": "P4_P5_window_count_short_20260714_v5",
+      "count": 2
+    },
+    {
+      "campaign": "P4_P5_window_count_short_20260714_v6",
+      "count": 1
+    },
+    {
+      "campaign": "P4_P5_window_count_short_20260714_v7",
+      "count": 1
+    },
+    {
+      "campaign": "P4_arbitrary_start_20260712",
+      "count": 13
+    },
+    {
+      "campaign": "P4_attitude_gauge_fix_20260716_ultra",
+      "count": 13
+    },
+    {
+      "campaign": "P4_calibrated_yaw_sigma_fly3_bias_full_20260716_ultra",
+      "count": 6
+    },
+    {
+      "campaign": "P4_calibrated_yaw_sigma_focus_20260716_ultra",
+      "count": 8
+    },
+    {
+      "campaign": "P4_calibrated_yaw_sigma_production_full_20260716_ultra",
+      "count": 5
+    },
+    {
+      "campaign": "P4_calibrated_yaw_sigma_qfc_diag_20260716_ultra",
+      "count": 4
+    },
+    {
+      "campaign": "P4_clean_baseline_20260712",
+      "count": 49
+    },
+    {
+      "campaign": "P4_diag_window_count_v8_fly1",
+      "count": 1
+    },
+    {
+      "campaign": "P4_diag_window_count_v9_fly1",
+      "count": 1
+    },
+    {
+      "campaign": "P4_direct_sliding_state_20260717",
+      "count": 139
+    },
+    {
+      "campaign": "P4_final_yaw_only_focus_20260716_autonomous",
+      "count": 7
+    },
+    {
+      "campaign": "P4_final_yaw_only_full_20260716_autonomous",
+      "count": 13
+    },
+    {
+      "campaign": "P4_fly2_direction_validation_20260716_autonomous",
+      "count": 44
+    },
+    {
+      "campaign": "P4_formal_20260715",
+      "count": 97
+    },
+    {
+      "campaign": "P4_low_dynamic_attitude_gauge_focus_20260716_ultra",
+      "count": 4
+    },
+    {
+      "campaign": "P4_low_dynamic_attitude_gauge_full_20260716_ultra",
+      "count": 2
+    },
+    {
+      "campaign": "P4_online_joint_alignment_20260712",
+      "count": 16
+    },
+    {
+      "campaign": "P4_provisional_gauge_refactor_20260717",
+      "count": 44
+    },
+    {
+      "campaign": "P4_sliding_window_r1_20260714",
+      "count": 10
+    },
+    {
+      "campaign": "P4_yaw_bias_feedback_ablation_20260716_ultra",
+      "count": 20
+    },
+    {
+      "campaign": "P4_yaw_calibration_factorial_20260716_ultra",
+      "count": 186
+    },
+    {
+      "campaign": "P4_yaw_drift_causal_ablation_20260715",
+      "count": 373
+    },
+    {
+      "campaign": "P4_yaw_gauge_full_20260716_ultra",
+      "count": 5
+    },
+    {
+      "campaign": "P4_yaw_gauge_localjac_20260716_ultra",
+      "count": 6
+    },
+    {
+      "campaign": "P4_yaw_gauge_retain_bias_full_20260716_ultra",
+      "count": 4
+    },
+    {
+      "campaign": "P4_yaw_q_release_ablation_20260716_ultra",
+      "count": 4
+    },
+    {
+      "campaign": "p4_crossflight_v14_20260717",
+      "count": 10
+    },
+    {
+      "campaign": "p4_direct_sliding_state_20260717",
+      "count": 12
+    },
+    {
+      "campaign": "p4_fair_nasa_focus_20260717",
+      "count": 4
+    },
+    {
+      "campaign": "p4_fc_anchor_relative_20260717",
+      "count": 2
+    },
+    {
+      "campaign": "p4_fc_time_integral_20260717",
+      "count": 12
+    },
+    {
+      "campaign": "p4_gauge_focus_20260717",
+      "count": 8
+    },
+    {
+      "campaign": "p4_window_full_graph_posterior_20260717",
+      "count": 3
+    },
+    {
+      "campaign": "p4_window_full_posterior_20260717",
+      "count": 1
+    },
+    {
+      "campaign": "p4_window_history_transfer_20260717",
+      "count": 5
+    }
+  ],
+  "missing_run_spec_inputs": [],
+  "repeat_contract_groups": 45,
+  "artifact_link_groups": 261
+}

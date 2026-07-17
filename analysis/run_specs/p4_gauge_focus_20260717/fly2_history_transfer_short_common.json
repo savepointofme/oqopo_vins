@@ -1,0 +1,17 @@
+{
+  "experiment_id": "p4_window_history_transfer_20260717",
+  "flight_name": "fly2",
+  "method_name": "p4_history_transfer_short",
+  "date": "20260717",
+  "status": "candidate",
+  "gps_csv": "C:/Users/baloney/Desktop/20260518_gsmq_d455_fly2/result/fc_rebuild_20260614/gps_refined_finealign.csv",
+  "vio_traj": "C:/Users/baloney/Desktop/P4_direct_sliding_state_20260717/history_transfer_short/20260717_063459_fly2_history_transfer_short/fly2/traj_nav.txt",
+  "vio_bias": "C:/Users/baloney/Desktop/P4_direct_sliding_state_20260717/history_transfer_short/20260717_063459_fly2_history_transfer_short/fly2/traj.txt.bias",
+  "diag_csv": "C:/Users/baloney/Desktop/P4_direct_sliding_state_20260717/history_transfer_short/20260717_063459_fly2_history_transfer_short/fly2/diag.csv",
+  "t0": 728.84884119,
+  "t1": 819.8,
+  "alignment": {"mode": "start_heading", "course_window_s": 60.0},
+  "sampling": {"mode": "gps_update_after_vio", "max_delay_s": 0.2},
+  "segmentation": {"mode": "geometry"},
+  "notes": "Shared-bias staged P4 plus atomic historical clone and joint covariance transfer; no GPS XY/course online."
+}

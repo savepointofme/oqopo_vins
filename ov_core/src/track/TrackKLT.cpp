@@ -55,11 +55,15 @@ static void apply_H_kp(std::vector<cv::KeyPoint> &kps, const cv::Matx33d &H) {
 void TrackKLT::feed_new_camera(const CameraData &message) {
 
   // Error check that we have all the data
-  if (message.sensor_ids.empty() || message.sensor_ids.size() != message.images.size() || message.images.size() != message.masks.size()) {
+  const bool detection_masks_valid =
+      message.detection_masks.empty() || message.detection_masks.size() == message.images.size();
+  if (message.sensor_ids.empty() || message.sensor_ids.size() != message.images.size() ||
+      message.images.size() != message.masks.size() || !detection_masks_valid) {
     PRINT_ERROR(RED "[ERROR]: MESSAGE DATA SIZES DO NOT MATCH OR EMPTY!!!\n" RESET);
     PRINT_ERROR(RED "[ERROR]:   - message.sensor_ids.size() = %zu\n" RESET, message.sensor_ids.size());
     PRINT_ERROR(RED "[ERROR]:   - message.images.size() = %zu\n" RESET, message.images.size());
     PRINT_ERROR(RED "[ERROR]:   - message.masks.size() = %zu\n" RESET, message.masks.size());
+    PRINT_ERROR(RED "[ERROR]:   - message.detection_masks.size() = %zu\n" RESET, message.detection_masks.size());
     std::exit(EXIT_FAILURE);
   }
 
@@ -136,6 +140,8 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
   cv::Mat img = img_curr.at(cam_id);
   std::vector<cv::Mat> imgpyr = img_pyramid_curr.at(cam_id);
   cv::Mat mask = message.masks.at(msg_id);
+  const cv::Mat detection_mask =
+      message.detection_masks.empty() ? mask : message.detection_masks.at(msg_id);
   rT2 = boost::posix_time::microsec_clock::local_time();
 
   // If we didn't have any successful tracks last time, just extract this time
@@ -144,12 +150,12 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
     // Detect new features
     std::vector<cv::KeyPoint> good_left;
     std::vector<size_t> good_ids_left;
-    perform_detection_monocular(imgpyr, mask, good_left, good_ids_left);
+    perform_detection_monocular(imgpyr, detection_mask, good_left, good_ids_left);
     // Save the current image and pyramid
     std::lock_guard<std::mutex> lckv(mtx_last_vars);
     img_last[cam_id] = img;
     img_pyramid_last[cam_id] = imgpyr;
-    img_mask_last[cam_id] = mask;
+    img_mask_last[cam_id] = detection_mask;
     pts_last[cam_id] = good_left;
     ids_last[cam_id] = good_ids_left;
     time_last[cam_id] = message.timestamp;
@@ -262,7 +268,7 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
     std::lock_guard<std::mutex> lckv(mtx_last_vars);
     img_last[cam_id] = img;
     img_pyramid_last[cam_id] = imgpyr;
-    img_mask_last[cam_id] = mask;
+    img_mask_last[cam_id] = detection_mask;
     pts_last[cam_id].clear();
     ids_last[cam_id].clear();
     PRINT_ERROR(RED "[KLT-EXTRACTOR]: Failed to get enough points to do RANSAC, resetting.....\n" RESET);
@@ -308,7 +314,7 @@ void TrackKLT::feed_monocular(const CameraData &message, size_t msg_id) {
     std::lock_guard<std::mutex> lckv(mtx_last_vars);
     img_last[cam_id] = img;
     img_pyramid_last[cam_id] = imgpyr;
-    img_mask_last[cam_id] = mask;
+    img_mask_last[cam_id] = detection_mask;
     pts_last[cam_id] = good_left;
     ids_last[cam_id] = good_ids_left;
     time_last[cam_id] = message.timestamp;
@@ -377,6 +383,10 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
   std::vector<cv::Mat> imgpyr_right = img_pyramid_curr.at(cam_id_right);
   cv::Mat mask_left = message.masks.at(msg_id_left);
   cv::Mat mask_right = message.masks.at(msg_id_right);
+  const cv::Mat detection_mask_left =
+      message.detection_masks.empty() ? mask_left : message.detection_masks.at(msg_id_left);
+  const cv::Mat detection_mask_right =
+      message.detection_masks.empty() ? mask_right : message.detection_masks.at(msg_id_right);
   rT2 = boost::posix_time::microsec_clock::local_time();
 
   // If we didn't have any successful tracks last time, just extract this time
@@ -385,7 +395,8 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
     // Track into the new image
     std::vector<cv::KeyPoint> good_left, good_right;
     std::vector<size_t> good_ids_left, good_ids_right;
-    perform_detection_stereo(imgpyr_left, imgpyr_right, mask_left, mask_right, cam_id_left, cam_id_right, good_left, good_right,
+    perform_detection_stereo(imgpyr_left, imgpyr_right, detection_mask_left, detection_mask_right, cam_id_left, cam_id_right,
+                             good_left, good_right,
                              good_ids_left, good_ids_right);
     // Save the current image and pyramid
     std::lock_guard<std::mutex> lckv(mtx_last_vars);
@@ -393,8 +404,8 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
     img_last[cam_id_right] = img_right;
     img_pyramid_last[cam_id_left] = imgpyr_left;
     img_pyramid_last[cam_id_right] = imgpyr_right;
-    img_mask_last[cam_id_left] = mask_left;
-    img_mask_last[cam_id_right] = mask_right;
+    img_mask_last[cam_id_left] = detection_mask_left;
+    img_mask_last[cam_id_right] = detection_mask_right;
     pts_last[cam_id_left] = good_left;
     pts_last[cam_id_right] = good_right;
     ids_last[cam_id_left] = good_ids_left;
@@ -525,8 +536,8 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
     img_last[cam_id_right] = img_right;
     img_pyramid_last[cam_id_left] = imgpyr_left;
     img_pyramid_last[cam_id_right] = imgpyr_right;
-    img_mask_last[cam_id_left] = mask_left;
-    img_mask_last[cam_id_right] = mask_right;
+    img_mask_last[cam_id_left] = detection_mask_left;
+    img_mask_last[cam_id_right] = detection_mask_right;
     pts_last[cam_id_left].clear();
     pts_last[cam_id_right].clear();
     ids_last[cam_id_left].clear();
@@ -611,8 +622,8 @@ void TrackKLT::feed_stereo(const CameraData &message, size_t msg_id_left, size_t
     img_last[cam_id_right] = img_right;
     img_pyramid_last[cam_id_left] = imgpyr_left;
     img_pyramid_last[cam_id_right] = imgpyr_right;
-    img_mask_last[cam_id_left] = mask_left;
-    img_mask_last[cam_id_right] = mask_right;
+    img_mask_last[cam_id_left] = detection_mask_left;
+    img_mask_last[cam_id_right] = detection_mask_right;
     time_last[cam_id_left] = message.timestamp;
     time_last[cam_id_right] = message.timestamp;
     pts_last[cam_id_left] = good_left;

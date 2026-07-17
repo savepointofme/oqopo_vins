@@ -1,0 +1,80 @@
+{
+  "schema": "openvins_p4_kd_split_final_verdict_v1",
+  "generated_at": "2026-07-16T17:38:04+08:00",
+  "status": "complete",
+  "completed_runs": {
+    "focus": ["C0_fly1", "C0_fly3", "KONLY_fly1", "KONLY_fly3", "DONLY_fly1", "DONLY_fly3", "KD_fly1", "KD_fly3"],
+    "full": ["C0_fly1", "C0_fly3", "KONLY_fly1", "KONLY_fly3", "DONLY_fly1", "DONLY_fly3"]
+  },
+  "failed_or_incomplete_runs": [],
+  "identity": {
+    "source_commit": "fdd8d745229c7115b56b5d2d765f462a3fd68b4b",
+    "runner_sha256": "f873565b03a85d1fe91695652c006b374d1406ede29f08af426b078b99281a76",
+    "library_sha256": "40ac217cfd15319fb15ba705d44d7781e9b1798170020f21416995e228306080",
+    "build_performed": false
+  },
+  "verdict": {
+    "K": "not transferable: focus XY worsens on both flights, full effect is harmful on fly1 and beneficial on fly3",
+    "D": "dominant harmful factor: large cross-flight XY/Z/FC-velocity/course degradation and 1-km divergence events",
+    "KxD": "antagonistic compensation: June K partly offsets June D, but KD remains unacceptable versus C0"
+  },
+  "focus_start_heading_delta_vs_C0": {
+    "KONLY": {
+      "fly1": {"xy_rmse_m": 48.00472951002, "vertical_rmse_m": -5.355559635863157, "vxy_vec_rmse_mps": 0.6379489396055864, "course_rmse_deg": 0.662973481574876},
+      "fly3": {"xy_rmse_m": 47.10587682502444, "vertical_rmse_m": -0.01628290621986217, "vxy_vec_rmse_mps": 0.1127072406104086, "course_rmse_deg": -0.4451884412047211}
+    },
+    "DONLY": {
+      "fly1": {"xy_rmse_m": 221.3310948336549, "vertical_rmse_m": 234.07190538858327, "vxy_vec_rmse_mps": 4.110088279970286, "course_rmse_deg": -0.9414391964373392},
+      "fly3": {"xy_rmse_m": 639.178669947913, "vertical_rmse_m": 172.7489765811376, "vxy_vec_rmse_mps": 7.028100598357682, "course_rmse_deg": 6.394523931378084}
+    },
+    "KD": {
+      "fly1": {"xy_rmse_m": 171.99836804541626, "vertical_rmse_m": 179.23936614772565, "vxy_vec_rmse_mps": 3.546937908084915, "course_rmse_deg": -1.4344272552917307},
+      "fly3": {"xy_rmse_m": 493.1782193870686, "vertical_rmse_m": 114.06668207825277, "vxy_vec_rmse_mps": 5.724641754648187, "course_rmse_deg": 4.731741897414807}
+    }
+  },
+  "focus_interaction_KD_minus_K_minus_D_plus_C0": {
+    "fly1": {"xy_rmse_m": -97.33745629825863, "vertical_rmse_m": -49.47697960499445, "vxy_vec_rmse_mps": -1.2010993114909572, "course_rmse_deg": -1.155961540429268},
+    "fly3": {"xy_rmse_m": -193.1063273858689, "vertical_rmse_m": -58.66601159666498, "vxy_vec_rmse_mps": -1.416166084319904, "course_rmse_deg": -1.2175935927585568}
+  },
+  "full_start_heading_delta_vs_C0": {
+    "KONLY": {
+      "fly1": {"xy_rmse_m": 38.64139668716234, "vertical_rmse_m": -0.904841164232258, "vxy_vec_rmse_mps": 0.455235721115897, "course_rmse_deg": 1.001702546742956},
+      "fly3": {"xy_rmse_m": -61.5231211909892, "vertical_rmse_m": -4.004802141467346, "vxy_vec_rmse_mps": -1.904305233776681, "course_rmse_deg": -3.315058989173957}
+    },
+    "DONLY": {
+      "fly1": {"xy_rmse_m": 380.6032151661874, "vertical_rmse_m": 344.3201731932539, "vxy_vec_rmse_mps": 7.147210580260236, "course_rmse_deg": 16.45893863113512},
+      "fly3": {"xy_rmse_m": 1620.4875743188286, "vertical_rmse_m": 160.42661324296252, "vxy_vec_rmse_mps": 17.892355856367865, "course_rmse_deg": 27.72327715147007}
+    }
+  },
+  "p4": {
+    "same_release_window_fingerprint_within_flight": true,
+    "same_release_time_and_level_within_flight": true,
+    "initialized_state_unchanged": false,
+    "fly1_release_s": 940.353238821,
+    "fly3_release_s": 628.199999809
+  },
+  "formal_evaluation": {
+    "gps_update_time_grid": true,
+    "primary_alignment": "start_heading",
+    "corroborating_alignment": "absolute_navigation_no_post_alignment",
+    "reference_velocity": "FC Ve,Vn,Vu",
+    "best_fit_used": false,
+    "gps_horizontal_estimator_input": false
+  },
+  "geometry_audit": {
+    "result": "PASS",
+    "resolution": "640x480",
+    "model": "pinhole-radtan",
+    "K_order": ["fx", "fy", "cx", "cy"],
+    "D_order": ["k1", "k2", "p1", "p2"],
+    "downsample_cameras": false,
+    "scale_factor": 1.0
+  },
+  "remaining_unproved": [
+    "physical ground-truth calibration accuracy",
+    "cause of K's cross-flight full-window reversal",
+    "mediation share from P4 initialization versus post-release backend",
+    "generalization beyond fly1 and fly3",
+    "any T_C_I or time-offset conclusion"
+  ]
+}

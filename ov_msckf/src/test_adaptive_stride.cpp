@@ -1,417 +1,331 @@
-#include "feat/Feature.h"
-#include "feat/FeatureDatabase.h"
-#include "core/BackendUpdateTrigger.h"
 #include "core/AlignmentFrameSelector.h"
+#include "core/BackendUpdateTrigger.h"
 #include "core/VisualCadencePlanner.h"
-#include "ros_free/AdaptiveStrideController.h"
+#include "ros_free/AdaptiveVisualScheduler.h"
 
+#include <Eigen/Dense>
 #include <cassert>
 #include <cmath>
 #include <iostream>
-#include <string>
-
-using ov_msckf::AdaptivePolicyState;
-using ov_msckf::AdaptiveStrideController;
-using ov_msckf::AdaptiveStrideDecision;
-using ov_msckf::AdaptiveStrideInput;
 
 namespace {
 
-AdaptiveStrideInput healthy(double t, double height = 180.0) {
-  AdaptiveStrideInput in;
-  in.timestamp = t;
-  in.initialized = true;
-  in.relative_height_m = height;
-  in.horizontal_speed_mps = 35.0;
-  in.vertical_speed_mps = 0.0;
-  in.roll_deg = 1.0;
-  in.pitch_deg = 2.0;
-  in.gyro_norm_radps = 0.03;
-  in.actual_received_camera_dt_s = 1.0 / 30.0;
-  in.active_msckf_features = 320;
-  in.active_slam_features = 40;
-  in.configured_feature_count = 400;
-  in.median_track_age_frames = 12.0;
-  in.msckf_input_count = 20;
-  in.msckf_accepted_count = 10;
-  in.msckf_rejected_count = 10;
-  in.time_since_accepted_backend_update_s = 0.2;
-  in.parallax_measurement_timestamp_s = t;
-  in.parallax_measurement_dt_s = 0.1;
-  in.median_parallax_px = 0.5;
-  in.p95_parallax_px = 0.8;
-  in.raw_median_parallax_px = 0.6;
-  in.raw_p95_parallax_px = 1.0;
-  in.rotation_median_parallax_px = 0.1;
-  in.rotation_p95_parallax_px = 0.2;
-  in.track_survival_ratio = 0.8;
-  in.common_track_count = 300;
-  return in;
+ov_msckf::VisualMotionMetrics healthy_motion(double dt, double comp_median,
+                                             double comp_p95) {
+  ov_msckf::VisualMotionMetrics motion;
+  motion.valid = true;
+  motion.dt_s = dt;
+  motion.previous_tracks = 100;
+  motion.current_tracks = 95;
+  motion.common_tracks = 90;
+  motion.effective_track_count = 80.0;
+  motion.survival_ratio = 0.90;
+  motion.median_track_age = 8.0;
+  motion.grid_occupancy_ratio = 0.75;
+  motion.grid_entropy = 0.85;
+  motion.border_track_ratio = 0.10;
+  motion.raw_median_px = comp_median;
+  motion.raw_p95_px = std::max(comp_p95, comp_median);
+  motion.rotation_median_px = 0.0;
+  motion.rotation_p95_px = 0.0;
+  motion.rotation_max_px = 0.0;
+  motion.compensated_median_px = comp_median;
+  motion.compensated_p95_px = comp_p95;
+  motion.compensated_sigma_px = 0.5;
+  motion.compensated_p95_ucb_px = comp_p95 + 0.1;
+  return motion;
 }
 
-AdaptiveStrideDecision run_until(AdaptiveStrideController &controller,
-                                 double t0, double t1, double dt,
-                                 double height = 180.0) {
-  AdaptiveStrideDecision out;
-  for (double t = t0; t <= t1 + 1.0e-9; t += dt)
-    out = controller.update(healthy(t, height));
-  return out;
-}
-
-AdaptiveStrideDecision enter_high(AdaptiveStrideController &controller) {
-  return run_until(controller, 0.0, 7.0, 0.1, 180.0);
-}
-
-void add_flow(AdaptiveStrideInput &in, double tracker_dt, double flow_px,
-              double p95_px) {
-  in.parallax_measurement_timestamp_s = in.timestamp;
-  in.parallax_measurement_dt_s = tracker_dt;
-  in.median_parallax_px = flow_px;
-  in.p95_parallax_px = p95_px;
+ov_msckf::ContinuousTrackingPlannerInput
+tracking_input(double timestamp, double measured_flow) {
+  ov_msckf::ContinuousTrackingPlannerInput input;
+  input.timestamp = timestamp;
+  input.motion_measurement_timestamp_s = timestamp;
+  input.raw_camera_dt_s = 1.0 / 30.0;
+  input.motion = healthy_motion(0.1, measured_flow, measured_flow * 1.4);
+  return input;
 }
 
 } // namespace
 
 int main() {
-  // 1. Stable low-motion high-altitude cruise reaches the target-parallax cap.
-  {
-    AdaptiveStrideController c;
-    const auto d = enter_high(c);
-    assert(d.state == AdaptivePolicyState::HIGH_ALTITUDE_CRUISE);
-    assert(d.tracking_stride == 12 && d.backend_update_stride == 12);
-  }
+  using namespace ov_msckf;
 
-  // 2. Descent causes an anticipatory downshift before low altitude.
+  // 1. Rotation-compensated motion retains translation while removing the
+  // known camera rotation, and computes spatial/effective support.
   {
-    AdaptiveStrideController c;
-    enter_high(c);
-    AdaptiveStrideDecision d;
-    for (int i = 71; i <= 100; ++i) {
-      auto in = healthy(0.1 * i, 180.0);
-      in.vertical_speed_mps = -3.0;
-      d = c.update(in);
-    }
-    assert(d.state == AdaptivePolicyState::DESCENT_SAFETY);
-    assert(d.backend_update_stride == 4);
-    assert(d.reason_descent);
-  }
-
-  // 3. Low altitude forces the registered safe cadence and sub-band.
-  {
-    AdaptiveStrideController c;
-    enter_high(c);
-    const auto d = c.update(healthy(7.1, 15.0));
-    assert(d.state == AdaptivePolicyState::LOW_ALTITUDE_SAFETY);
-    assert(d.low_altitude_band == 3);
-    assert(d.tracking_stride == 1 && d.backend_update_stride == 1);
-    assert(d.main_trigger == "low_altitude");
-  }
-
-  // 4. High angular rate enters turn safety immediately.
-  {
-    AdaptiveStrideController c;
-    enter_high(c);
-    auto in = healthy(7.1, 180.0);
-    in.gyro_norm_radps = 0.35;
-    in.roll_deg = 12.0;
-    const auto d = c.update(in);
-    assert(d.state == AdaptivePolicyState::TURN_SAFETY);
-    assert(d.main_trigger == "severe_turn");
-    assert(d.tracking_stride == 1 && d.backend_update_stride == 2);
-  }
-
-  // 5. Degraded visual health triggers an emergency downshift.
-  {
-    AdaptiveStrideController c;
-    enter_high(c);
-    AdaptiveStrideDecision d;
-    bool saw_emergency = false;
-    for (int i = 71; i <= 85; ++i) {
-      auto in = healthy(0.1 * i, 180.0);
-      in.active_msckf_features = 100;
-      d = c.update(in);
-      saw_emergency = saw_emergency || d.emergency_downshift;
-    }
-    assert(d.state == AdaptivePolicyState::VISUAL_DEGRADED);
-    assert(saw_emergency);
-    assert(d.main_trigger == "feature_emergency");
-    assert(d.tracking_stride == 1 && d.backend_update_stride == 1);
-  }
-
-  // 6. Recovery requires sustained stability.
-  {
-    AdaptiveStrideController c;
-    enter_high(c);
-    auto turn = healthy(7.1, 180.0);
-    turn.gyro_norm_radps = 0.35;
-    turn.roll_deg = 12.0;
-    assert(c.update(turn).state == AdaptivePolicyState::TURN_SAFETY);
-    auto d = run_until(c, 7.2, 10.9, 0.1, 180.0);
-    assert(d.state == AdaptivePolicyState::TURN_SAFETY);
-    d = c.update(healthy(12.8, 180.0));
-    assert(d.state == AdaptivePolicyState::HIGH_ALTITUDE_CRUISE);
-  }
-
-  // 7. Recovery publishes one bounded target, not a rung ladder.
-  {
-    AdaptiveStrideController c;
-    enter_high(c);
-    auto turn = healthy(7.1, 180.0);
-    turn.gyro_norm_radps = 0.35;
-    turn.roll_deg = 12.0;
-    c.update(turn);
-    int recovery_changes = 0;
-    AdaptiveStrideDecision recovered;
-    for (int i = 72; i <= 140; ++i) {
-      const auto d = c.update(healthy(0.1 * i, 180.0));
-      if (d.normal_recovery) {
-        recovery_changes++;
-        recovered = d;
-      }
-    }
-    assert(recovery_changes == 1);
-    assert(recovered.state == AdaptivePolicyState::HIGH_ALTITUDE_CRUISE);
-    assert(recovered.backend_update_stride == 12);
-  }
-
-  // 8. Noisy turn threshold input does not cause repeated reversal.
-  {
-    AdaptiveStrideController c;
-    enter_high(c);
-    int transitions = 0;
-    for (int i = 71; i <= 170; ++i) {
-      auto in = healthy(0.1 * i, 180.0);
-      in.roll_deg = (i % 2 == 0) ? 5.0 : 7.0;
-      const auto d = c.update(in);
-      transitions += d.policy_state_changed ? 1 : 0;
-      assert(!d.unnecessary_reversal);
-    }
-    assert(transitions == 0);
-    assert(c.policy_state() == AdaptivePolicyState::HIGH_ALTITUDE_CRUISE);
-  }
-
-  // 9. Pixel displacement uses actual raw-camera dt.
-  {
-    AdaptiveStrideController c;
-    auto in = healthy(0.0, 80.0);
-    in.actual_received_camera_dt_s = 0.02;
-    add_flow(in, 0.10, 10.0, 15.0);
-    auto d = c.update(in);
-    assert(std::fabs(d.normalized_parallax_px - 2.0) < 1.0e-9);
-    in.timestamp = 0.1;
-    in.actual_received_camera_dt_s = 0.04;
-    add_flow(in, 0.10, 10.0, 15.0);
-    d = c.update(in);
-    assert(std::fabs(d.normalized_parallax_px - 4.0) < 1.0e-9);
-  }
-
-  // 10. Previous recommendation is not used as the measured interval.
-  {
-    AdaptiveStrideController sparse;
-    enter_high(sparse);
-    auto in = healthy(7.1, 180.0);
-    in.actual_received_camera_dt_s = 1.0 / 30.0;
-    add_flow(in, 0.2, 12.0, 18.0);
-    const auto d = sparse.update(in);
-    assert(d.backend_update_stride == 12);
-    assert(std::fabs(d.normalized_parallax_px -
-                     d.filtered_parallax_rate_pxps *
-                         in.actual_received_camera_dt_s) < 1.0e-9);
-  }
-
-  // 11. Tracking and backend cadences are independently controlled.
-  {
-    AdaptiveStrideController c;
-    enter_high(c);
-    auto input = healthy(7.1, 180.0);
-    add_flow(input, 0.2, 12.0, 18.0);
-    const auto d = c.update(input);
-    assert(d.tracking_stride < d.backend_update_stride);
-    assert(d.tracking_stride <= d.backend_update_stride);
-    assert(d.backend_update_stride == 12);
-  }
-
-  // 12/13. A tracking-only timestamp is removed from backend storage while
-  // the same feature ID remains continuous across eligible timestamps.
-  {
-    ov_core::FeatureDatabase db;
-    constexpr size_t id = 42;
-    db.update_feature(id, 1.0, 0, 10, 20, 0.1f, 0.2f);
-    db.update_feature(id, 2.0, 0, 11, 21, 0.11f, 0.21f);
-    assert(db.features_containing(2.0).size() == 1);
-    db.cleanup_measurements_exact(2.0);
-    assert(db.features_containing(2.0).empty());
-    assert(db.get_feature(id) != nullptr);
-    db.update_feature(id, 3.0, 0, 12, 22, 0.12f, 0.22f);
-    const auto feature = db.get_feature(id);
-    assert(feature != nullptr && feature->featid == id);
-    assert(feature->timestamps.at(0).size() == 2);
-    assert(feature->timestamps.at(0).at(0) == 1.0);
-    assert(feature->timestamps.at(0).at(1) == 3.0);
-  }
-
-  // 14. Emergency downshift bypasses recovery dwell.
-  {
-    AdaptiveStrideController c;
-    enter_high(c);
-    auto in = healthy(7.01, 180.0);
-    in.covariance_all_finite = false;
-    const auto d = c.update(in);
-    assert(d.policy_state_changed);
-    assert(d.state == AdaptivePolicyState::VISUAL_DEGRADED);
-    assert(d.transition_guard_s == 0.0);
-  }
-
-  // 15. A stable state never rewrites the same target.
-  {
-    AdaptiveStrideController c;
-    enter_high(c);
-    for (int i = 71; i <= 200; ++i) {
-      const auto d = c.update(healthy(0.1 * i, 180.0));
-      assert(!d.same_state_target_rewrite);
-      assert(!d.tracking_stride_changed);
-      assert(!d.backend_stride_changed);
-    }
-  }
-
-  // 16. Transition reasons and metrics are deterministic.
-  {
-    AdaptiveStrideController a;
-    AdaptiveStrideController b;
-    enter_high(a);
-    enter_high(b);
-    auto in = healthy(7.1, 180.0);
-    in.active_msckf_features = 100;
-    const auto da = a.update(in);
-    const auto db = b.update(in);
-    assert(da.policy_state == db.policy_state);
-    assert(da.main_trigger == db.main_trigger);
-    assert(da.transition_reason == db.transition_reason);
-    assert(da.emergency_downshift == db.emergency_downshift);
-    assert(da.tracking_stride == db.tracking_stride);
-    assert(da.backend_update_stride == db.backend_update_stride);
-  }
-
-  // 17. Rotation-compensated motion separates raw rotation and translation.
-  {
-    ov_msckf::VisualFrameSnapshot previous;
-    ov_msckf::VisualFrameSnapshot current;
+    VisualFrameSnapshot previous;
+    VisualFrameSnapshot current;
     previous.timestamp = 0.0;
     current.timestamp = 0.1;
     const Eigen::Matrix3d rotation =
-        Eigen::AngleAxisd(0.02, Eigen::Vector3d::UnitZ()).toRotationMatrix();
-    for (size_t id = 0; id < 20; ++id) {
-      ov_msckf::VisualTrackPoint old;
+        Eigen::AngleAxisd(0.02, Eigen::Vector3d::UnitY()).toRotationMatrix();
+    for (size_t id = 0; id < 48; ++id) {
+      VisualTrackPoint old;
       old.feature_id = id;
-      old.normalized = Eigen::Vector2d(-0.2 + 0.02 * id, 0.1);
-      old.raw = 400.0 * old.normalized + Eigen::Vector2d(640.0, 360.0);
-      old.track_age = 5;
       old.valid = true;
+      old.track_age = 8;
+      old.normalized = Eigen::Vector2d(
+          -0.6 + 0.2 * static_cast<double>(id % 7),
+          -0.4 + 0.2 * static_cast<double>((id / 7) % 5));
+      old.raw = Eigen::Vector2d(640.0 + 400.0 * old.normalized.x(),
+                                360.0 + 400.0 * old.normalized.y());
       Eigen::Vector3d ray(old.normalized.x(), old.normalized.y(), 1.0);
       ray = rotation * ray;
-      ov_msckf::VisualTrackPoint now = old;
+      VisualTrackPoint now = old;
       now.normalized = ray.head<2>() / ray.z() + Eigen::Vector2d(0.002, 0.0);
-      now.raw = 400.0 * now.normalized + Eigen::Vector2d(640.0, 360.0);
+      now.raw = Eigen::Vector2d(640.0 + 400.0 * now.normalized.x(),
+                                360.0 + 400.0 * now.normalized.y());
       previous.tracks.push_back(old);
       current.tracks.push_back(now);
     }
-    const auto motion = ov_msckf::compute_visual_motion_metrics(
-        previous, current, rotation, 400.0, 400.0);
-    assert(motion.valid && motion.rotation_median_px > 1.0);
+    const auto motion = compute_visual_motion_metrics(
+        previous, current, rotation, 400.0, 400.0, 1280, 720);
+    assert(motion.valid);
+    assert(motion.rotation_median_px > 1.0);
     assert(std::fabs(motion.compensated_median_px - 0.8) < 1e-6);
+    assert(motion.effective_track_count > 30.0);
+    assert(motion.grid_occupancy_ratio > 0.25);
+    assert(motion.compensated_p95_ucb_px >= motion.compensated_p95_px);
   }
 
-  // 18. Target-parallax cadence downshifts immediately and upshifts only
-  // after repeated safe observations.
+  // 2. The planner computes an arbitrary integer gap from a conservative
+  // fraction of the complete continuous safety horizon. Six is deliberately
+  // absent from the deleted legacy ladder.
   {
-    ov_msckf::VisualCadencePlanner planner;
-    ov_msckf::VisualCadencePlannerInput in;
-    in.raw_camera_dt_s = 1.0 / 30.0;
-    in.safety_stride_cap = 12;
-    in.motion.valid = true;
-    in.motion.dt_s = 0.1;
-    in.motion.common_tracks = 300;
-    in.motion.survival_ratio = 0.9;
-    in.motion.compensated_median_px = 0.5;
-    in.motion.compensated_p95_px = 0.8;
-    in.motion.raw_p95_px = 1.0;
-    in.motion.rotation_p95_px = 0.2;
-    in.timestamp = 0.0;
-    in.motion_measurement_timestamp_s = 0.0;
-    planner.update(in);
-    // Re-reading one KLT packet on skipped raw frames must not manufacture
-    // upshift confirmations.
-    for (int i = 1; i <= 10; ++i) {
-      in.timestamp = 0.03 * i;
-      planner.update(in);
-      assert(planner.current_stride() == 1);
-    }
-    for (int i = 1; i <= 3; ++i) {
-      in.timestamp = 0.2 * i;
-      in.motion_measurement_timestamp_s = in.timestamp;
-      planner.update(in);
-    }
-    assert(planner.current_stride() == 12);
-    in.timestamp = 0.7;
-    in.motion.valid = false;
-    in.motion_measurement_timestamp_s =
-        std::numeric_limits<double>::quiet_NaN();
-    const auto held = planner.update(in);
-    assert(held.stride == 12 &&
-           held.reason == "hold_until_new_motion_measurement");
-    in.motion.valid = true;
-    in.motion.compensated_median_px = 8.0;
-    in.motion.compensated_p95_px = 12.0;
-    in.motion.raw_p95_px = 15.0;
-    in.timestamp = 0.8;
-    in.motion_measurement_timestamp_s = 0.8;
-    const auto down = planner.update(in);
-    assert(down.immediate_downshift && down.stride < 12);
+    ContinuousTrackingPlanner planner;
+    auto input = tracking_input(0.0, 2.1);
+    auto first = planner.update(input);
+    assert(first.tracking_gap == 1);
+    input.timestamp = 0.6;
+    input.motion_measurement_timestamp_s = 0.6;
+    const auto expanded = planner.update(input);
+    assert(expanded.expansion_confirmed);
+    assert(std::fabs(expanded.target_horizon_s -
+                     0.5 * expanded.safe_horizon_s) < 1e-12);
+    assert(expanded.tracking_gap == 6);
   }
 
-  // 19. Backend update uses accumulated information; frame count is only the
-  // elapsed-time fallback.
+  // 3. A new unsafe rate contracts directly, without walking through a
+  // sequence of fixed modes or fixed stride choices.
   {
-    ov_msckf::BackendUpdateTrigger trigger;
-    ov_msckf::BackendUpdateTriggerInput in;
-    in.initialized = true;
-    in.timestamp = 1.0;
-    in.last_backend_timestamp = 0.8;
-    in.motion_from_last_backend.valid = true;
-    in.motion_from_last_backend.common_tracks = 100;
-    in.motion_from_last_backend.survival_ratio = 0.8;
-    in.motion_from_last_backend.compensated_median_px = 6.0;
-    auto decision = trigger.evaluate(in);
-    assert(decision.trigger && decision.information_trigger &&
-           !decision.latency_fallback);
-    in.timestamp = 1.4;
-    in.motion_from_last_backend.compensated_median_px = 1.0;
-    decision = trigger.evaluate(in);
-    assert(decision.trigger && decision.latency_fallback);
+    ContinuousTrackingPlanner planner;
+    auto input = tracking_input(0.0, 2.1);
+    planner.update(input);
+    input.timestamp = 0.6;
+    input.motion_measurement_timestamp_s = 0.6;
+    assert(planner.update(input).tracking_gap == 6);
+    input = tracking_input(0.7, 10.0);
+    const auto contracted = planner.update(input);
+    assert(contracted.immediate_contraction);
+    assert(contracted.tracking_gap < 6);
   }
 
-  // 20. Polygon overlap uses the projected calibrated footprint, not a scalar
-  // speed/height approximation.
+  // 4. Re-reading the same KLT pair does not advance expansion confirmation.
   {
-    ov_msckf::GroundFootprintOverlapInput in;
-    in.R_GtoC = Eigen::Matrix3d::Identity();
-    in.p_CinG = Eigen::Vector3d(0.0, 0.0, 10.0);
-    in.velocity_G = Eigen::Vector3d(1.0, 0.0, 0.0);
-    in.ground_height_G = 0.0;
-    in.prediction_horizon_s = 1.0;
-    in.corner_rays_C = {Eigen::Vector3d(-1.0, -1.0, -1.0),
-                        Eigen::Vector3d(1.0, -1.0, -1.0),
-                        Eigen::Vector3d(1.0, 1.0, -1.0),
-                        Eigen::Vector3d(-1.0, 1.0, -1.0)};
-    const double overlap = ov_msckf::ground_footprint_polygon_overlap(in);
-    assert(std::isfinite(overlap) && overlap > 0.8 && overlap < 1.0);
+    ContinuousTrackingPlanner planner;
+    auto input = tracking_input(0.0, 2.1);
+    planner.update(input);
+    input.timestamp = 0.4;
+    const auto held = planner.update(input);
+    assert(!held.new_motion_measurement);
+    assert(held.tracking_gap == 1);
+    assert(held.reason == "hold_until_new_motion_measurement");
   }
 
-  // 21. Alignment frame selection keeps the first/tail or informative frames
-  // and rejects redundant/high-rate frames while remaining bounded.
+  // 5. A stale motion packet forces dense tracking on wall-clock time.
   {
-    ov_msckf::AlignmentFrameSelector selector;
-    ov_msckf::AlignmentFrameSelectionInput input;
+    ContinuousTrackingPlanner planner;
+    auto input = tracking_input(0.0, 2.1);
+    planner.update(input);
+    input.timestamp = 1.0;
+    const auto stale = planner.update(input);
+    assert(stale.tracking_gap == 1);
+    assert(stale.reason == "motion_stale");
+  }
+
+  // 6. Poor image coverage is a protection condition, not a flight-state
+  // label mapped to a preselected cadence.
+  {
+    ContinuousTrackingPlanner planner;
+    auto input = tracking_input(0.0, 2.1);
+    input.motion.grid_occupancy_ratio = 0.1;
+    const auto decision = planner.update(input);
+    assert(decision.tracking_gap == 1);
+    assert(decision.reason == "insufficient_spatial_support");
+  }
+
+  // 7. The outer scheduler consumes estimator health only as a dense safety
+  // override; it has no HIGH/NORMAL/TURN/LOW stride table.
+  {
+    AdaptiveVisualScheduler scheduler;
+    AdaptiveVisualSchedulerInput input;
+    input.timestamp = 0.0;
+    input.initialized = true;
+    input.raw_camera_dt_s = 1.0 / 30.0;
+    input.motion_measurement_timestamp_s = 0.0;
+    input.motion = healthy_motion(0.1, 2.1, 3.0);
+    input.active_feature_count = 90;
+    input.covariance_all_finite = false;
+    const auto protected_decision = scheduler.update(input);
+    assert(protected_decision.estimator_protection);
+    assert(protected_decision.tracking_gap == 1);
+    assert(protected_decision.mode ==
+           AdaptiveVisualMode::ESTIMATOR_PROTECTION);
+
+    // State motion between different timestamps is intentionally absent from
+    // this interface. Only a correction measured before/after the visual EKF
+    // update at one timestamp may trigger the correction safety override.
+    AdaptiveVisualScheduler correction_scheduler;
+    input.covariance_all_finite = true;
+    input.visual_state_correction_valid = true;
+    input.visual_position_correction_m = 6.0;
+    const auto correction_protected = correction_scheduler.update(input);
+    assert(correction_protected.estimator_protection);
+    assert(correction_protected.tracking_gap == 1);
+  }
+
+  // 8. Backend bootstrap requests a frame but does not by itself claim that a
+  // clone/reference has been committed.
+  {
+    AdaptiveBackendScheduler scheduler;
+    AdaptiveBackendSchedulerInput input;
+    input.initialized = true;
+    input.timestamp = 1.0;
+    const auto decision = scheduler.evaluate(input);
+    assert(decision.trigger && decision.bootstrap_trigger);
+    assert(!backend_reference_commit_allowed(decision.trigger, true, false));
+    assert(backend_reference_commit_allowed(decision.trigger, true, true));
+  }
+
+  // 9. Healthy translation geometry triggers on information accumulated from
+  // the last actual clone.
+  {
+    AdaptiveBackendScheduler scheduler;
+    AdaptiveBackendSchedulerInput input;
+    input.initialized = true;
+    input.timestamp = 1.4;
+    input.last_actual_clone_timestamp = 1.0;
+    input.clone_capacity = 10;
+    input.motion_from_last_clone = healthy_motion(0.4, 12.0, 16.0);
+    const auto decision = scheduler.evaluate(input);
+    assert(decision.trigger && decision.information_trigger);
+    assert(decision.information_score > 8.0);
+    assert(decision.temporal_support_ready);
+  }
+
+  // 10. Direct image information alone must not collapse the bounded clone window
+  // to a tiny real-time span.
+  {
+    AdaptiveBackendScheduler scheduler;
+    AdaptiveBackendSchedulerInput input;
+    input.initialized = true;
+    input.timestamp = 1.2;
+    input.last_actual_clone_timestamp = 1.0;
+    input.clone_capacity = 10;
+    input.motion_from_last_clone = healthy_motion(0.2, 16.0, 20.0);
+    const auto decision = scheduler.evaluate(input);
+    assert(!decision.trigger);
+    assert(!decision.temporal_support_ready);
+    assert(decision.reason == "accumulate_temporal_window_support");
+  }
+
+  // 11. Pure rotation is not mistaken for translation information.
+  {
+    AdaptiveBackendScheduler scheduler;
+    AdaptiveBackendSchedulerInput input;
+    input.initialized = true;
+    input.timestamp = 1.2;
+    input.last_actual_clone_timestamp = 1.0;
+    input.motion_from_last_clone = healthy_motion(0.2, 0.5, 1.0);
+    input.motion_from_last_clone.rotation_median_px = 12.0;
+    input.motion_from_last_clone.rotation_p95_px = 18.0;
+    const auto decision = scheduler.evaluate(input);
+    assert(!decision.trigger && decision.pure_rotation);
+    assert(decision.reason == "accumulate_through_pure_rotation");
+  }
+
+  // 12. Maximum real-time latency eventually creates a clone even during
+  // pure rotation, and records that visual translation information did not
+  // cause the trigger.
+  {
+    AdaptiveBackendScheduler scheduler;
+    AdaptiveBackendSchedulerInput input;
+    input.initialized = true;
+    input.timestamp = 1.6;
+    input.last_actual_clone_timestamp = 1.0;
+    input.motion_from_last_clone = healthy_motion(0.6, 0.5, 1.0);
+    input.motion_from_last_clone.rotation_median_px = 12.0;
+    const auto decision = scheduler.evaluate(input);
+    assert(decision.trigger && decision.latency_trigger);
+    assert(decision.pure_rotation);
+    assert(decision.forced_without_visual_information);
+  }
+
+  // 13. Track termination cannot collapse the clone window to the camera
+  // period. It is released only after real temporal support is available.
+  {
+    AdaptiveBackendScheduler scheduler;
+    AdaptiveBackendSchedulerInput input;
+    input.initialized = true;
+    input.timestamp = 1.1;
+    input.last_actual_clone_timestamp = 1.0;
+    input.clone_capacity = 10;
+    input.motion_from_last_clone = healthy_motion(0.1, 1.0, 2.0);
+    input.motion_from_last_clone.common_tracks = 10;
+    const auto early = scheduler.evaluate(input);
+    assert(!early.trigger);
+    assert(!early.temporal_support_ready);
+    assert(early.reason == "accumulate_termination_temporal_support");
+
+    input.timestamp = 1.4;
+    input.motion_from_last_clone.dt_s = 0.4;
+    const auto supported = scheduler.evaluate(input);
+    assert(supported.trigger && supported.termination_trigger);
+    assert(supported.temporal_support_ready);
+    assert(!supported.forced_without_visual_information);
+  }
+
+  // 14. Reliable height enters as continuous projected-footprint geometry;
+  // it does not select a height-band cadence.
+  {
+    GroundFootprintPredictionInput footprint;
+    footprint.valid = true;
+    footprint.R_GtoC = Eigen::Matrix3d::Identity();
+    footprint.p_CinG = Eigen::Vector3d(0.0, 0.0, 10.0);
+    footprint.velocity_G = Eigen::Vector3d(2.0, 0.0, 0.0);
+    footprint.ground_height_G = 0.0;
+    footprint.corner_rays_C = {
+        Eigen::Vector3d(-1.0, -1.0, -1.0),
+        Eigen::Vector3d(1.0, -1.0, -1.0),
+        Eigen::Vector3d(1.0, 1.0, -1.0),
+        Eigen::Vector3d(-1.0, 1.0, -1.0)};
+    const double near_overlap = ground_footprint_overlap(footprint, 0.1);
+    const double far_overlap = ground_footprint_overlap(footprint, 1.0);
+    assert(std::isfinite(near_overlap) && std::isfinite(far_overlap));
+    assert(near_overlap > far_overlap);
+
+    ContinuousTrackingPlannerConfig config;
+    config.upshift_confirmation_duration_s = 0.0;
+    ContinuousTrackingPlanner low_height_planner(config);
+    ContinuousTrackingPlanner high_height_planner(config);
+    auto low_input = tracking_input(0.0, 0.1);
+    low_input.ground_footprint = footprint;
+    low_input.ground_footprint.velocity_G =
+        Eigen::Vector3d(20.0, 0.0, 0.0);
+    auto high_input = low_input;
+    high_input.ground_footprint.p_CinG.z() = 100.0;
+    const auto low_decision = low_height_planner.update(low_input);
+    const auto high_decision = high_height_planner.update(high_input);
+    assert(low_decision.ground_geometry_valid);
+    assert(high_decision.ground_geometry_valid);
+    assert(low_decision.tracking_gap < high_decision.tracking_gap);
+  }
+
+  // 15. P4 frame selection remains a separate contract from P5 cadence.
+  {
+    AlignmentFrameSelector selector;
+    AlignmentFrameSelectionInput input;
     input.timestamp = 0.0;
     input.common_tracks = 100;
     input.survival_ratio = 0.9;
@@ -422,11 +336,8 @@ int main() {
     input.timestamp = 0.2;
     input.compensated_parallax_px = 4.0;
     assert(selector.evaluate(input).selected);
-    input.timestamp = 1.0;
-    input.high_angular_rate = true;
-    assert(!selector.evaluate(input).selected);
   }
 
-  std::cout << "P4/P5 visual scheduling tests 1-21 passed\n";
+  std::cout << "continuous adaptive visual scheduling tests 1-15 passed\n";
   return 0;
 }

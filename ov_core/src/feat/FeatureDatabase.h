@@ -158,6 +158,13 @@ public:
   void cleanup_measurements_exact(double timestamp);
 
   /**
+   * @brief Remove complete tracks for feature IDs whose measurements have
+   * already been consumed by an external batch posterior.
+   * @return Number of tracks removed from the database.
+   */
+  size_t remove_features(const std::vector<size_t> &feature_ids);
+
+  /**
    * @brief Returns the size of the feature database
    */
   size_t size() {

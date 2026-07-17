@@ -120,7 +120,10 @@ def load_traj(path: str | Path) -> pd.DataFrame:
         if not s or s.startswith("#"):
             continue
         vals = [float(v) for v in s.split()]
-        if len(vals) >= 4:
+        if len(vals) >= 11:
+            # OpenVINS traj_nav.txt: t x y z vx vy vz qx qy qz qw.
+            rows.append(vals[:4] + vals[7:11])
+        elif len(vals) >= 4:
             rows.append(vals[:8])
     if not rows:
         raise ValueError(f"No trajectory rows in {path}")
@@ -432,6 +435,7 @@ def segment_flight_from_macro_csv(
         complete_flags = complete_flags.map(
             lambda value: str(value).strip().lower() in {"true", "1", "yes"})
         if (len(lap_rows) == 4 and complete_flags.all()
+                and float(lap_rows["t_start"].min()) >= float(t[0]) - 1e-6
                 and float(lap_rows["t_end"].max()) <= float(t[-1]) + 1e-6):
             complete_lap_ids.add(int(lap_value))
     for _, src in source.iterrows():

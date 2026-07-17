@@ -23,6 +23,7 @@
 #define OV_MSCKF_STATE_HELPER_H
 
 #include <Eigen/Eigen>
+#include <cstddef>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -44,6 +45,7 @@ using VisualOcFn = std::function<Eigen::MatrixXd(
 
 namespace ov_msckf {
 
+class Propagator;
 class State;
 
 /**
@@ -63,6 +65,8 @@ public:
     PER_BLOCK_SCALE                  =  1, // internal "no yaw update" scale path
     GLOBAL_YAW_OC_PROJECTION         =  2, // post-chi2 OC, current gauge
     GLOBAL_YAW_OC_FEJ_PROJECTION     = 10, // post-chi2 OC, FEJ gauge
+    GLOBAL_YAW_OC_CENTERED_PROJECTION = 11, // post-chi2 OC, current gauge centered at oldest clone
+    GLOBAL_4DOF_OC_PROJECTION        = 12, // post-chi2 OC, origin-invariant [yaw, tx, ty, tz] gauge
     // (msckf2_0 / oc_prechi2 is dispatched via VisualObservabilityPolicy::is_prechi2_mode_string, not this enum)
   };
 
@@ -72,6 +76,104 @@ public:
     double dx_yaw_before_projection_deg = 0.0;
     double dx_yaw_after_projection_deg = 0.0;
   };
+
+  /**
+   * @brief Result of an atomic scene-scale reset.
+   *
+   * A successful identity reset has `success=true` and
+   * `state_changed=false`. On failure, `failure_reason` is populated and the
+   * state, covariance, and propagator cache are left untouched.
+   */
+  struct Sim3ScaleResetResult {
+    bool success = false;
+    bool state_changed = false;
+    bool propagator_cache_invalidated = false;
+    double scale = std::numeric_limits<double>::quiet_NaN();
+    std::size_t camera_id = 0;
+    Eigen::Vector3d pivot_camera_center = Eigen::Vector3d::Constant(
+        std::numeric_limits<double>::quiet_NaN());
+    double covariance_min_eigenvalue =
+        std::numeric_limits<double>::quiet_NaN();
+    /// True when a roundoff-sized negative covariance mode was clipped.
+    bool covariance_psd_projected = false;
+    /// Spectral norm of the required/applied PSD correction.
+    double covariance_psd_projection_magnitude = 0.0;
+    /// Maximum correction accepted as eigensolver/matrix-product roundoff.
+    double covariance_psd_projection_limit =
+        std::numeric_limits<double>::quiet_NaN();
+    std::string failure_reason;
+  };
+
+  /**
+   * @brief Atomically apply a pivoted Sim(3) scene-scale reset.
+   *
+   * The specified camera center at the active IMU time is the pivot. The
+   * active velocity, clone camera centers, and every SLAM landmark are
+   * reparameterized while orientation, biases, intrinsics, and camera-IMU
+   * extrinsics remain unchanged. Nominal and FEJ values are transformed in
+   * lockstep, and the complete covariance is reset with `P' = J P J^T`.
+   *
+   * This implementation is deliberately fail-closed for a single camera:
+   * `state->_options.num_cameras` must be one and `camera_id` must be zero.
+   * The operation validates the complete state and both prior/candidate
+   * covariance matrices before committing. Any failed check rolls back the
+   * full transaction. Only machine-roundoff-sized negative covariance modes
+   * may be projected to zero, with the correction reported in the result. A
+   * non-null propagator is required for a non-identity reset so its
+   * fast-propagation cache can be invalidated after commit.
+   *
+   * @param state State and covariance to reset.
+   * @param scale Strictly positive scene scale.
+   * @param propagator Propagator whose fast-state cache must be invalidated.
+   * @param camera_id Camera whose current center defines the pivot.
+   */
+  static Sim3ScaleResetResult apply_sim3_scale_reset(
+      std::shared_ptr<State> state, double scale, Propagator *propagator,
+      std::size_t camera_id = 0);
+
+  struct GlobalYawTranslationResetResult {
+    bool success = false;
+    bool state_changed = false;
+    bool propagator_cache_invalidated = false;
+    double scale = 1.0;
+    double yaw_delta_rad = std::numeric_limits<double>::quiet_NaN();
+    Eigen::Vector3d translation = Eigen::Vector3d::Constant(
+        std::numeric_limits<double>::quiet_NaN());
+    double covariance_min_eigenvalue =
+        std::numeric_limits<double>::quiet_NaN();
+    bool covariance_psd_projected = false;
+    double covariance_psd_projection_magnitude = 0.0;
+    double covariance_psd_projection_limit =
+        std::numeric_limits<double>::quiet_NaN();
+    std::string failure_reason;
+  };
+
+  /**
+   * @brief Atomically change the VIO global yaw and translation gauge.
+   *
+   * The current IMU position is mapped exactly to `target_imu_position`.
+   * Current/FEJ IMU state, clones, global landmarks, and the complete
+   * covariance are transformed together. Velocity is rotated; biases,
+   * calibration, and anchor-frame landmark parameters are preserved.
+   */
+  static GlobalYawTranslationResetResult apply_global_yaw_translation_reset(
+      std::shared_ptr<State> state, double yaw_delta_rad,
+      const Eigen::Vector3d &target_imu_position, Propagator *propagator);
+
+  /**
+   * @brief Atomically apply startup metric scale, global yaw, and translation.
+   *
+   * Scale is first applied with the current camera center as pivot so fixed
+   * camera--IMU lever arms and every supported landmark representation retain
+   * reprojection geometry. The yaw/translation transaction then maps the
+   * active IMU exactly to `target_imu_position`. If either stage fails, all
+   * nominal values, FEJ values, and the complete covariance are restored.
+   */
+  static GlobalYawTranslationResetResult
+  apply_global_yaw_scale_translation_reset(
+      std::shared_ptr<State> state, double scale, double yaw_delta_rad,
+      const Eigen::Vector3d &target_imu_position, Propagator *propagator,
+      std::size_t camera_id = 0);
 
   /**
    * @brief Performs EKF propagation of the state covariance.
@@ -118,7 +220,8 @@ public:
                         VisualYawUpdateMode visual_yaw_update_mode = VisualYawUpdateMode::ORIGINAL,
                         double visual_yaw_update_scale = 1.0,
                         double visual_global_yaw_oc_alpha = 0.0,
-                        double visual_bgz_update_scale = 1.0);
+                        double visual_bgz_update_scale = 1.0,
+                        double visual_imu_yaw_gain_scale = 1.0);
 
   struct UpdateDiagnostics {
     bool valid = false;
@@ -166,6 +269,14 @@ public:
       double visual_global_yaw_oc_alpha = 0.0,
       double visual_bgz_update_scale = 1.0);
 
+  static Eigen::MatrixXd project_visual_measurement_jacobian(
+      std::shared_ptr<State> state,
+      const std::vector<std::shared_ptr<ov_type::Type>> &H_order,
+      const Eigen::MatrixXd &H,
+      VisualYawUpdateMode visual_yaw_update_mode,
+      double visual_yaw_update_scale,
+      double visual_global_yaw_oc_alpha);
+
   static Eigen::VectorXd compute_update_dx(std::shared_ptr<State> state,
                                            const std::vector<std::shared_ptr<ov_type::Type>> &H_order,
                                            const Eigen::MatrixXd &H, const Eigen::VectorXd &res,
@@ -190,6 +301,37 @@ public:
    */
   static void set_initial_covariance(std::shared_ptr<State> state, const Eigen::MatrixXd &covariance,
                                      const std::vector<std::shared_ptr<ov_type::Type>> &order);
+
+  /**
+   * @brief Apply the OpenVINS dynamic-initializer covariance inflation.
+   *
+   * The covariance order must start with [attitude, position, velocity,
+   * gyro bias, accelerometer bias]. The four arguments are covariance
+   * multipliers, not standard-deviation multipliers. Matching the upstream
+   * DynamicInitializer contract, only those four 3x3 diagonal blocks are
+   * inflated; position and all cross-covariances remain unchanged.
+   */
+  static bool inflate_initial_imu_subspace_covariance(
+      Eigen::MatrixXd &joint_covariance, double orientation_inflation,
+      double velocity_inflation, double gyro_bias_inflation,
+      double accel_bias_inflation, std::string *failure_reason);
+
+  /**
+   * @brief Atomically initialize an active IMU state and historical pose clones.
+   *
+   * The covariance order is exactly [active IMU(15), clone_0(6), ...,
+   * landmark_0(3), ...].
+   * Every clone timestamp must be strictly increasing and older than the
+   * active timestamp. No state mutation occurs when validation fails.
+   */
+  static bool initialize_with_pose_history(
+      std::shared_ptr<State> state, double active_timestamp,
+      const Eigen::Matrix<double, 16, 1> &imu_state,
+      const std::vector<double> &clone_timestamps,
+      const std::vector<Eigen::Matrix<double, 7, 1>> &clone_states,
+      const std::vector<size_t> &landmark_feature_ids,
+      const std::vector<Eigen::Vector3d> &landmark_positions,
+      const Eigen::MatrixXd &joint_covariance, std::string *failure_reason);
 
   /**
    * @brief Inject noise into the position-z element of the state covariance.
@@ -409,7 +551,8 @@ public:
                          VisualYawUpdateMode visual_yaw_update_mode = VisualYawUpdateMode::ORIGINAL,
                          double visual_yaw_update_scale = 1.0,
                          double visual_global_yaw_oc_alpha = 0.0,
-                         VisualOcFn oc_fn = nullptr);
+                         VisualOcFn oc_fn = nullptr,
+                         double visual_imu_yaw_gain_scale = 1.0);
 
   /**
    * @brief Initializes new variable into covariance (H_L must be invertible)

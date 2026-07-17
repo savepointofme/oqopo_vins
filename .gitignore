@@ -75,3 +75,11 @@ baseline/legacy_quarantine_20260625/*
 # Local draft material kept in the workspace but excluded from the clean baseline.
 docs/patent/
 ov_msckf/scripts/run_d455_fly123_nocal.sh
+
+# Local build/test/process artifacts. Keep source, run specs and small evidence,
+# but never publish generated binaries or stale background-process receipts.
+build_*/
+Testing/
+*.pid
+*.out.log
+*.err.log

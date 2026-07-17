@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 
 import numpy as np
@@ -42,10 +43,116 @@ SAMPLE_COLS = [
 LK_COLS = ["lk_E", "lk_N", "lk_U", "err_lk_XY"]
 
 
+def _first_present(mapping, *keys, default=None):
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+    return default
+
+
+def normalize_inputs(
+    df: pd.DataFrame,
+    seg_index: pd.DataFrame,
+    seg_err: pd.DataFrame,
+    summary: dict,
+    quality: dict,
+    meta: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict, dict, dict]:
+    """Normalize canonical full-flight tables to the browser data contract."""
+    df = df.copy()
+    seg_index = seg_index.copy()
+    seg_err = seg_err.copy()
+    summary = dict(summary)
+    quality = dict(quality)
+    meta = dict(meta)
+
+    if "cum_dist" not in df and "cum_dist_gps" in df:
+        df["cum_dist"] = df["cum_dist_gps"]
+    if "course_err_deg" not in df and "course_error_deg" in df:
+        df["course_err_deg"] = df["course_error_deg"]
+    if "vio_delay_s" not in df and "vio_sample_delay_ms" in df:
+        df["vio_delay_s"] = df["vio_sample_delay_ms"] / 1000.0
+    if "valid" not in df:
+        df["valid"] = True
+    if "gap" not in df:
+        df["gap"] = (
+            df["gps_gap_before"].astype(bool)
+            if "gps_gap_before" in df else False
+        )
+
+    if "segment_id" in df and "segment_id" in seg_index:
+        lookup = seg_index.set_index("segment_id")
+        for column in ("segment_heading_deg", "heading_source", "heading_quality"):
+            if column not in df and column in lookup:
+                df[column] = df["segment_id"].map(lookup[column])
+
+    aliases = {
+        "dist_m": "length_m",
+        "d_start": "dist_start_m",
+        "d_end": "dist_end_m",
+    }
+    for target, source in aliases.items():
+        if target not in seg_index and source in seg_index:
+            seg_index[target] = seg_index[source]
+    if "label" not in seg_index and "segment_type" in seg_index:
+        seg_index["label"] = seg_index["segment_type"].astype(str)
+
+    if "dist_m" not in seg_err:
+        source = "gps_dist_m" if "gps_dist_m" in seg_err else "length_m"
+        if source in seg_err:
+            seg_err["dist_m"] = seg_err[source]
+    if "local_drift_percent" not in seg_err and "xy_drift_percent" in seg_err:
+        seg_err["local_drift_percent"] = seg_err["xy_drift_percent"]
+    if "local_final_xy_error_m" not in seg_err:
+        source = (
+            "xy_error_growth_m"
+            if "xy_error_growth_m" in seg_err else "final_xy_error_m"
+        )
+        if source in seg_err:
+            seg_err["local_final_xy_error_m"] = seg_err[source]
+
+    summary.setdefault(
+        "yaw_or_course_rmse_deg", summary.get("yaw/course_rmse_deg")
+    )
+    summary.setdefault(
+        "yaw_or_course_final_deg", summary.get("yaw/course_final_deg")
+    )
+
+    quality.setdefault(
+        "gps_sample_count",
+        int(_first_present(quality, "gps_update_rows", default=len(df))),
+    )
+    quality.setdefault("valid_aligned_count", int(len(df)))
+    quality.setdefault(
+        "gps_gap_count",
+        int(_first_present(
+            quality,
+            "gps_gap_rows",
+            default=int(df["gap"].sum()) if "gap" in df else 0,
+        )),
+    )
+    quality.setdefault("invalid_delay_count", 0)
+    if "p95_delay_s" not in quality:
+        delay_ms = _first_present(quality, "vio_sample_delay_p95_ms")
+        quality["p95_delay_s"] = (
+            float(delay_ms) / 1000.0 if delay_ms is not None else None
+        )
+    quality.setdefault(
+        "velocity_source",
+        _first_present(quality, "gps_velocity_source", default=""),
+    )
+    meta.setdefault("alignment", summary.get("alignment_mode", ""))
+    meta.setdefault("velocity_source", quality.get("velocity_source", ""))
+    return df, seg_index, seg_err, summary, quality, meta
+
+
 def build_payload(df: pd.DataFrame, seg_index: pd.DataFrame, seg_err: pd.DataFrame,
                   summary: dict, quality: dict, meta: dict,
                   *, decimate_to: int = 4000) -> dict:
     """组装前端 JSON 数据契约。"""
+    df, seg_index, seg_err, summary, quality, meta = normalize_inputs(
+        df, seg_index, seg_err, summary, quality, meta
+    )
     cols = [c for c in SAMPLE_COLS if c in df.columns]
     cols += [c for c in LK_COLS if c in df.columns]
     sub = df[cols]
@@ -156,7 +263,7 @@ body{{font-family:"Microsoft YaHei","Noto Sans SC",system-ui,sans-serif;backgrou
 <body>
 <div class="topbar">
   <h1>飞行误差分析仪表板</h1><span class="sub">{out_folder}</span>
-  <span class="sp"></span><span class="b">{status}</span><span class="b">起点对齐 start-heading</span>
+  <span class="sp"></span><span class="b">{status}</span><span class="b">{alignment}</span>
 </div>
 <div id="app"></div>
 <script id="run-data" type="application/json">{payload}</script>
@@ -172,6 +279,42 @@ def _read_app_js() -> str:
         return f.read()
 
 
+def _json_safe(value):
+    """Return a browser-parseable JSON value tree.
+
+    Python's json encoder emits NaN/Infinity by default, but JSON.parse rejects
+    those tokens.  Summary and quality dictionaries can contain non-finite
+    values even though pandas records have already converted them to null.
+    """
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (float, np.floating)):
+        return float(value) if math.isfinite(float(value)) else None
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.bool_):
+        return bool(value)
+    return value
+
+
+def _embedded_run_data(html: str) -> str:
+    marker = '<script id="run-data" type="application/json">'
+    start = html.find(marker)
+    if start < 0:
+        raise ValueError("missing run-data script")
+    start += len(marker)
+    end = html.find("</script>", start)
+    if end < 0:
+        raise ValueError("unterminated run-data script")
+    return html[start:end]
+
+
+def _reject_nonfinite_constant(token: str):
+    raise ValueError(f"non-finite JSON constant: {token}")
+
+
 def validate_dashboard_html(html: str) -> None:
     """Fail fast if an interactive dashboard is not the SVG v2 format."""
     problems = []
@@ -182,6 +325,45 @@ def validate_dashboard_html(html: str) -> None:
     for marker in _FORBIDDEN_HTML_MARKERS:
         if marker in html:
             problems.append(f"contains {marker}")
+    try:
+        payload = json.loads(
+            _embedded_run_data(html),
+            parse_constant=_reject_nonfinite_constant,
+        )
+        samples = payload.get("samples", [])
+        if not samples:
+            problems.append("run-data has no samples")
+        else:
+            required_sample_fields = {
+                "t", "cum_dist", "gps_E", "gps_N", "vio_E", "vio_N",
+                "err_XY", "err_along", "err_cross", "err_vertical",
+                "course_err_deg", "segment_id",
+            }
+            missing = sorted(required_sample_fields - set(samples[0]))
+            if missing:
+                problems.append(
+                    "run-data samples missing fields: " + ", ".join(missing)
+                )
+            if not any(
+                row.get("cum_dist") is not None and row.get("err_XY") is not None
+                for row in samples
+            ):
+                problems.append("run-data has no drawable distance/error samples")
+        required_summary_fields = {
+            "gps_distance_km", "duration_s", "final_xy_error_m", "xy_rmse_m",
+            "yaw_or_course_rmse_deg", "yaw_or_course_final_deg",
+        }
+        missing = sorted(required_summary_fields - set(payload.get("summary", {})))
+        if missing:
+            problems.append("run-data summary missing fields: " + ", ".join(missing))
+        required_sampling_fields = {
+            "gps_sample_count", "valid_aligned_count", "p95_delay_s",
+        }
+        missing = sorted(required_sampling_fields - set(payload.get("sampling", {})))
+        if missing:
+            problems.append("run-data sampling missing fields: " + ", ".join(missing))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        problems.append(f"run-data is not strict JSON: {exc}")
     if problems:
         raise RuntimeError(f"{DASHBOARD_FORMAT_ERROR} ({'; '.join(problems)})")
 
@@ -198,8 +380,11 @@ def write_dashboard(payload: dict, reports_dir: str) -> str:
         experiment_id=meta.get("experiment_id", ""),
         out_folder=meta.get("out_folder", ""),
         status=meta.get("status", ""),
+        alignment=meta.get("alignment", "alignment not supplied"),
         # Escape closing script tags defensively before embedding JSON in HTML.
-        payload=json.dumps(payload, ensure_ascii=False).replace("</", "<\\/"),
+        payload=json.dumps(
+            _json_safe(payload), ensure_ascii=False, allow_nan=False
+        ).replace("</", "<\\/"),
         app_js=_read_app_js(),
     )
     validate_dashboard_html(html)

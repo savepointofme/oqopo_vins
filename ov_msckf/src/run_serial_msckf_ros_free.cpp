@@ -63,7 +63,7 @@
 #include "utils/sensor_data.h"
 
 #include "ros_free/DatasetReaderEuroc.h"
-#include "ros_free/AdaptiveStrideController.h"
+#include "ros_free/AdaptiveVisualScheduler.h"
 #include "ros_free/DiagLogger.h"
 #include "ros_free/DiagMetrics.h"
 #include "ros_free/DiagPrinter.h"
@@ -141,9 +141,15 @@ VisualMotionMetrics tracker_motion_metrics(
   std::vector<double> raw;
   std::vector<double> rotation;
   std::vector<double> compensated;
+  std::vector<double> ages;
+  std::vector<double> weights;
+  std::vector<Eigen::Vector2d> current_pixels;
   raw.reserve(count);
   rotation.reserve(count);
   compensated.reserve(count);
+  ages.reserve(count);
+  weights.reserve(count);
+  current_pixels.reserve(count);
   for (size_t index = 0; index < count; ++index) {
     const cv::Point2f &old = previous_raw[index];
     const cv::Point2f &predicted = rotation_prediction[index];
@@ -153,19 +159,22 @@ VisualMotionMetrics tracker_motion_metrics(
         std::hypot(predicted.x - old.x, predicted.y - old.y));
     compensated.push_back(std::hypot(current.x - predicted.x,
                                      current.y - predicted.y));
+    ages.push_back(1.0);
+    const double nx = packet.image_width > 0
+                          ? current.x / static_cast<double>(packet.image_width)
+                          : 0.5;
+    const double ny = packet.image_height > 0
+                          ? current.y / static_cast<double>(packet.image_height)
+                          : 0.5;
+    const double border_distance =
+        std::min(std::min(nx, 1.0 - nx), std::min(ny, 1.0 - ny));
+    weights.push_back(
+        std::max(0.20, std::min(1.0, border_distance / 0.08)));
+    current_pixels.emplace_back(current.x, current.y);
   }
-  out.raw_median_px = visual_percentile(raw, 0.5);
-  out.raw_p75_px = visual_percentile(raw, 0.75);
-  out.raw_p90_px = visual_percentile(raw, 0.90);
-  out.raw_p95_px = visual_percentile(raw, 0.95);
-  out.rotation_median_px = visual_percentile(rotation, 0.5);
-  out.rotation_p95_px = visual_percentile(rotation, 0.95);
-  out.rotation_max_px = visual_percentile(rotation, 1.0);
-  out.compensated_median_px = visual_percentile(compensated, 0.5);
-  out.compensated_p75_px = visual_percentile(compensated, 0.75);
-  out.compensated_p90_px = visual_percentile(compensated, 0.90);
-  out.compensated_p95_px = visual_percentile(compensated, 0.95);
-  out.valid = out.dt_s > 0.0 && count >= 4;
+  finalize_visual_motion_metrics(
+      out, raw, rotation, compensated, ages, weights, current_pixels,
+      packet.image_width, packet.image_height);
   return out;
 }
 
@@ -267,6 +276,7 @@ struct NavFrameState {
   double init_camera_timestamp = -1.0;
   double first_emitted_timestamp = -1.0;
   double selected_fc_timestamp = -1.0;
+  double camera_to_imu_time_offset_s = 0.0;
   double fc_time_offset = 0.0;
   double gps_timestamp = -1.0;
   double gps_age = std::numeric_limits<double>::quiet_NaN();
@@ -357,6 +367,38 @@ double parse_declared_scalar(const std::string &value,
   return scalar;
 }
 
+bool valid_post_alignment_visual_roi(const std::string &mode) {
+  return mode == "full" || mode == "left" || mode == "center" ||
+         mode == "right" || mode == "top" || mode == "bottom" ||
+         mode == "dynamic_turn";
+}
+
+void apply_post_alignment_visual_roi(cv::Mat &mask, const std::string &mode) {
+  if (mode == "full")
+    return;
+  if (mask.empty() || mask.type() != CV_8UC1)
+    throw std::runtime_error("post-alignment visual ROI requires a CV_8UC1 mask");
+
+  mask.setTo(cv::Scalar(255));
+  cv::Rect keep;
+  if (mode == "left") {
+    keep = cv::Rect(0, 0, std::max(1, mask.cols / 2), mask.rows);
+  } else if (mode == "right") {
+    const int x0 = mask.cols / 2;
+    keep = cv::Rect(x0, 0, mask.cols - x0, mask.rows);
+  } else if (mode == "top") {
+    keep = cv::Rect(0, 0, mask.cols, std::max(1, mask.rows / 2));
+  } else if (mode == "bottom") {
+    const int y0 = mask.rows / 2;
+    keep = cv::Rect(0, y0, mask.cols, mask.rows - y0);
+  } else {
+    const int x0 = mask.cols / 5;
+    const int y0 = mask.rows / 5;
+    keep = cv::Rect(x0, y0, mask.cols - 2 * x0, mask.rows - 2 * y0);
+  }
+  mask(keep).setTo(cv::Scalar(0));
+}
+
 struct Args {
   std::string config_path;
   std::string dataset_dir;
@@ -371,6 +413,14 @@ struct Args {
   std::string online_alignment_window_trace_path;
   bool online_alignment_disable_visual = false;
   bool online_alignment_navigation_allow_without_visual = false;
+  // The joint graph estimates both biases. The causal candidate filter has
+  // only FC position/velocity observations, so production keeps the graph
+  // bias estimates instead of changing them through cross-covariance alone.
+  bool online_alignment_retain_bg_prior = true;
+  bool online_alignment_retain_ba_prior = true;
+  bool online_alignment_release_attitude_from_fc = false;
+  bool online_alignment_diagnostic_graph_q_fc_pv_zero_bias = false;
+  bool online_alignment_diagnostic_never_anchor = false;
   std::string online_alignment_release_policy = "practical_navigation_start";
   double online_alignment_visual_perturbation_px = 0.0;
   double online_alignment_visual_perturbation_fraction = 0.0;
@@ -411,6 +461,7 @@ struct Args {
   double gps_alt_nasa_beta = 0.0;         // NASA underweight coefficient beta (>=0; 0 disables)
   double gps_alt_nasa_q_threshold = 0.0;  // NASA trigger on H'PH (m^2)
   bool gps_alt_joseph = false;           // PX4-style masked Joseph update (Gate 2)
+  bool gps_alt_guard_fallback_joseph_pz = false;
   bool gps_alt_ground_plane = false;     // Enable scalar height ground-plane updater
   bool gps_alt_ground_plane_rangefinder = false; // true: height column is rangefinder/LiDAR range
   // -- Stage B (ground-plane feature update) --
@@ -457,6 +508,11 @@ struct Args {
   std::string dash_title = "OpenVINS ROS-free Dashboard";
   int dash_every = 1;
   int cam_subsample = 1;         // --camera-frame-stride/--cam-subsample N: feed only 1 of every N camera frames to VIO
+  int post_alignment_camera_frame_stride = 0; // Diagnostic fixed stride after P4 release; 0 keeps cam_subsample.
+  std::string post_alignment_visual_roi = "full"; // Diagnostic KLT/MSCKF/SLAM image ROI after P4 release.
+  std::string dynamic_turn_roi_diag_path;
+  std::string agl_scene_scale_mode = "off";
+  std::string agl_scene_scale_diag_path;
   bool adaptive_stride_shadow = false; // calculate/log policy but preserve fixed input stride
   bool adaptive_stride = false;        // actively apply the causal parallax policy
   std::string adaptive_stride_log_path;
@@ -483,6 +539,19 @@ struct Args {
   double vio_global_yaw_oc_alpha = std::numeric_limits<double>::quiet_NaN();
   double vio_yaw_control_start_after_init = 0.0; // seconds; 0 = apply requested yaw control immediately
   double visual_bgz_update_scale = 1.0;          // --visual-bgz-update-scale: scale bg_z row of visual K
+  double post_alignment_gyro_z_perturbation_rad_s = 0.0; // Diagnostic-only board gyro-z perturbation after P4 release.
+  double post_alignment_gyro_z_scale = 1.0; // Diagnostic-only board gyro-z scale after P4 release.
+  double post_alignment_gyro_z_scale_min_abs_rad_s = 0.0; // Diagnostic-only scale activation threshold.
+  Eigen::Vector3d post_alignment_camera_extrinsic_left_rotvec_deg =
+      Eigen::Vector3d::Zero(); // Diagnostic-only; applied after P4 release.
+  bool post_alignment_fc_yaw_aid = false; // Diagnostic-only causal FC-attitude yaw anchor.
+  double post_alignment_fc_yaw_aid_period_s = 2.0;
+  double post_alignment_fc_yaw_aid_sigma_deg = 2.0;
+  double post_alignment_fc_yaw_aid_gate_sigma = 5.0;
+  std::string post_alignment_fc_yaw_aid_log_path;
+  bool disable_slam_features = false;              // Diagnostic-only MSCKF-only backend ablation.
+  bool online_alignment_use_cli_init_covariance = false; // Diagnostic-only: replace P4 covariance, preserve nominal state.
+  bool online_alignment_local_estimator_origin = false; // Preserve absolute output while centering internal W0 at P4 release.
   double curl_correction_rate_degps = 0.0;       // --curl-correction-rate: camera-fixed curl bias correction (deg/s)
   // Timed visual-yaw policy switch.
   std::string vio_yaw_switch_mode;              // --vio-yaw-switch-mode: switch to this mode at vio_yaw_switch_time
@@ -545,6 +614,10 @@ struct Args {
   double mech_diag_t1 = std::numeric_limits<double>::infinity();
   double slam_freeze_t0 = -1.0;          // --slam-update-freeze-window start
   double slam_freeze_t1 = -1.0;          // --slam-update-freeze-window end
+  double msckf_yaw_freeze_t0 = -1.0;     // --msckf-yaw-freeze-window start
+  double msckf_yaw_freeze_t1 = -1.0;     // --msckf-yaw-freeze-window end
+  double visual_yaw_gain_zero_t0 = -1.0;  // --visual-yaw-gain-zero-window start
+  double visual_yaw_gain_zero_t1 = -1.0;  // --visual-yaw-gain-zero-window end
   // Atomic experiment selection for explicit OC / FEJ combinations.
   std::string vio_consistency_mode;
   // High-level gauge-mode alias: expands to vio_yaw_update_mode + alpha
@@ -693,11 +766,22 @@ void write_online_alignment_metadata(const std::string &path,
     throw std::runtime_error("cannot open online alignment metadata: " + path);
   output << std::setprecision(15);
   auto write_vec3 = [&](const Eigen::Vector3d &v) {
-    output << "[" << v.x() << ", " << v.y() << ", " << v.z() << "]";
+    output << "[" << json_scalar(v.x()) << ", " << json_scalar(v.y())
+           << ", " << json_scalar(v.z()) << "]";
   };
   auto write_vec4 = [&](const Eigen::Vector4d &v) {
-    output << "[" << v(0) << ", " << v(1) << ", " << v(2) << ", "
-           << v(3) << "]";
+    output << "[" << json_scalar(v(0)) << ", " << json_scalar(v(1))
+           << ", " << json_scalar(v(2)) << ", " << json_scalar(v(3))
+           << "]";
+  };
+  auto write_vec15 = [&](const Eigen::Matrix<double, 15, 1> &v) {
+    output << "[";
+    for (Eigen::Index index = 0; index < v.rows(); ++index) {
+      if (index)
+        output << ", ";
+      output << json_scalar(v(index));
+    }
+    output << "]";
   };
   auto write_matrix3 = [&](const Eigen::Matrix3d &R) {
     output << "[[" << R(0, 0) << ", " << R(0, 1) << ", " << R(0, 2)
@@ -716,7 +800,7 @@ void write_online_alignment_metadata(const std::string &path,
   };
   const auto &d = result.diagnostics;
   output << "{\n"
-         << "  \"schema\": \"openvins_online_multisensor_alignment_v7\",\n"
+         << "  \"schema\": \"openvins_online_multisensor_alignment_v14\",\n"
          << "  \"mode\": \"online_multisensor_alignment\",\n"
          << "  \"status\": \"" << alignment_readiness_name(result.readiness)
          << "\",\n"
@@ -762,6 +846,22 @@ void write_online_alignment_metadata(const std::string &path,
          << json_scalar(d.initialization_duration_s) << ",\n"
          << "  \"nonlinear_solve_attempt_count\": "
          << d.nonlinear_solve_attempt_count << ",\n"
+         << "  \"shared_window_bias_model\": "
+         << (d.shared_window_bias_model ? "true" : "false") << ",\n"
+         << "  \"staged_solver_enabled\": "
+         << (d.staged_solver_enabled ? "true" : "false") << ",\n"
+         << "  \"stage1_solution_usable\": "
+         << (d.stage1_solution_usable ? "true" : "false") << ",\n"
+         << "  \"stage1_initial_cost\": " << json_scalar(d.stage1_initial_cost)
+         << ",\n"
+         << "  \"stage1_final_cost\": " << json_scalar(d.stage1_final_cost)
+         << ",\n"
+         << "  \"stage1_solver_iterations\": "
+         << d.stage1_solver_iterations << ",\n"
+         << "  \"stage1_solve_wall_time_s\": "
+         << json_scalar(d.stage1_solve_wall_time_s) << ",\n"
+         << "  \"final_stage_solve_wall_time_s\": "
+         << json_scalar(d.final_stage_solve_wall_time_s) << ",\n"
          << "  \"successful_release_count\": "
          << d.successful_release_count << ",\n"
          << "  \"post_release_try_count\": "
@@ -782,12 +882,113 @@ void write_online_alignment_metadata(const std::string &path,
          << d.candidate_rejected_count << ",\n"
          << "  \"candidate_refinement_count\": "
          << d.candidate_refinement_count << ",\n"
+         << "  \"gauge_window_observation_count\": "
+         << d.gauge_window_observation_count << ",\n"
+         << "  \"gauge_stability_required_s\": "
+         << json_scalar(d.gauge_stability_required_s) << ",\n"
+         << "  \"gauge_stable_duration_s\": "
+         << json_scalar(d.gauge_stable_duration_s) << ",\n"
+         << "  \"gauge_yaw_delta_from_previous_deg\": "
+         << json_scalar(d.gauge_yaw_delta_from_previous_deg) << ",\n"
+         << "  \"gauge_translation_delta_from_previous_m\": "
+         << json_scalar(d.gauge_translation_delta_from_previous_m) << ",\n"
+         << "  \"gauge_yaw_consistency_limit_deg\": "
+         << json_scalar(d.gauge_yaw_consistency_limit_deg) << ",\n"
+         << "  \"gauge_translation_consistency_limit_m\": "
+         << json_scalar(d.gauge_translation_consistency_limit_m) << ",\n"
+         << "  \"gauge_metric_scale\": "
+         << json_scalar(d.gauge_metric_scale) << ",\n"
+         << "  \"gauge_metric_scale_observed\": "
+         << json_scalar(d.gauge_metric_scale_observed) << ",\n"
+         << "  \"gauge_metric_scale_sigma\": "
+         << json_scalar(d.gauge_metric_scale_sigma) << ",\n"
+         << "  \"gauge_velocity_fit_rmse_mps\": "
+         << json_scalar(d.gauge_velocity_fit_rmse_mps) << ",\n"
+         << "  \"gauge_velocity_excitation_mps\": "
+         << json_scalar(d.gauge_velocity_excitation_mps) << ",\n"
+         << "  \"gauge_yaw_reset_deg\": "
+         << json_scalar(d.gauge_yaw_reset_deg) << ",\n"
+         << "  \"gauge_translation_G_m\": ";
+  write_vec3(d.gauge_translation_G);
+  output << ",\n"
+         << "  \"gauge_window_quality_passed\": "
+         << (d.gauge_window_quality_passed ? "true" : "false") << ",\n"
+         << "  \"gauge_consistency_passed\": "
+         << (d.gauge_consistency_passed ? "true" : "false") << ",\n"
+         << "  \"sliding_overlap_state_count\": "
+         << d.sliding_overlap_state_count << ",\n"
+         << "  \"sliding_overlap_attitude_max_deg\": "
+         << json_scalar(d.sliding_overlap_attitude_max_deg) << ",\n"
+         << "  \"sliding_overlap_position_max_m\": "
+         << json_scalar(d.sliding_overlap_position_max_m) << ",\n"
+         << "  \"sliding_overlap_velocity_max_mps\": "
+         << json_scalar(d.sliding_overlap_velocity_max_mps) << ",\n"
+         << "  \"sliding_overlap_gyro_bias_max_rad_s\": "
+         << json_scalar(d.sliding_overlap_gyro_bias_max_rad_s) << ",\n"
+         << "  \"sliding_overlap_accel_bias_max_mps2\": "
+         << json_scalar(d.sliding_overlap_accel_bias_max_mps2) << ",\n"
+         << "  \"sliding_overlap_normalized_max_sigma\": "
+         << json_scalar(d.sliding_overlap_normalized_max_sigma) << ",\n"
+         << "  \"sliding_overlap_stable_duration_s\": "
+         << json_scalar(d.sliding_overlap_stable_duration_s) << ",\n"
+         << "  \"sliding_overlap_stability_required_s\": "
+         << json_scalar(d.sliding_overlap_stability_required_s) << ",\n"
+         << "  \"sliding_overlap_consistency_passed\": "
+         << (d.sliding_overlap_consistency_passed ? "true" : "false")
+         << ",\n"
+         << "  \"sliding_bias_trend_sample_count\": "
+         << d.sliding_bias_trend_sample_count << ",\n"
+         << "  \"sliding_bias_trend_span_s\": "
+         << json_scalar(d.sliding_bias_trend_span_s) << ",\n"
+         << "  \"sliding_bg_trend_projected_change_rad_s\": ";
+  write_vec3(d.sliding_bg_trend_projected_change_rad_s);
+  output << ",\n  \"sliding_ba_trend_projected_change_mps2\": ";
+  write_vec3(d.sliding_ba_trend_projected_change_mps2);
+  output << ",\n"
+         << "  \"sliding_bias_trend_normalized_max_sigma\": "
+         << json_scalar(d.sliding_bias_trend_normalized_max_sigma) << ",\n"
+         << "  \"sliding_bias_trend_passed\": "
+         << (d.sliding_bias_trend_passed ? "true" : "false") << ",\n"
+         << "  \"direct_sliding_state_release\": "
+         << (d.direct_sliding_state_release ? "true" : "false") << ",\n"
+         << "  \"initial_history_clone_count\": "
+         << result.initial_clones.size() << ",\n"
+         << "  \"initial_persistent_landmark_count\": "
+         << result.initial_landmarks.size() << ",\n"
+         << "  \"startup_consumed_feature_count\": "
+         << result.startup_consumed_feature_ids.size() << ",\n"
+         << "  \"initial_joint_covariance_dimension\": "
+         << result.initial_joint_covariance.rows() << ",\n"
+         << "  \"initial_history_covariance_recovered\": "
+         << (d.initial_history_covariance_recovered ? "true" : "false")
+         << ",\n"
+         << "  \"handoff_covariance_inflation_applied\": "
+         << (d.handoff_covariance_inflation_applied ? "true" : "false")
+         << ",\n"
+         << "  \"handoff_covariance_model\": \""
+         << json_escape(d.handoff_covariance_model) << "\",\n"
+         << "  \"handoff_covariance_inflation\": {"
+         << "\"orientation\": "
+         << json_scalar(d.handoff_covariance_inflation[0]) << ", "
+         << "\"velocity\": "
+         << json_scalar(d.handoff_covariance_inflation[1]) << ", "
+         << "\"gyro_bias\": "
+         << json_scalar(d.handoff_covariance_inflation[2]) << ", "
+         << "\"accelerometer_bias\": "
+         << json_scalar(d.handoff_covariance_inflation[3]) << "},\n"
+         << "  \"handoff_raw_covariance_std\": ";
+  write_vec15(d.handoff_raw_covariance_std);
+  output << ",\n  \"handoff_applied_covariance_std\": ";
+  write_vec15(d.handoff_applied_covariance_std);
+  output << ",\n"
          << "  \"candidate_validation_duration_s\": "
          << json_scalar(d.candidate_validation_duration_s) << ",\n"
          << "  \"candidate_validation_frames\": "
          << d.candidate_validation_frames << ",\n"
          << "  \"candidate_fc_imu_rotation_residual_deg\": "
          << json_scalar(d.candidate_fc_imu_rotation_residual_deg) << ",\n"
+         << "  \"candidate_fc_imu_yaw_residual_deg\": "
+         << json_scalar(d.candidate_fc_imu_yaw_residual_deg) << ",\n"
          << "  \"candidate_relative_position_residual_m\": "
          << json_scalar(d.candidate_relative_position_residual_m) << ",\n"
          << "  \"candidate_relative_velocity_residual_mps\": "
@@ -855,6 +1056,34 @@ void write_online_alignment_metadata(const std::string &path,
          << (d.candidate_covariance_error_reset_applied ? "true" : "false") << ",\n"
          << "  \"candidate_fc_attitude_evaluation_only\": "
          << (d.candidate_fc_attitude_evaluation_only ? "true" : "false") << ",\n"
+         << "  \"fc_attitude_gauge_factor_enabled\": "
+         << (d.fc_attitude_gauge_factor_enabled ? "true" : "false")
+         << ",\n"
+         << "  \"fc_attitude_gauge_factor_count\": "
+         << d.fc_attitude_gauge_factor_count << ",\n"
+         << "  \"fc_position_velocity_factor_count\": "
+         << d.fc_position_velocity_factor_count << ",\n"
+         << "  \"fc_position_velocity_time_weight_sum\": "
+         << json_scalar(d.fc_position_velocity_time_weight_sum) << ",\n"
+         << "  \"fc_position_velocity_weight_model\": \""
+         << json_escape(d.fc_position_velocity_weight_model) << "\",\n"
+         << "  \"fc_attitude_gauge_anchor_timestamp_s\": "
+         << json_scalar(d.fc_attitude_gauge_anchor_timestamp_s) << ",\n"
+         << "  \"fc_attitude_gauge_anchor_rate_rad_s\": "
+         << json_scalar(d.fc_attitude_gauge_anchor_rate_rad_s) << ",\n"
+         << "  \"fc_attitude_gauge_anchor_rate_residual_rad_s\": "
+         << json_scalar(d.fc_attitude_gauge_anchor_rate_residual_rad_s)
+         << ",\n"
+         << "  \"fc_attitude_gauge_sigma_deg\": "
+         << json_scalar(d.fc_attitude_gauge_sigma_deg) << ",\n"
+         << "  \"fc_terminal_attitude_residual_deg\": "
+         << json_scalar(d.fc_terminal_attitude_residual_deg) << ",\n"
+         << "  \"fc_terminal_position_residual_m\": "
+         << json_scalar(d.fc_terminal_position_residual_m) << ",\n"
+         << "  \"fc_terminal_velocity_residual_mps\": "
+         << json_scalar(d.fc_terminal_velocity_residual_mps) << ",\n"
+         << "  \"fc_terminal_max_normalized_residual\": "
+         << json_scalar(d.fc_terminal_max_normalized_residual) << ",\n"
          << "  \"candidate_feedback_tier\": \""
          << json_escape(d.candidate_feedback_tier) << "\",\n"
          << "  \"candidate_feedback_state_mask\": \""
@@ -1112,7 +1341,7 @@ void write_online_alignment_failure_metadata(
     throw std::runtime_error("cannot open online alignment failure metadata: " + path);
   output << std::setprecision(15)
          << "{\n"
-         << "  \"schema\": \"openvins_online_multisensor_alignment_v7\",\n"
+         << "  \"schema\": \"openvins_online_multisensor_alignment_v14\",\n"
          << "  \"mode\": \"online_multisensor_alignment\",\n"
          << "  \"status\": \"STREAM_ENDED_NOT_INITIALIZED\",\n"
          << "  \"readiness_level\": \""
@@ -1133,6 +1362,25 @@ void write_online_alignment_failure_metadata(
          << json_scalar(diagnostics.initialization_duration_s) << ",\n"
          << "  \"nonlinear_solve_attempt_count\": "
          << diagnostics.nonlinear_solve_attempt_count << ",\n"
+         << "  \"shared_window_bias_model\": "
+         << (diagnostics.shared_window_bias_model ? "true" : "false")
+         << ",\n"
+         << "  \"staged_solver_enabled\": "
+         << (diagnostics.staged_solver_enabled ? "true" : "false")
+         << ",\n"
+         << "  \"stage1_solution_usable\": "
+         << (diagnostics.stage1_solution_usable ? "true" : "false")
+         << ",\n"
+         << "  \"stage1_initial_cost\": "
+         << json_scalar(diagnostics.stage1_initial_cost) << ",\n"
+         << "  \"stage1_final_cost\": "
+         << json_scalar(diagnostics.stage1_final_cost) << ",\n"
+         << "  \"stage1_solver_iterations\": "
+         << diagnostics.stage1_solver_iterations << ",\n"
+         << "  \"stage1_solve_wall_time_s\": "
+         << json_scalar(diagnostics.stage1_solve_wall_time_s) << ",\n"
+         << "  \"final_stage_solve_wall_time_s\": "
+         << json_scalar(diagnostics.final_stage_solve_wall_time_s) << ",\n"
          << "  \"successful_release_count\": "
          << diagnostics.successful_release_count << ",\n"
          << "  \"post_release_try_count\": "
@@ -1275,13 +1523,15 @@ void write_online_alignment_attempt_receipts(
     throw std::runtime_error("cannot open online alignment attempt receipts: " +
                              path);
   output << std::setprecision(15)
-         << "{\n  \"schema\": \"openvins_p4_sliding_window_attempts_v2\",\n"
+     << "{\n  \"schema\": \"openvins_p4_sliding_window_attempts_v4\",\n"
          << "  \"attempts\": [\n";
   for (size_t index = 0; index < receipts.size(); ++index) {
     const auto &receipt = receipts[index];
     output << "    {\"window_id\": " << receipt.window_id
            << ", \"optimizer_invocation_index\": "
            << receipt.optimizer_invocation_index
+           << ", \"optimizer_invocation_count\": "
+           << receipt.optimizer_invocation_count
            << ", \"attempt_timestamp\": "
            << json_scalar(receipt.attempt_timestamp)
            << ", \"trigger\": \"" << json_escape(receipt.trigger)
@@ -1305,6 +1555,22 @@ void write_online_alignment_attempt_receipts(
            << ", \"factor_count\": " << receipt.factor_count
            << ", \"solve_wall_time_s\": "
            << json_scalar(receipt.solve_wall_time_s)
+           << ", \"shared_window_bias_model\": "
+           << (receipt.shared_window_bias_model ? "true" : "false")
+           << ", \"staged_solver_enabled\": "
+           << (receipt.staged_solver_enabled ? "true" : "false")
+           << ", \"stage1_solution_usable\": "
+           << (receipt.stage1_solution_usable ? "true" : "false")
+           << ", \"stage1_initial_cost\": "
+           << json_scalar(receipt.stage1_initial_cost)
+           << ", \"stage1_final_cost\": "
+           << json_scalar(receipt.stage1_final_cost)
+           << ", \"stage1_solver_iterations\": "
+           << receipt.stage1_solver_iterations
+           << ", \"stage1_solve_wall_time_s\": "
+           << json_scalar(receipt.stage1_solve_wall_time_s)
+           << ", \"final_stage_solve_wall_time_s\": "
+           << json_scalar(receipt.final_stage_solve_wall_time_s)
            << ", \"initial_cost\": " << json_scalar(receipt.initial_cost)
            << ", \"final_cost\": " << json_scalar(receipt.final_cost)
            << ", \"q_GtoI_xyzw\": ";
@@ -1317,6 +1583,10 @@ void write_online_alignment_attempt_receipts(
     write_json_eigen_vector(output, receipt.bg);
     output << ", \"ba_mps2\": ";
     write_json_eigen_vector(output, receipt.ba);
+    output << ", \"bg_prior_center_rad_s\": ";
+    write_json_eigen_vector(output, receipt.bg_prior_center);
+    output << ", \"ba_prior_center_mps2\": ";
+    write_json_eigen_vector(output, receipt.ba_prior_center);
     output << ", \"state_std\": ";
     write_json_eigen_vector(output, receipt.state_std);
     output << ", \"imu_residual_rms\": "
@@ -1343,6 +1613,37 @@ void write_online_alignment_attempt_receipts(
            << json_scalar(receipt.previous_gyro_bias_delta_rad_s)
            << ", \"previous_accel_bias_delta_mps2\": "
            << json_scalar(receipt.previous_accel_bias_delta_mps2)
+           << ", \"overlap_state_count\": " << receipt.overlap_state_count
+           << ", \"overlap_attitude_max_deg\": "
+           << json_scalar(receipt.overlap_attitude_max_deg)
+           << ", \"overlap_position_max_m\": "
+           << json_scalar(receipt.overlap_position_max_m)
+           << ", \"overlap_velocity_max_mps\": "
+           << json_scalar(receipt.overlap_velocity_max_mps)
+           << ", \"overlap_gyro_bias_max_rad_s\": "
+           << json_scalar(receipt.overlap_gyro_bias_max_rad_s)
+           << ", \"overlap_accel_bias_max_mps2\": "
+           << json_scalar(receipt.overlap_accel_bias_max_mps2)
+           << ", \"overlap_normalized_max_sigma\": "
+           << json_scalar(receipt.overlap_normalized_max_sigma)
+           << ", \"bias_trend_sample_count\": "
+           << receipt.bias_trend_sample_count
+           << ", \"bias_trend_span_s\": "
+           << json_scalar(receipt.bias_trend_span_s)
+           << ", \"bg_trend_projected_change_rad_s\": ";
+    write_json_eigen_vector(output,
+                            receipt.bg_trend_projected_change_rad_s);
+    output << ", \"ba_trend_projected_change_mps2\": ";
+    write_json_eigen_vector(output,
+                            receipt.ba_trend_projected_change_mps2);
+    output << ", \"bias_trend_normalized_max_sigma\": "
+           << json_scalar(receipt.bias_trend_normalized_max_sigma)
+           << ", \"bias_trend_passed\": "
+           << (receipt.bias_trend_passed ? "true" : "false")
+           << ", \"overlap_stable_duration_s\": "
+           << json_scalar(receipt.overlap_stable_duration_s)
+           << ", \"overlap_consistency_passed\": "
+           << (receipt.overlap_consistency_passed ? "true" : "false")
            << ", \"warm_start_used\": "
            << (receipt.warm_start_used ? "true" : "false")
            << ", \"outcome\": \"" << json_escape(receipt.outcome)
@@ -1389,19 +1690,33 @@ void write_online_alignment_sliding_window_trace(
     throw std::runtime_error(
         "cannot open online alignment sliding-window trace: " + path);
   output << std::setprecision(17)
-         << "window_id,optimizer_invocation_index,window_begin_timestamp_s,"
+         << "window_id,optimizer_invocation_index,optimizer_invocation_count,"
+            "shared_window_bias_model,staged_solver_enabled,"
+            "stage1_solution_usable,stage1_initial_cost,stage1_final_cost,"
+            "stage1_solver_iterations,stage1_solve_wall_time_s,"
+            "final_stage_solve_wall_time_s,window_begin_timestamp_s,"
             "window_end_timestamp_s,window_duration_s,raw_fc_count,"
             "valid_fc_count,imu_count,visual_frame_count,"
             "selected_keyframe_count,selected_frame_timestamps_s,"
             "solve_wall_time_s,initial_cost,final_cost,q_GtoI_xyzw,"
-            "p_IinG_m,v_IinG_mps,bg_rad_s,ba_mps2,q_std_rad,p_std_m,"
+            "p_IinG_m,v_IinG_mps,bg_rad_s,ba_mps2,"
+            "bg_prior_center_rad_s,ba_prior_center_mps2,"
+            "q_std_rad,p_std_m,"
             "v_std_mps,bg_std_rad_s,ba_std_mps2,imu_residual_rms,"
             "fc_residual_rms,visual_reprojection_rmse_px,"
             "visual_reprojection_p95_px,joint_normalized_cost,"
             "angular_excitation_rad_s,second_axis_ratio,"
             "previous_attitude_delta_deg,previous_position_delta_m,"
             "previous_velocity_delta_mps,previous_gyro_bias_delta_rad_s,"
-            "previous_accel_bias_delta_mps2,warm_start_used,solve_status,"
+            "previous_accel_bias_delta_mps2,overlap_state_count,"
+            "overlap_attitude_max_deg,overlap_position_max_m,"
+            "overlap_velocity_max_mps,overlap_gyro_bias_max_rad_s,"
+            "overlap_accel_bias_max_mps2,overlap_normalized_max_sigma,"
+            "overlap_stable_duration_s,bias_trend_sample_count,"
+            "bias_trend_span_s,bg_trend_projected_change_rad_s,"
+            "ba_trend_projected_change_mps2,"
+            "bias_trend_normalized_max_sigma,bias_trend_passed,"
+            "overlap_consistency_passed,warm_start_used,solve_status,"
             "failed_gate,window_fingerprint\n";
   for (const auto &receipt : receipts) {
     if (receipt.window_id <= 0)
@@ -1415,7 +1730,15 @@ void write_online_alignment_sliding_window_trace(
       timestamps << receipt.selected_frame_timestamps[index];
     }
     output << receipt.window_id << ',' << receipt.optimizer_invocation_index
-           << ',' << receipt.window_begin_timestamp << ','
+           << ',' << receipt.optimizer_invocation_count << ','
+           << (receipt.shared_window_bias_model ? 1 : 0) << ','
+           << (receipt.staged_solver_enabled ? 1 : 0) << ','
+           << (receipt.stage1_solution_usable ? 1 : 0) << ','
+           << receipt.stage1_initial_cost << ',' << receipt.stage1_final_cost
+           << ',' << receipt.stage1_solver_iterations << ','
+           << receipt.stage1_solve_wall_time_s << ','
+           << receipt.final_stage_solve_wall_time_s << ','
+           << receipt.window_begin_timestamp << ','
            << receipt.window_end_timestamp << ',' << receipt.window_duration_s
            << ',' << receipt.raw_fc_count << ',' << receipt.valid_fc_count
            << ',' << receipt.imu_count << ',' << receipt.visual_frame_count
@@ -1427,6 +1750,8 @@ void write_online_alignment_sliding_window_trace(
            << csv_eigen_vector(receipt.v_IinG) << "\",\""
            << csv_eigen_vector(receipt.bg) << "\",\""
            << csv_eigen_vector(receipt.ba) << "\",\""
+           << csv_eigen_vector(receipt.bg_prior_center) << "\",\""
+           << csv_eigen_vector(receipt.ba_prior_center) << "\",\""
            << csv_eigen_vector(receipt.state_std.segment<3>(0)) << "\",\""
            << csv_eigen_vector(receipt.state_std.segment<3>(3)) << "\",\""
            << csv_eigen_vector(receipt.state_std.segment<3>(6)) << "\",\""
@@ -1443,46 +1768,26 @@ void write_online_alignment_sliding_window_trace(
            << receipt.previous_velocity_delta_mps << ','
            << receipt.previous_gyro_bias_delta_rad_s << ','
            << receipt.previous_accel_bias_delta_mps2 << ','
+           << receipt.overlap_state_count << ','
+           << receipt.overlap_attitude_max_deg << ','
+           << receipt.overlap_position_max_m << ','
+           << receipt.overlap_velocity_max_mps << ','
+           << receipt.overlap_gyro_bias_max_rad_s << ','
+           << receipt.overlap_accel_bias_max_mps2 << ','
+           << receipt.overlap_normalized_max_sigma << ','
+           << receipt.overlap_stable_duration_s << ','
+           << receipt.bias_trend_sample_count << ','
+           << receipt.bias_trend_span_s << ",\""
+           << csv_eigen_vector(receipt.bg_trend_projected_change_rad_s)
+           << "\",\""
+           << csv_eigen_vector(receipt.ba_trend_projected_change_mps2)
+           << "\"," << receipt.bias_trend_normalized_max_sigma << ','
+           << (receipt.bias_trend_passed ? 1 : 0) << ','
+           << (receipt.overlap_consistency_passed ? 1 : 0) << ','
            << (receipt.warm_start_used ? 1 : 0) << ",\""
            << receipt.outcome << "\",\"" << receipt.failed_gate << "\",\""
            << receipt.window_fingerprint << "\"\n";
   }
-}
-
-void write_online_alignment_shadow_metadata(
-    const std::string &path,
-    const std::deque<AlignmentAttemptReceipt> &receipts,
-    const OnlineAlignmentDiagnostics &diagnostics) {
-  ensure_parent_directory(path);
-  std::ofstream output(path, std::ofstream::out | std::ofstream::trunc);
-  if (!output.is_open())
-    throw std::runtime_error(
-        "cannot open online alignment shadow metadata: " + path);
-  int solved_windows = 0;
-  const AlignmentAttemptReceipt *last = nullptr;
-  for (const auto &receipt : receipts) {
-    if (receipt.window_id <= 0 || receipt.optimizer_invocation_index <= 0)
-      continue;
-    ++solved_windows;
-    last = &receipt;
-  }
-  output << std::setprecision(17)
-         << "{\n  \"schema\": \"openvins_p4_r1_sliding_window_shadow_v1\",\n"
-         << "  \"status\": \"SHADOW_ONLY\",\n"
-         << "  \"released_to_openvins\": false,\n"
-         << "  \"alignment_active\": true,\n"
-         << "  \"optimizer_invocation_count\": " << solved_windows << ",\n"
-         << "  \"nonlinear_solve_attempt_count\": "
-         << diagnostics.nonlinear_solve_attempt_count << ",\n"
-         << "  \"last_window_begin_timestamp_s\": "
-         << (last != nullptr ? json_scalar(last->window_begin_timestamp)
-                             : "null")
-         << ",\n  \"last_window_end_timestamp_s\": "
-         << (last != nullptr ? json_scalar(last->window_end_timestamp)
-                             : "null")
-         << ",\n  \"last_window_outcome\": \""
-         << (last != nullptr ? json_escape(last->outcome) : "none")
-         << "\"\n}\n";
 }
 
 void write_nav_metadata(const std::string &path,
@@ -1514,6 +1819,8 @@ void write_nav_metadata(const std::string &path,
      << "  \"init_camera_timestamp\": " << nav.init_camera_timestamp << ",\n"
      << "  \"first_emitted_timestamp\": " << nav.first_emitted_timestamp << ",\n"
      << "  \"selected_fc_timestamp\": " << nav.selected_fc_timestamp << ",\n"
+     << "  \"camera_to_imu_time_offset_s\": "
+     << nav.camera_to_imu_time_offset_s << ",\n"
      << "  \"fc_time_offset\": " << nav.fc_time_offset << ",\n"
      << "  \"initialization_mode\": \"" << json_escape(nav.initialization_mode) << "\",\n"
      << "  \"fc_init_requested_level\": \"" << json_escape(nav.fc_init_requested_level) << "\",\n"
@@ -1604,6 +1911,8 @@ void print_help() {
                "  --gps-alt-joseph-update  PX4-style masked Joseph update (Gate 2):\n"
                "                            only p_z state DOF and p_z row/col of P updated.\n"
                "                            All guard flags still apply.\n"
+               "  --gps-alt-guard-fallback-joseph-pz\n"
+               "                            on coupled guard rejection, apply p_z-only Joseph update.\n"
                "  --gps-alt-ground-plane   Bootstrap a local ground plane from scalar height.\n"
                "                            Default type is gps: h(x)=p_z, no tilt/r22 term.\n"
                "  --gps-alt-ground-plane-type gps|rangefinder\n"
@@ -1657,6 +1966,12 @@ void print_help() {
                 "  --online-alignment-release-policy POLICY  practical_navigation_start (default) or strict_full_alignment.\n"
                 "  --online-alignment-disable-visual  Negative control: remove all monocular reprojection factors; full alignment is forbidden.\n"
                 "  --online-alignment-navigation-allow-without-visual  Explicitly allow navigation-only release in the no-vision control.\n"
+                "  --online-alignment-retain-bg-prior  Compatibility flag; production already retains the joint-graph bg estimate.\n"
+                "  --online-alignment-retain-ba-prior  Compatibility flag; production already retains the joint-graph ba estimate.\n"
+                "  --online-alignment-enable-candidate-bg-feedback  Diagnostic: allow FC p/v cross-covariance to change graph bg.\n"
+                "  --online-alignment-enable-candidate-ba-feedback  Diagnostic: allow FC p/v cross-covariance to change graph ba.\n"
+                "  --online-alignment-release-attitude-from-fc  Diagnostic q-only release ablation using synchronized FC attitude and accepted mount.\n"
+                "  --online-alignment-diagnostic-never-anchor  Diagnostic isolation: solve P4 windows but never modify the provisional VIO.\n"
                 "  --online-alignment-visual-perturbation-px PX  Add a deterministic pixel offset to selected feature tracks.\n"
                 "  --online-alignment-visual-perturbation-fraction R  Fraction [0,1] of feature IDs perturbed.\n"
                "  --gps-antenna-in-imu X Y Z  GPS antenna position p_I_GPS in IMU frame meters (default 0 0 0)\n"
@@ -1670,8 +1985,13 @@ void print_help() {
                "  --dash-title TITLE    Window title (default: 'OpenVINS ROS-free Dashboard')\n"
                "  --dash-every N        Refresh dashboard every N camera frames (default 1)\n"
                "  --camera-frame-stride N  Feed only 1 of every N camera frames to VIO before tracker (default 1)\n"
-               "  --adaptive-stride-shadow  Compute/log the causal height+turn policy; keep fixed camera stride\n"
-               "  --adaptive-stride         Apply the causal parallax policy to camera input (requires fixed stride 1)\n"
+               "  --post-alignment-camera-frame-stride N  Override fixed stride only after P4 releases (diagnostic)\n"
+               "  --post-alignment-visual-roi MODE  Post-P4 ROI: full|left|center|right|top|bottom|dynamic_turn\n"
+               "  --dynamic-turn-roi-diag PATH  Write causal direction/detection/backend-quota diagnostics\n"
+               "  --agl-scene-scale MODE  Visual-ground/AGL scene-scale mode: off|shadow|single_reset|guarded_repeat_reset\n"
+               "  --agl-scene-scale-diag PATH  Write visual ground, ratio-window and atomic reset diagnostics\n"
+               "  --adaptive-stride-shadow  Log continuous visual scheduling; keep fixed camera stride\n"
+               "  --adaptive-stride         Apply continuous visual tracking/backend scheduling\n"
                "  --adaptive-stride-log PATH  Per-raw-frame policy CSV (default: OUTPUT.adaptive_stride.csv)\n"
                "  --adaptive-stride-no-parallax  Disable closed-loop stride correction from observed KLT parallax\n"
                "  --camera-frame-adaptive  Online geometry-gated input camera sampling (default off)\n"
@@ -1698,11 +2018,22 @@ void print_help() {
                "                         oc-fej = FEJ Jacobians + FEJ-gauge OC projection\n"
                "  --no-vio-yaw-update   Alias for --vio-yaw-update-scale 0.0\n"
                "  --vio-yaw-update-mode M   original|per_block_scale|global_yaw_oc_projection|global_yaw_oc_fej_projection\n"
+               "                            global_yaw_oc_centered_projection|global_4d_oc_projection\n"
                "                            global_yaw_oc_fej_prechi2|visual_4d_oc_fej_prechi2\n"
                "  --vio-yaw-update-scale S  Scale visual yaw correction for *_scale modes (1=orig, 0=off)\n"
                "  --vio-global-yaw-oc-alpha A  H-projection alpha for global_yaw_oc_projection (0=orig, 1=full)\n"
                "  --vio-yaw-control-start-after-init S  Delay requested visual yaw control until S seconds after init\n"
                "  --visual-bgz-update-scale S  Scale bg_z row of visual K_eff (1.0=normal, 0.0=freeze bg_z from visual)\n"
+               "  --post-alignment-gyro-z-perturbation R  Diagnostic-only board gyro-z perturbation in rad/s after P4 release\n"
+               "  --post-alignment-gyro-z-scale S  Diagnostic-only multiplicative board gyro-z scale after P4 release\n"
+               "  --post-alignment-gyro-z-scale-min-abs R  Apply the diagnostic scale only when |gyro_z| >= R rad/s\n"
+               "  --post-alignment-fc-yaw-aid  Diagnostic-only causal yaw anchor from FC attitude after P4 release\n"
+               "  --post-alignment-fc-yaw-aid-period S  FC yaw-anchor period in seconds (default 2)\n"
+               "  --post-alignment-fc-yaw-aid-sigma-deg D  FC yaw measurement sigma in degrees (default 2)\n"
+               "  --post-alignment-fc-yaw-aid-log PATH  Write FC yaw-anchor decisions to CSV\n"
+               "  --disable-slam-features  Diagnostic-only: set max_slam=0 while preserving KLT/MSCKF\n"
+               "  --online-alignment-use-cli-init-covariance  Diagnostic-only: preserve the P4 nominal state/release time but use --init-*-sigma as a diagonal 15x15 covariance\n"
+               "  --online-alignment-local-estimator-origin  Keep P4 absolute output but run VIO in a release-centered local W0\n"
                "  --curl-correction-rate R     Camera-fixed optical-axis curl correction (deg/s, + = CCW in image)\n"
                "  --vio-yaw-switch-mode M   After --vio-yaw-switch-time, switch to this visual yaw mode\n"
                "  --vio-yaw-switch-time T   Absolute timestamp (s) to switch yaw mode\n"
@@ -1754,6 +2085,7 @@ void print_help() {
                 "  --restart-yaw-error-deg DEG  Severe course-yaw error threshold (default 45deg)\n"
                 "  --restart-visual-settle S  Seconds to suppress visual updates after restart (default 3)\n"
                 "  --slam-update-freeze-window T0 T1 Skip only SLAM update/delayed init in [T0,T1]\n"
+                "  --msckf-yaw-freeze-window T0 T1 Zero only the MSCKF yaw correction in [T0,T1]\n"
                "  --vio-consistency-mode M  Low-level alias for --yaw-mode:\n"
                "    baseline  use_fej=true, current-gauge global-yaw OC alpha=1 (current best recipe)\n"
                "    oc        use_fej=false, current-gauge global-yaw OC alpha=1\n"
@@ -1810,6 +2142,20 @@ bool parse_args(int argc, char **argv, Args &a) {
       a.online_alignment_disable_visual = true;
     else if (s == "--online-alignment-navigation-allow-without-visual")
       a.online_alignment_navigation_allow_without_visual = true;
+    else if (s == "--online-alignment-retain-bg-prior")
+      a.online_alignment_retain_bg_prior = true;
+    else if (s == "--online-alignment-retain-ba-prior")
+      a.online_alignment_retain_ba_prior = true;
+    else if (s == "--online-alignment-enable-candidate-bg-feedback")
+      a.online_alignment_retain_bg_prior = false;
+    else if (s == "--online-alignment-enable-candidate-ba-feedback")
+      a.online_alignment_retain_ba_prior = false;
+    else if (s == "--online-alignment-release-attitude-from-fc")
+      a.online_alignment_release_attitude_from_fc = true;
+    else if (s == "--online-alignment-diagnostic-graph-q-fc-pv-zero-bias")
+      a.online_alignment_diagnostic_graph_q_fc_pv_zero_bias = true;
+    else if (s == "--online-alignment-diagnostic-never-anchor")
+      a.online_alignment_diagnostic_never_anchor = true;
     else if (s == "--online-alignment-release-policy")
       a.online_alignment_release_policy =
           next("--online-alignment-release-policy");
@@ -1852,6 +2198,8 @@ bool parse_args(int argc, char **argv, Args &a) {
     else if (s == "--gps-alt-nasa-beta") a.gps_alt_nasa_beta = std::atof(next("--gps-alt-nasa-beta").c_str());
     else if (s == "--gps-alt-nasa-q-threshold") a.gps_alt_nasa_q_threshold = std::atof(next("--gps-alt-nasa-q-threshold").c_str());
     else if (s == "--gps-alt-joseph-update") a.gps_alt_joseph = true;
+    else if (s == "--gps-alt-guard-fallback-joseph-pz")
+      a.gps_alt_guard_fallback_joseph_pz = true;
     else if (s == "--gps-alt-ground-plane") a.gps_alt_ground_plane = true;
     else if (s == "--gps-alt-ground-plane-type" || s == "--height-source") {
       const std::string type = next(s.c_str());
@@ -1918,6 +2266,21 @@ bool parse_args(int argc, char **argv, Args &a) {
     else if (s == "--dash-every") a.dash_every = std::atoi(next("--dash-every").c_str());
     else if (s == "--cam-subsample" || s == "--camera-frame-stride")
       a.cam_subsample = std::max(1, std::atoi(next(s.c_str()).c_str()));
+    else if (s == "--post-alignment-camera-frame-stride")
+      a.post_alignment_camera_frame_stride =
+          std::max(1, std::atoi(next(s.c_str()).c_str()));
+    else if (s == "--post-alignment-visual-roi") {
+      a.post_alignment_visual_roi = next(s.c_str());
+      if (!valid_post_alignment_visual_roi(a.post_alignment_visual_roi))
+        throw std::runtime_error("invalid --post-alignment-visual-roi: " +
+                                 a.post_alignment_visual_roi);
+    }
+    else if (s == "--dynamic-turn-roi-diag")
+      a.dynamic_turn_roi_diag_path = next(s.c_str());
+    else if (s == "--agl-scene-scale")
+      a.agl_scene_scale_mode = next(s.c_str());
+    else if (s == "--agl-scene-scale-diag")
+      a.agl_scene_scale_diag_path = next(s.c_str());
     else if (s == "--adaptive-stride-shadow")
       a.adaptive_stride_shadow = true;
     else if (s == "--adaptive-stride")
@@ -1961,6 +2324,39 @@ bool parse_args(int argc, char **argv, Args &a) {
     else if (s == "--vio-global-yaw-oc-alpha") a.vio_global_yaw_oc_alpha = std::atof(next("--vio-global-yaw-oc-alpha").c_str());
     else if (s == "--vio-yaw-control-start-after-init") a.vio_yaw_control_start_after_init = std::atof(next("--vio-yaw-control-start-after-init").c_str());
     else if (s == "--visual-bgz-update-scale") a.visual_bgz_update_scale = std::atof(next("--visual-bgz-update-scale").c_str());
+    else if (s == "--post-alignment-gyro-z-perturbation")
+      a.post_alignment_gyro_z_perturbation_rad_s =
+          std::atof(next("--post-alignment-gyro-z-perturbation").c_str());
+    else if (s == "--post-alignment-gyro-z-scale")
+      a.post_alignment_gyro_z_scale =
+          std::atof(next("--post-alignment-gyro-z-scale").c_str());
+    else if (s == "--post-alignment-gyro-z-scale-min-abs")
+      a.post_alignment_gyro_z_scale_min_abs_rad_s =
+          std::atof(next("--post-alignment-gyro-z-scale-min-abs").c_str());
+    else if (s == "--post-alignment-fc-yaw-aid")
+      a.post_alignment_fc_yaw_aid = true;
+    else if (s == "--post-alignment-fc-yaw-aid-period")
+      a.post_alignment_fc_yaw_aid_period_s =
+          std::atof(next("--post-alignment-fc-yaw-aid-period").c_str());
+    else if (s == "--post-alignment-fc-yaw-aid-sigma-deg")
+      a.post_alignment_fc_yaw_aid_sigma_deg =
+          std::atof(next("--post-alignment-fc-yaw-aid-sigma-deg").c_str());
+    else if (s == "--post-alignment-fc-yaw-aid-log")
+      a.post_alignment_fc_yaw_aid_log_path =
+          next("--post-alignment-fc-yaw-aid-log");
+    else if (s == "--post-alignment-camera-extrinsic-left-rotvec-deg") {
+      a.post_alignment_camera_extrinsic_left_rotvec_deg.x() =
+          std::atof(next("--post-alignment-camera-extrinsic-left-rotvec-deg").c_str());
+      a.post_alignment_camera_extrinsic_left_rotvec_deg.y() =
+          std::atof(next("--post-alignment-camera-extrinsic-left-rotvec-deg").c_str());
+      a.post_alignment_camera_extrinsic_left_rotvec_deg.z() =
+          std::atof(next("--post-alignment-camera-extrinsic-left-rotvec-deg").c_str());
+    }
+    else if (s == "--disable-slam-features") a.disable_slam_features = true;
+    else if (s == "--online-alignment-use-cli-init-covariance")
+      a.online_alignment_use_cli_init_covariance = true;
+    else if (s == "--online-alignment-local-estimator-origin")
+      a.online_alignment_local_estimator_origin = true;
     else if (s == "--curl-correction-rate") a.curl_correction_rate_degps = std::atof(next("--curl-correction-rate").c_str());
     else if (s == "--vio-yaw-switch-mode") a.vio_yaw_switch_mode = next("--vio-yaw-switch-mode");
     else if (s == "--vio-yaw-switch-time") a.vio_yaw_switch_time = std::atof(next("--vio-yaw-switch-time").c_str());
@@ -2026,6 +2422,16 @@ bool parse_args(int argc, char **argv, Args &a) {
       a.slam_freeze_t0 = std::atof(next("--slam-update-freeze-window T0").c_str());
       a.slam_freeze_t1 = std::atof(next("--slam-update-freeze-window T1").c_str());
     }
+    else if (s == "--msckf-yaw-freeze-window") {
+      a.msckf_yaw_freeze_t0 = std::atof(next("--msckf-yaw-freeze-window T0").c_str());
+      a.msckf_yaw_freeze_t1 = std::atof(next("--msckf-yaw-freeze-window T1").c_str());
+    }
+    else if (s == "--visual-yaw-gain-zero-window") {
+      a.visual_yaw_gain_zero_t0 =
+          std::atof(next("--visual-yaw-gain-zero-window T0").c_str());
+      a.visual_yaw_gain_zero_t1 =
+          std::atof(next("--visual-yaw-gain-zero-window T1").c_str());
+    }
     else if (s == "--visual-update-skip-window") {
       a.visual_skip_t0 = std::atof(next("--visual-update-skip-window T0").c_str());
       a.visual_skip_t1 = std::atof(next("--visual-update-skip-window T1").c_str());
@@ -2062,6 +2468,14 @@ bool parse_args(int argc, char **argv, Args &a) {
       a.online_alignment_visual_perturbation_fraction > 1.0) {
     std::cerr << "online alignment visual perturbation must use PX >= 0 "
                  "and fraction in [0,1]\n";
+    return false;
+  }
+  if (!std::isfinite(a.post_alignment_gyro_z_scale) ||
+      a.post_alignment_gyro_z_scale <= 0.0 ||
+      !std::isfinite(a.post_alignment_gyro_z_scale_min_abs_rad_s) ||
+      a.post_alignment_gyro_z_scale_min_abs_rad_s < 0.0) {
+    std::cerr << "post-alignment gyro-z scale must be finite and positive, "
+                 "and its activation threshold must be finite and nonnegative\n";
     return false;
   }
   return true;
@@ -2113,6 +2527,23 @@ int main(int argc, char **argv) {
     args.adaptive_stride_log_path = args.output_path + ".adaptive_stride.csv";
   if (args.pose_repair_sim_gps && args.gps_path.empty()) {
     PRINT_ERROR(RED "[pose-repair] --pose-repair-sim-gps requires --gps PATH\n" RESET);
+    return EXIT_FAILURE;
+  }
+  const bool agl_scene_scale_enabled =
+      args.agl_scene_scale_mode != "off";
+  if (agl_scene_scale_enabled && args.gps_alt_update) {
+    PRINT_ERROR(RED "[AGL-SCALE] scene-scale reset and --gps-alt-update are "
+                    "mutually exclusive; AGL must not enter p_z\n" RESET);
+    return EXIT_FAILURE;
+  }
+  if (agl_scene_scale_enabled && args.gps_path.empty()) {
+    PRINT_ERROR(RED "[AGL-SCALE] current AGL source requires --gps PATH; "
+                    "GPS XY/course remain evaluation-only\n" RESET);
+    return EXIT_FAILURE;
+  }
+  if (args.post_alignment_fc_yaw_aid &&
+      initialization_mode != InitializationMode::ONLINE_MULTISENSOR_ALIGNMENT) {
+    PRINT_ERROR(RED "[FC-YAW-AID] requires online_multisensor_alignment and its accepted FC stream\n" RESET);
     return EXIT_FAILURE;
   }
   if (!args.dashboard_enabled && !args.video_path.empty()) {
@@ -2192,6 +2623,10 @@ int main(int argc, char **argv) {
   args.pose_repair_yaw_sigma_deg = std::max(0.1, args.pose_repair_yaw_sigma_deg);
   args.pose_repair_gate_sigma = std::max(0.5, args.pose_repair_gate_sigma);
   args.pose_repair_max_gps_age_s = std::max(0.01, args.pose_repair_max_gps_age_s);
+  args.post_alignment_fc_yaw_aid_period_s =
+      std::max(0.2, args.post_alignment_fc_yaw_aid_period_s);
+  args.post_alignment_fc_yaw_aid_sigma_deg =
+      std::max(0.1, args.post_alignment_fc_yaw_aid_sigma_deg);
   args.restart_consecutive_repair_failures = std::max(1, args.restart_consecutive_repair_failures);
   args.restart_cooldown_s = std::max(0.0, args.restart_cooldown_s);
   args.restart_visual_settle_s = std::max(0.0, args.restart_visual_settle_s);
@@ -2349,6 +2784,8 @@ int main(int argc, char **argv) {
     params.enable_vio_yaw_update = (params.vio_yaw_update_mode == "original" ||
                                     params.vio_yaw_update_mode == "global_yaw_oc_projection" ||
                                     params.vio_yaw_update_mode == "global_yaw_oc_fej_projection" ||
+                                    params.vio_yaw_update_mode == "global_yaw_oc_centered_projection" ||
+                                    params.vio_yaw_update_mode == "global_4d_oc_projection" ||
                                     VisualObservabilityPolicy::is_prechi2_mode_string(params.vio_yaw_update_mode) ||
                                     params.vio_yaw_update_scale > 0.0 ||
                                     params.vio_global_yaw_oc_alpha > 0.0);
@@ -2365,10 +2802,28 @@ int main(int argc, char **argv) {
     params.use_gyro_aided_klt = false; // suppressed when warp active (avoids double rotation)
     PRINT_INFO(CYAN "[ros-free] CLI override: use_ground_parallel_warp=true (gyro_aided_klt suppressed)\n" RESET);
   }
+  if (args.post_alignment_visual_roi != "full") {
+    if (args.post_alignment_visual_roi == "dynamic_turn") {
+      PRINT_INFO(CYAN "[ros-free] causal dynamic turn ROI enabled: left turn->right image, right turn->left image\n" RESET);
+    } else {
+      PRINT_INFO(CYAN "[ros-free] diagnostic static post-alignment visual ROI=%s\n" RESET,
+                 args.post_alignment_visual_roi.c_str());
+    }
+  }
   if (args.visual_bgz_update_scale < 1.0 - 1e-12) {
     params.visual_bgz_update_scale = std::max(0.0, std::min(1.0, args.visual_bgz_update_scale));
     PRINT_INFO(CYAN "[ros-free] CLI override: visual_bgz_update_scale=%.4f\n" RESET,
                params.visual_bgz_update_scale);
+  }
+  if ((args.adaptive_stride || args.adaptive_stride_shadow) &&
+      args.post_alignment_camera_frame_stride > 0) {
+    PRINT_ERROR(RED "[adaptive-stride] cannot be combined with a fixed post-alignment camera stride\n" RESET);
+    return EXIT_FAILURE;
+  }
+  if (args.disable_slam_features) {
+    params.state_options.max_slam_features = 0;
+    params.state_options.max_slam_in_update = 0;
+    PRINT_INFO(CYAN "[ros-free] CLI override: max_slam=0 max_slam_in_update=0\n" RESET);
   }
   if (args.curl_correction_rate_degps != 0.0) {
     params.curl_correction_rate_degps = args.curl_correction_rate_degps;
@@ -2405,6 +2860,26 @@ int main(int argc, char **argv) {
                args.vio_yaw_control_start_after_init);
   }
   auto sys = std::make_shared<VioManager>(params);
+  sys->configure_dynamic_turn_roi(
+      args.post_alignment_visual_roi == "dynamic_turn");
+  if (!sys->configure_agl_scene_scale(args.agl_scene_scale_mode))
+    return EXIT_FAILURE;
+  if (args.online_alignment_use_cli_init_covariance) {
+    if (!sys->set_online_alignment_release_covariance_override(
+            args.init_att_sigma_deg * M_PI / 180.0, args.init_pos_sigma,
+            args.init_vel_sigma, args.init_bg_sigma, args.init_ba_sigma)) {
+      return EXIT_FAILURE;
+    }
+    PRINT_INFO(CYAN "[ros-free] P4 covariance ablation: CLI diagonal std "
+                    "att=%.6gdeg pos=%.6gm vel=%.6gm/s bg=%.6grad/s ba=%.6gm/s2; "
+                    "P4 q/p/v/bg/ba and release time remain unchanged\n" RESET,
+               args.init_att_sigma_deg, args.init_pos_sigma,
+               args.init_vel_sigma, args.init_bg_sigma, args.init_ba_sigma);
+  }
+  if (args.online_alignment_local_estimator_origin) {
+    sys->set_online_alignment_local_estimator_origin(true);
+    PRINT_INFO(CYAN "[ros-free] online alignment will inject a release-centered local W0 position\n" RESET);
+  }
   sys->set_tracker_viz_image_payload_enabled(
       args.dashboard_enabled || !args.video_cam_path.empty());
   if (!args.visual_flow_curl_diag_path.empty() ||
@@ -2494,6 +2969,22 @@ int main(int argc, char **argv) {
                "(MSCKF/GPS-Z/yaw OC unchanged)\n" RESET,
                args.slam_freeze_t0, args.slam_freeze_t1);
   }
+  if (args.msckf_yaw_freeze_t0 >= 0.0 &&
+      args.msckf_yaw_freeze_t1 > args.msckf_yaw_freeze_t0) {
+    sys->set_msckf_yaw_freeze_window(args.msckf_yaw_freeze_t0,
+                                     args.msckf_yaw_freeze_t1);
+    PRINT_INFO(CYAN "[ros-free] MSCKF yaw freeze window: [%.3f, %.3f]s "
+                    "(MSCKF position/velocity, SLAM and GPS-Z unchanged)\n" RESET,
+               args.msckf_yaw_freeze_t0, args.msckf_yaw_freeze_t1);
+  }
+  if (args.visual_yaw_gain_zero_t0 >= 0.0 &&
+      args.visual_yaw_gain_zero_t1 > args.visual_yaw_gain_zero_t0) {
+    sys->set_visual_yaw_gain_zero_window(args.visual_yaw_gain_zero_t0,
+                                         args.visual_yaw_gain_zero_t1);
+    PRINT_INFO(CYAN "[ros-free] all-visual current-IMU yaw gain zero window: "
+                    "[%.3f, %.3f]s\n" RESET,
+               args.visual_yaw_gain_zero_t0, args.visual_yaw_gain_zero_t1);
+  }
   bool delayed_vio_yaw_control_applied = !delayed_vio_yaw_control;
   bool timed_yaw_switch_applied = args.vio_yaw_switch_mode.empty() || args.vio_yaw_switch_time < 0.0;
   if (!timed_yaw_switch_applied) {
@@ -2504,6 +2995,13 @@ int main(int argc, char **argv) {
 
   // Visual update guard (--visual-update-skip-window / --visual-update-guard-log / --visual-update-reject-topn-file)
   sys->set_visual_update_stride(args.visual_update_stride);
+  if (args.post_alignment_camera_extrinsic_left_rotvec_deg.norm() > 1e-12) {
+    if (!sys->configure_post_alignment_camera_extrinsic_rotation(
+            args.post_alignment_camera_extrinsic_left_rotvec_deg * M_PI / 180.0)) {
+      PRINT_ERROR(RED "[ros-free] invalid post-alignment camera extrinsic rotation\n" RESET);
+      return EXIT_FAILURE;
+    }
+  }
   if (args.visual_update_stride > 1) {
     PRINT_INFO(CYAN "[ros-free] Visual update stride: track every fed camera frame, "
                "run MSCKF/SLAM visual updates every %d frames\n" RESET,
@@ -2525,9 +3023,9 @@ int main(int argc, char **argv) {
                args.visual_update_adaptive_min_tracks);
   }
   if (args.adaptive_stride || args.adaptive_stride_shadow) {
-    PRINT_INFO(CYAN "[adaptive-stride] mode=%s fixed_stride=%d log=%s; "
-               "causal inputs only (actual camera/tracker dt, parallax rate, relative height, "
-               "VIO speed/attitude, IMU gyro, active features)\n" RESET,
+    PRINT_INFO(CYAN "[adaptive-visual] mode=%s fixed_stride=%d log=%s; "
+               "continuous causal geometry (actual dt, compensated KLT motion, "
+               "track support, valid AGL footprint, estimator health)\n" RESET,
                args.adaptive_stride ? "active" : "shadow", args.cam_subsample,
                args.adaptive_stride_log_path.c_str());
   }
@@ -2653,6 +3151,11 @@ int main(int argc, char **argv) {
     PRINT_INFO(CYAN "[ros-free] GPS alt JOSEPH-MASKED mode ENABLED "
                "(PX4-style: p_z state + p_z row/col of P only; Brink 2017)\n" RESET);
   }
+  if (args.gps_alt_guard_fallback_joseph_pz) {
+    sys->set_gps_alt_guard_fallback_joseph_pz(true);
+    PRINT_INFO(CYAN "[ros-free] GPS alt guarded fallback ENABLED "
+               "(unsafe coupled correction -> p_z-only Joseph update)\n" RESET);
+  }
   const int num_cams = params.state_options.num_cameras;
   if (args.stereo && num_cams < 2) {
     PRINT_ERROR(RED "[ros-free] --stereo requested but config has num_cameras=%d\n" RESET, num_cams);
@@ -2713,7 +3216,6 @@ int main(int argc, char **argv) {
   bool fc_init_pending = false;
   const bool online_alignment_mode =
       initialization_mode == InitializationMode::ONLINE_MULTISENSOR_ALIGNMENT;
-  const bool online_alignment_r1_shadow_only = online_alignment_mode;
   FCInitSeries online_fc_series;
   size_t online_fc_index = 0;
   FCInitResult fc_init_result;
@@ -2782,14 +3284,33 @@ int main(int argc, char **argv) {
         PRINT_INFO(CYAN "[ONLINE-ALIGN][DEBUG] FC row contracts validated\n" RESET);
 
         OnlineAlignmentOptions online_options;
-        // P4-R1 is a shadow-only fixed-time sliding window. Every sufficiently
-        // advanced window rebuilds the joint graph; no candidate filter or
-        // formal OpenVINS state injection participates in this phase.
-        online_options.sliding_window_shadow_only = true;
+        // Formal P4: run the upstream OpenVINS visual-inertial dynamic
+        // initializer once. The initialized metric local VIO is then paired
+        // causally with FC navigation over one real-time window to estimate
+        // only global yaw and translation. Metric scale is recovered later by
+        // the independent AGL output postprocess, never from FC horizontal
+        // velocity. No repeated joint Ceres graph is permitted in this path.
+        online_options.upstream_dynamic_init_fc_gauge = true;
+        online_options.sliding_window_shadow_only = false;
+        online_options.sliding_window_direct_state_release = false;
+        online_options.sliding_window_deferred_release_certification = false;
+        online_options.sliding_window_terminal_state_covariance_only = false;
+        online_options.max_initial_slam_features = 0;
+        online_options.max_initial_clones = 0;
+        online_options.sliding_window_diagnostic_never_anchor =
+            args.online_alignment_diagnostic_never_anchor;
+        online_options.fc_attitude_gauge_factor_enabled = true;
+        online_options.diagnostic_release_attitude_from_fc =
+            args.online_alignment_release_attitude_from_fc;
+        online_options.diagnostic_release_graph_attitude_fc_pv_zero_bias =
+            args.online_alignment_diagnostic_graph_q_fc_pv_zero_bias;
         online_options.sliding_window_duration_s = 8.0;
         online_options.sliding_window_min_advance_s = 0.5;
+        online_options.sliding_window_gauge_stability_duration_s = 8.0;
         online_options.reference_window_duration_s = 8.0;
         online_options.candidate_window_durations_s = {8.0};
+        online_options.candidate_short_validation_duration_s = 2.0;
+        online_options.candidate_refinement_enabled = true;
         online_options.min_fc_samples = 20;
         online_options.min_imu_samples = 600;
         online_options.min_stereo_frames = 12;
@@ -2800,6 +3321,8 @@ int main(int argc, char **argv) {
         online_options.max_imu_gap_s = 0.03;
         online_options.max_stereo_gap_s = 0.75;
         online_options.maximum_selected_alignment_frames = 36;
+        online_options.max_keyframes =
+            online_options.maximum_selected_alignment_frames;
         online_options.max_gyro_bias_norm_rad_s = args.init_max_bg_norm_rad_s;
         online_options.max_accel_bias_norm_mps2 = args.init_max_ba_norm_mps2;
         // Motion is used only to check the accepted external calibration and
@@ -2834,6 +3357,13 @@ int main(int argc, char **argv) {
         online_options.fc_board_mount_sigma_deg = parse_declared_scalar(
             require_declaration("fc_board_mount_sigma_deg"),
             "fc_board_mount_sigma_deg");
+        // The full-flight calibration's fixed-mount sigma is the empirical
+        // FC-attitude/board agreement uncertainty for this flight. Use that
+        // declared uncertainty for the single full-attitude gauge instead of the
+        // generic 2 deg fallback, which made the absolute G_nav gauge almost
+        // inert even when a calibration record was accepted.
+        online_options.fc_attitude_sigma_deg =
+            std::max(0.05, online_options.fc_board_mount_sigma_deg);
         online_options.p_IinF = parse_declared_vector3(
             require_declaration("p_IinF_m"), "p_IinF_m");
         online_options.visual_factors_enabled =
@@ -2848,6 +3378,105 @@ int main(int argc, char **argv) {
             args.online_alignment_release_policy == "strict_full_alignment"
                 ? AlignmentReleasePolicy::STRICT_FULL_ALIGNMENT
                 : AlignmentReleasePolicy::PRACTICAL_NAVIGATION_START;
+        const auto configure_candidate_gate =
+            [&](CandidateStateGroup group, bool require_graph_support,
+                bool allow_early_feedback,
+                const Eigen::Vector3d &max_abs_error,
+                const Eigen::Vector3d &max_std,
+                const Eigen::Vector3d &max_std_step,
+                const Eigen::Vector3d &max_error_peak_to_peak,
+                const Eigen::Vector3d &max_std_peak_to_peak,
+                const Eigen::Vector3d &max_feedback_step,
+                const Eigen::Vector3d &max_cumulative_feedback) {
+              CandidateGroupGate &gate =
+                  online_options.candidate_filter_config.group_gates
+                      [static_cast<std::size_t>(group)];
+              gate.configured = true;
+              gate.derive_depth_from_sliding_window = true;
+              gate.allow_initial_feedback_before_derived_history =
+                  allow_early_feedback;
+              gate.require_initial_graph_support = require_graph_support;
+              gate.history_duration_s = 0.0;
+              gate.history_length_updates = 0;
+              gate.min_supported_updates = 0;
+              gate.post_feedback_validation_duration_s = 0.0;
+              gate.required_post_feedback_stable_updates = 0;
+              gate.max_abs_error = max_abs_error;
+              gate.max_std = max_std;
+              gate.max_std_step = max_std_step;
+              gate.max_error_peak_to_peak = max_error_peak_to_peak;
+              gate.max_std_peak_to_peak = max_std_peak_to_peak;
+              gate.max_feedback_step = max_feedback_step;
+              gate.max_cumulative_feedback = max_cumulative_feedback;
+            };
+        const double deg = M_PI / 180.0;
+        configure_candidate_gate(
+            CandidateStateGroup::ATTITUDE, true, true,
+            Eigen::Vector3d::Constant(1.0 * deg),
+            Eigen::Vector3d::Constant(5.0 * deg),
+            Eigen::Vector3d::Constant(0.25 * deg),
+            Eigen::Vector3d::Constant(0.75 * deg),
+            Eigen::Vector3d::Constant(0.50 * deg),
+            Eigen::Vector3d::Constant(3.0 * deg),
+            Eigen::Vector3d::Constant(3.0 * deg));
+        configure_candidate_gate(
+            CandidateStateGroup::POSITION, false, false,
+            Eigen::Vector3d::Constant(1.0),
+            Eigen::Vector3d::Constant(5.0),
+            Eigen::Vector3d::Constant(0.25),
+            Eigen::Vector3d::Constant(1.0),
+            Eigen::Vector3d::Constant(0.50),
+            Eigen::Vector3d::Constant(5.0),
+            Eigen::Vector3d::Constant(5.0));
+        configure_candidate_gate(
+            CandidateStateGroup::VELOCITY, false, false,
+            Eigen::Vector3d::Constant(0.50),
+            Eigen::Vector3d::Constant(2.0),
+            Eigen::Vector3d::Constant(0.10),
+            Eigen::Vector3d::Constant(0.50),
+            Eigen::Vector3d::Constant(0.20),
+            Eigen::Vector3d::Constant(3.0),
+            Eigen::Vector3d::Constant(3.0));
+        configure_candidate_gate(
+            CandidateStateGroup::GYRO_BIAS, true, true,
+            Eigen::Vector3d::Constant(0.010),
+            Eigen::Vector3d::Constant(0.100),
+            Eigen::Vector3d::Constant(0.005),
+            Eigen::Vector3d::Constant(0.010),
+            Eigen::Vector3d::Constant(0.010),
+            Eigen::Vector3d::Constant(0.020),
+            Eigen::Vector3d::Constant(0.020));
+        configure_candidate_gate(
+            CandidateStateGroup::ACCEL_BIAS, true, true,
+            Eigen::Vector3d::Constant(0.20),
+            Eigen::Vector3d::Constant(2.0),
+            Eigen::Vector3d::Constant(0.05),
+            Eigen::Vector3d::Constant(0.20),
+            Eigen::Vector3d::Constant(0.20),
+            Eigen::Vector3d::Constant(0.50),
+            Eigen::Vector3d::Constant(0.50));
+        if (args.online_alignment_retain_bg_prior) {
+          online_options.candidate_filter_config.group_gates
+              [static_cast<std::size_t>(CandidateStateGroup::GYRO_BIAS)]
+                  .configured = false;
+          PRINT_INFO(CYAN "[ONLINE-ALIGN][POLICY] bg remains graph-estimated; FC p/v-only candidate bg feedback is disabled\n" RESET);
+        }
+        if (args.online_alignment_retain_ba_prior) {
+          online_options.candidate_filter_config.group_gates
+              [static_cast<std::size_t>(CandidateStateGroup::ACCEL_BIAS)]
+                  .configured = false;
+          PRINT_INFO(CYAN "[ONLINE-ALIGN][POLICY] ba remains graph-estimated; FC p/v-only candidate ba feedback is disabled\n" RESET);
+        }
+        online_options.candidate_filter_config.nis_gate_3d = 11.345;
+        online_options.candidate_max_closed_loop_attitude_correction_deg =
+            3.0;
+        online_options.candidate_max_closed_loop_position_correction_m = 5.0;
+        online_options.candidate_max_closed_loop_velocity_correction_mps =
+            3.0;
+        online_options.candidate_max_closed_loop_gyro_bias_correction_rad_s =
+            0.020;
+        online_options.candidate_max_closed_loop_accel_bias_correction_mps2 =
+            0.50;
         PRINT_INFO(CYAN "[ONLINE-ALIGN][DEBUG] configuring initializer\n" RESET);
         if (!sys->configure_online_alignment(online_options))
           throw std::runtime_error(
@@ -2859,7 +3488,7 @@ int main(int argc, char **argv) {
         PRINT_INFO(CYAN "[ONLINE-ALIGN] frames G=%s F=%s I=%s; shared target-parallax visual scheduler, T_C_I locked, manual 7deg/4.089deg corrections absent\n" RESET,
                    navigation_frame.c_str(), fc_body_frame.c_str(),
                    board_imu_frame.c_str());
-        PRINT_INFO(CYAN "[ONLINE-ALIGN] P4-R1 shadow-only fixed 8s sliding window; solve trigger requires 0.5s window-end advance; candidate filter and formal state feedback are disabled\n" RESET);
+        PRINT_INFO(CYAN "[ONLINE-ALIGN] formal P4 uses one upstream dynamic VIO initialization followed by an 8s causal FC/VIO velocity-position Sim(3) window; one atomic reset is allowed; repeated joint Ceres is disabled\n" RESET);
       } else {
       if (cam0.empty())
         throw std::runtime_error("no camera frames remain after --start-time trim; cannot choose FC init by camera time");
@@ -3070,8 +3699,69 @@ int main(int argc, char **argv) {
   debug_out << "# t_cam vx vy vz bg_x bg_y bg_z ba_x ba_y ba_z\n";
   debug_out << std::fixed << std::setprecision(9);
 
+  std::ofstream dynamic_turn_roi_out;
+  if (args.post_alignment_visual_roi == "dynamic_turn") {
+    if (args.dynamic_turn_roi_diag_path.empty())
+      args.dynamic_turn_roi_diag_path =
+          sibling_path(args.output_path, "dynamic_turn_roi.csv");
+    fs::path p(args.dynamic_turn_roi_diag_path);
+    if (!p.parent_path().empty())
+      fs::create_directories(p.parent_path());
+    dynamic_turn_roi_out.open(args.dynamic_turn_roi_diag_path,
+                              std::ofstream::out | std::ofstream::trunc);
+    if (!dynamic_turn_roi_out.is_open()) {
+      PRINT_ERROR(RED "[dynamic-turn-roi] cannot open diagnostics: %s\n" RESET,
+                  args.dynamic_turn_roi_diag_path.c_str());
+      return EXIT_FAILURE;
+    }
+    dynamic_turn_roi_out
+        << "timestamp,signal_valid,raw_yaw_rate_radps,filtered_yaw_rate_radps,"
+        << "direction,preferred_side,strength,preferred_fraction,"
+        << "detection_exclusion_fraction,reason,tracking_frame_fed,"
+        << "backend_frame_fed,detection_masked_pixels,msckf_available,"
+        << "msckf_selected_preferred,msckf_selected_other,slam_available,"
+        << "slam_selected_preferred,slam_selected_other,"
+        << "delayed_slam_available,delayed_slam_selected_preferred,"
+        << "delayed_slam_selected_other\n";
+    dynamic_turn_roi_out << std::fixed << std::setprecision(9);
+  }
+
+  std::ofstream agl_scene_scale_out;
+  size_t agl_scene_scale_last_logged_evaluation = 0;
+  if (agl_scene_scale_enabled) {
+    if (args.agl_scene_scale_diag_path.empty())
+      args.agl_scene_scale_diag_path =
+          sibling_path(args.output_path, "agl_scene_scale.csv");
+    fs::path p(args.agl_scene_scale_diag_path);
+    if (!p.parent_path().empty())
+      fs::create_directories(p.parent_path());
+    agl_scene_scale_out.open(args.agl_scene_scale_diag_path,
+                             std::ofstream::out | std::ofstream::trunc);
+    if (!agl_scene_scale_out.is_open()) {
+      PRINT_ERROR(RED "[AGL-SCALE] cannot open diagnostics: %s\n" RESET,
+                  args.agl_scene_scale_diag_path.c_str());
+      return EXIT_FAILURE;
+    }
+    agl_scene_scale_out
+        << "timestamp,mode,agl_timestamp,agl_m,agl_age_s,ground_valid,"
+        << "ground_reason,map_height_m,map_height_sigma_m,plane_tilt_deg,"
+        << "plane_residual_mad_m,plane_residual_rmse_m,input_features,"
+        << "candidate_features,inlier_features,inlier_ratio,image_cells,"
+        << "u_span_fraction,v_span_fraction,distinct_clone_times,"
+        << "window_coverage_s,window_max_gap_s,median_ratio,log_ratio_mad,"
+        << "candidate_scale,proposed_scale,cumulative_scale,decision_ready,"
+        << "decision_reason,reset_attempted,reset_succeeded,state_modified,"
+        << "applied_scale,reset_reason,covariance_min_eigenvalue,"
+        << "covariance_psd_projected,covariance_psd_projection_magnitude,"
+        << "covariance_psd_projection_limit,"
+        << "evaluation_count,valid_ground_count,proposal_count,"
+        << "reset_attempt_count,reset_success_count\n";
+    agl_scene_scale_out << std::fixed << std::setprecision(9);
+  }
+
   std::ofstream provisional_navigation_out;
-  if (online_alignment_mode) {
+  if (online_alignment_mode &&
+      args.online_alignment_diagnostic_never_anchor) {
     const std::string provisional_path =
         sibling_path(args.output_path, "provisional_navigation.csv");
     provisional_navigation_out.open(
@@ -3089,7 +3779,10 @@ int main(int argc, char **argv) {
     provisional_navigation_out << std::fixed << std::setprecision(9);
   }
 
-  AdaptiveStrideController adaptive_stride_controller;
+  // P4 owns its finite-window frame selector and receives every causal startup
+  // image. P5 is the only owner of this scheduler and starts from a fresh dense
+  // state after P4 has injected the OpenVINS state.
+  AdaptiveVisualScheduler adaptive_visual_scheduler;
   std::ofstream adaptive_stride_out;
   if (args.adaptive_stride || args.adaptive_stride_shadow) {
     fs::path p(args.adaptive_stride_log_path);
@@ -3103,34 +3796,35 @@ int main(int argc, char **argv) {
       return EXIT_FAILURE;
     }
     adaptive_stride_out
-        << "timestamp,current_fixed_stride,recommended_stride,relative_height,"
-        << "horizontal_speed,vertical_speed,roll,pitch,gyro_norm,median_parallax_px,active_msckf_features,"
-        << "active_slam_features,reason_height,reason_turn,reason_feature_low,"
-        << "reason_parallax_low,reason_parallax_high,reason_descent,reason_low_height,"
-        << "hysteresis_state,hold_timer,"
-        << "base_stride,filtered_height,filtered_speed,filtered_vertical_speed,filtered_parallax_px,"
-        << "filtered_parallax_rate_pxps,normalized_parallax_px,parallax_target_stride,"
-        << "actual_received_camera_dt_s,parallax_measurement_dt_s,"
-        << "parallax_measurement_age_s,time_since_last_fed_camera_s,"
-        << "raw_frames_since_last_feed,"
-        << "effective_height,filtered_gyro,severe_turn,severe_feature_low,"
-        << "severe_parallax_high,severe_visual_stale,severe_descent,"
-        << "force_fullrate_tracking,changed,"
-        << "switch_reason,height_source,height_timestamp_s,height_age_s,"
-        << "height_uncertainty_m,height_valid,mode,applied_stride,frame_fed,"
-        << "policy_state,previous_policy_state,policy_state_changed,main_trigger,transition_reason,"
-        << "tracking_stride,backend_update_stride,tracking_stride_changed,backend_stride_changed,"
-        << "emergency_downshift,normal_recovery,unnecessary_reversal,minimum_dwell_violation,"
-        << "same_state_target_rewrite,state_dwell_s,transition_guard_s,low_altitude_band,"
-        << "p95_parallax_px,filtered_parallax_p95_px,predicted_overlap,"
-        << "predicted_median_displacement_px,predicted_p95_displacement_px,"
-        << "actual_tracking_frame_interval_s,actual_backend_frame_interval_s,"
-        << "median_track_age_frames,visual_residual_rmse_px,visual_residual_p95_px,"
-        << "msckf_input_count,msckf_accepted_count,msckf_rejected_count,"
-        << "time_since_accepted_backend_update_s,covariance_all_finite,"
-        << "covariance_negative_diagonal_count,position_jump_m,velocity_jump_mps,attitude_jump_deg,"
-        << "tracking_frame_fed,backend_frame_fed,raw_frames_since_tracking,"
-        << "raw_frames_since_backend,time_since_tracking_s,time_since_backend_s\n";
+        << "timestamp,mode,decision_reason,tracking_gap,instantaneous_safe_gap,"
+        << "tracking_gap_changed,immediate_contraction,expansion_confirmed,"
+        << "new_motion_measurement,raw_camera_dt_s,actual_tracking_interval_s,"
+        << "motion_timestamp_s,motion_age_s,motion_dt_s,common_tracks,"
+        << "effective_tracks,survival_ratio,median_track_age,grid_occupancy,"
+        << "grid_entropy,border_track_ratio,raw_p95_px,rotation_p95_px,"
+        << "rotation_max_px,compensated_median_px,compensated_p95_px,"
+        << "compensated_sigma_px,compensated_p95_ucb_px,target_horizon_s,"
+        << "safe_horizon_s,interval_horizon_s,compensated_horizon_s,"
+        << "raw_horizon_s,rotation_horizon_s,survival_horizon_s,"
+        << "predicted_compensated_median_px,predicted_compensated_p95_ucb_px,"
+        << "estimator_protection,tracking_protection,active_features,"
+        << "agl_m,agl_source,agl_age_s,ground_geometry_valid,"
+        << "ground_overlap_horizon_s,predicted_ground_overlap,"
+        << "visual_residual_p95_px,time_since_accepted_backend_update_s,"
+        << "covariance_all_finite,covariance_negative_diagonal_count,"
+        << "visual_state_correction_valid,visual_position_correction_m,"
+        << "visual_velocity_correction_mps,visual_attitude_correction_deg,run_mode,"
+        << "tracking_frame_fed,backend_clone_created,raw_frames_since_tracking,"
+        << "time_since_tracking_s,time_since_backend_clone_s,backend_trigger,"
+        << "backend_reference_committed,backend_reason,backend_information_score,"
+        << "backend_elapsed_since_clone_s,backend_minimum_temporal_separation_s,"
+        << "backend_temporal_support_ready,backend_translation_baseline_px,"
+        << "backend_translation_p95_ucb_px,backend_effective_tracks,"
+        << "backend_survival_ratio,backend_grid_occupancy,"
+        << "backend_visual_geometry_valid,"
+        << "backend_pure_rotation,backend_information_trigger,"
+        << "backend_latency_trigger,backend_termination_trigger,"
+        << "backend_forced_without_visual_information\n";
     adaptive_stride_out << std::fixed << std::setprecision(9);
   }
 
@@ -3177,6 +3871,27 @@ int main(int argc, char **argv) {
     }
   }
 
+  std::ofstream fc_yaw_aid_out;
+  if (args.post_alignment_fc_yaw_aid) {
+    if (args.post_alignment_fc_yaw_aid_log_path.empty())
+      args.post_alignment_fc_yaw_aid_log_path =
+          args.output_path + ".fc_yaw_aid.csv";
+    fs::path p(args.post_alignment_fc_yaw_aid_log_path);
+    if (!p.parent_path().empty())
+      fs::create_directories(p.parent_path());
+    fc_yaw_aid_out.open(args.post_alignment_fc_yaw_aid_log_path,
+                        std::ofstream::out | std::ofstream::trunc);
+    if (!fc_yaw_aid_out.is_open()) {
+      PRINT_ERROR(RED "[FC-YAW-AID] failed to open %s\n" RESET,
+                  args.post_alignment_fc_yaw_aid_log_path.c_str());
+      return EXIT_FAILURE;
+    }
+    fc_yaw_aid_out
+        << "camera_time,fc_attitude_time,yaw_measurement_deg,yaw_residual_deg,"
+           "nis,gate_ratio,predicted_yaw_correction_deg,accepted,decision\n";
+    fc_yaw_aid_out << std::fixed << std::setprecision(9);
+  }
+
   // -------------------- timeline merge-sort --------------------
   size_t imu_i = 0, cam_i = 0, cam1_i = 0, gps_i = 0;
   // Track last GPS sample index actually fed to the filter, so we don't
@@ -3202,7 +3917,6 @@ int main(int argc, char **argv) {
   std::vector<double> processed_image_timestamps;
   size_t adaptive_raw_frames_since_feed = 0;
   size_t adaptive_raw_frames_since_tracking = 0;
-  size_t adaptive_raw_frames_since_backend = 0;
   double adaptive_last_raw_camera_time =
       std::numeric_limits<double>::quiet_NaN();
   double adaptive_last_parallax_packet_time =
@@ -3211,44 +3925,28 @@ int main(int argc, char **argv) {
       -std::numeric_limits<double>::infinity();
   double adaptive_last_fed_camera_time =
       std::numeric_limits<double>::quiet_NaN();
+  double p4_dynamic_last_fed_camera_time =
+      std::numeric_limits<double>::quiet_NaN();
   double adaptive_last_backend_camera_time =
       std::numeric_limits<double>::quiet_NaN();
-  double adaptive_last_health_packet_time =
-      -std::numeric_limits<double>::infinity();
   std::unordered_map<size_t, int> adaptive_track_age;
   std::unordered_set<size_t> adaptive_previous_track_ids;
   double adaptive_median_track_age = std::numeric_limits<double>::quiet_NaN();
-  size_t adaptive_backend_frame_count = 0;
-  size_t adaptive_tracking_only_frame_count = 0;
-  size_t adaptive_policy_state_transition_count = 0;
   size_t adaptive_tracking_stride_change_count = 0;
-  size_t adaptive_backend_stride_change_count = 0;
   size_t adaptive_emergency_downshift_count = 0;
-  size_t adaptive_normal_recovery_count = 0;
-  size_t adaptive_unnecessary_reversal_count = 0;
-  size_t adaptive_minimum_dwell_violation_count = 0;
-  size_t adaptive_same_state_target_rewrite_count = 0;
-  size_t adaptive_last_msckf_accept_count = 0;
+  size_t adaptive_last_visual_accept_count = 0;
   double adaptive_last_accepted_backend_update_time =
       std::numeric_limits<double>::quiet_NaN();
   bool adaptive_cadence_started = false;
-  bool adaptive_have_state_snapshot = false;
-  double adaptive_state_snapshot_time = -1.0;
-  Eigen::Vector3d adaptive_state_snapshot_p = Eigen::Vector3d::Zero();
-  Eigen::Vector3d adaptive_state_snapshot_v = Eigen::Vector3d::Zero();
-  Eigen::Quaterniond adaptive_state_snapshot_q = Eigen::Quaterniond::Identity();
+  bool adaptive_planner_started = false;
+  bool adaptive_have_covariance_snapshot = false;
+  double adaptive_covariance_snapshot_time = -1.0;
   bool adaptive_covariance_all_finite = true;
   int adaptive_covariance_negative_diagonal_count = 0;
   size_t adaptive_switch_count = 0;
   size_t adaptive_down_switch_count = 0;
   size_t adaptive_up_switch_count = 0;
-  bool adaptive_have_vio_height_origin = false;
-  double adaptive_vio_height_origin = 0.0;
-  double adaptive_vio_height_origin_sigma =
-      std::numeric_limits<double>::quiet_NaN();
-  double adaptive_vio_height_sigma =
-      std::numeric_limits<double>::quiet_NaN();
-  AdaptiveStrideDecision adaptive_decision;
+  AdaptiveVisualSchedulerDecision adaptive_decision;
   struct CameraFrameAdaptiveStats {
     size_t enabled = 0;
     size_t feed_count = 0;
@@ -3284,6 +3982,7 @@ int main(int argc, char **argv) {
   Eigen::Vector2d gps_xy_vio_ref = Eigen::Vector2d::Zero();
   size_t gps_alt_feeds = 0;
   double pose_repair_next_time = -1.0;
+  double fc_yaw_aid_next_time = -1.0;
   Eigen::Vector3d pose_repair_gps_ref = Eigen::Vector3d::Zero();
   Eigen::Vector3d pose_repair_vio_ref = Eigen::Vector3d::Zero();
   bool pose_repair_ref_valid = false;
@@ -3308,6 +4007,9 @@ int main(int argc, char **argv) {
   std::string restart_init_source;
 
   auto configure_after_restart = [&](const std::shared_ptr<VioManager> &next_sys) {
+    next_sys->configure_dynamic_turn_roi(
+        args.post_alignment_visual_roi == "dynamic_turn");
+    next_sys->configure_agl_scene_scale(args.agl_scene_scale_mode);
     next_sys->set_tracker_viz_image_payload_enabled(
         args.dashboard_enabled || !args.video_cam_path.empty());
     if (delayed_vio_yaw_control_applied) {
@@ -3321,6 +4023,13 @@ int main(int argc, char **argv) {
         next_sys->set_vio_global_yaw_oc_alpha(args.vio_yaw_switch_alpha);
     }
     next_sys->set_visual_update_stride(args.visual_update_stride);
+    if (args.post_alignment_camera_extrinsic_left_rotvec_deg.norm() > 1e-12) {
+      if (!next_sys->configure_post_alignment_camera_extrinsic_rotation(
+              args.post_alignment_camera_extrinsic_left_rotvec_deg * M_PI / 180.0)) {
+        PRINT_ERROR(RED "[ros-free] invalid post-alignment camera extrinsic rotation on restart\n" RESET);
+        std::exit(EXIT_FAILURE);
+      }
+    }
     next_sys->configure_visual_update_adaptive(
         args.visual_update_adaptive,
         args.visual_update_adaptive_target_flow_px,
@@ -3354,6 +4063,14 @@ int main(int argc, char **argv) {
     }
     if (args.slam_freeze_t0 >= 0.0 && args.slam_freeze_t1 > args.slam_freeze_t0)
       next_sys->set_slam_update_freeze_window(args.slam_freeze_t0, args.slam_freeze_t1);
+    if (args.msckf_yaw_freeze_t0 >= 0.0 &&
+        args.msckf_yaw_freeze_t1 > args.msckf_yaw_freeze_t0)
+      next_sys->set_msckf_yaw_freeze_window(args.msckf_yaw_freeze_t0,
+                                            args.msckf_yaw_freeze_t1);
+    if (args.visual_yaw_gain_zero_t0 >= 0.0 &&
+        args.visual_yaw_gain_zero_t1 > args.visual_yaw_gain_zero_t0)
+      next_sys->set_visual_yaw_gain_zero_window(args.visual_yaw_gain_zero_t0,
+                                                args.visual_yaw_gain_zero_t1);
     if (args.gps_alt_min_pzz > 0.0)
       next_sys->set_gps_alt_min_pzz(args.gps_alt_min_pzz);
     if (args.gps_alt_min_t_after_init > 0.0)
@@ -3400,6 +4117,8 @@ int main(int argc, char **argv) {
                                            args.gps_alt_nasa_q_threshold);
     if (args.gps_alt_joseph)
       next_sys->set_gps_alt_joseph_update(true);
+    if (args.gps_alt_guard_fallback_joseph_pz)
+      next_sys->set_gps_alt_guard_fallback_joseph_pz(true);
   };
 
   auto maybe_align = [&](double t) {
@@ -3533,6 +4252,11 @@ int main(int argc, char **argv) {
     return vel.allFinite();
   };
 
+  const auto formal_navigation_ready = [&]() -> bool {
+    return sys->initialized() &&
+           (!online_alignment_mode || sys->online_alignment_complete());
+  };
+
   while (!g_stop.load() && (imu_i < imu.size() || cam_i < cam0.size())) {
     double t_imu = imu_i < imu.size() ? imu[imu_i].timestamp : INF;
     double t_cam = cam_i < cam0.size() ? cam0[cam_i].timestamp : INF;
@@ -3573,6 +4297,14 @@ int main(int argc, char **argv) {
         BoardImuSample board;
         board.timestamp = t_imu;
         board.angular_velocity = imu[imu_i].gyro;
+        if (formal_navigation_ready()) {
+          if (std::abs(board.angular_velocity.z()) >=
+              args.post_alignment_gyro_z_scale_min_abs_rad_s) {
+            board.angular_velocity.z() *= args.post_alignment_gyro_z_scale;
+          }
+          board.angular_velocity.z() +=
+              args.post_alignment_gyro_z_perturbation_rad_s;
+        }
         board.linear_acceleration = imu[imu_i].accel;
         board.frame = "board_imu";
         board.status_valid = board.angular_velocity.allFinite() &&
@@ -3622,6 +4354,14 @@ int main(int argc, char **argv) {
           msg.masks.push_back(cv::Mat::zeros(img1.size(), CV_8UC1));
         }
       }
+    }
+
+    // Diagnostic causal ROI ablation.  P4 always receives the full image; the
+    // mask becomes active only after P4 has formally anchored navigation.
+    if (formal_navigation_ready() && args.post_alignment_visual_roi != "full" &&
+        args.post_alignment_visual_roi != "dynamic_turn") {
+      for (cv::Mat &mask : msg.masks)
+        apply_post_alignment_visual_roi(mask, args.post_alignment_visual_roi);
     }
 
     if (fc_init_pending && !sys->initialized()) {
@@ -3730,92 +4470,92 @@ int main(int argc, char **argv) {
     double ref_course_yaw = 0.0;
     bool ref_course_valid = reference_course_yaw_at(t_cam, ref_course_yaw);
     sys->set_reference_course_yaw(t_cam, ref_course_yaw, ref_course_valid);
-    AdaptiveStrideInput adaptive_input;
-    std::string adaptive_height_source = "unavailable";
-    double adaptive_height_timestamp =
-        std::numeric_limits<double>::quiet_NaN();
-    double adaptive_height_age = std::numeric_limits<double>::infinity();
-    double adaptive_height_uncertainty =
-        std::numeric_limits<double>::quiet_NaN();
-    bool adaptive_height_valid = false;
-    int adaptive_prev_stride = adaptive_stride_controller.recommended_stride();
-    int adaptive_prev_tracking_stride = adaptive_stride_controller.tracking_stride();
-    const bool p4_visual_cadence_active =
-        online_alignment_mode && !sys->initialized();
-    const bool visual_cadence_planner_active =
-        args.adaptive_stride || args.adaptive_stride_shadow ||
-        p4_visual_cadence_active;
-    if (visual_cadence_planner_active) {
-      adaptive_input.timestamp = t_cam;
-      if (std::isfinite(adaptive_last_raw_camera_time))
-        adaptive_input.actual_received_camera_dt_s =
-            t_cam - adaptive_last_raw_camera_time;
-      adaptive_last_raw_camera_time = t_cam;
-      adaptive_input.initialized = sys->initialized();
-      adaptive_input.configured_feature_count = params.num_pts;
-      if (imu_i > 0 && imu_i <= imu.size())
-        adaptive_input.gyro_norm_radps = imu[imu_i - 1].gyro.norm();
-
-      // Causal relative height: the latest GPS sample at or before t_cam.
-      // DatasetReaderEuroc anchors ENU-U at the first (ground) GPS sample.  No
-      // future sample, course, reference error, or flight identity is read.
-      if (!gps.empty()) {
-        auto it = std::upper_bound(
-            gps.begin(), gps.end(), t_cam,
-            [](double tt, const DatasetReaderEuroc::GpsSample &s) { return tt < s.timestamp; });
-        if (it != gps.begin()) {
-          --it;
-          if (t_cam - it->timestamp <= 2.0) {
-            adaptive_input.relative_height_m = it->xyz.z();
-            adaptive_height_source = "gps_past_enu_u";
-            adaptive_height_timestamp = it->timestamp;
-            adaptive_height_age = t_cam - it->timestamp;
-            adaptive_height_uncertainty = args.gps_alt_sigma;
-            adaptive_height_valid =
-                std::isfinite(adaptive_input.relative_height_m);
-          }
+    AdaptiveVisualSchedulerInput adaptive_input;
+    double adaptive_agl_m = std::numeric_limits<double>::quiet_NaN();
+    double adaptive_agl_age_s = std::numeric_limits<double>::infinity();
+    double adaptive_agl_timestamp_s = -1.0;
+    std::string adaptive_agl_source = "unavailable";
+    // One causal altitude lookup shared by P5 geometry and the independent
+    // AGL scene-scale path. Horizontal GPS and course are not passed here.
+    if (!gps.empty()) {
+      auto altitude_sample = std::upper_bound(
+          gps.begin(), gps.end(), t_cam,
+          [](double timestamp,
+             const DatasetReaderEuroc::GpsSample &sample) {
+            return timestamp < sample.timestamp;
+          });
+      if (altitude_sample != gps.begin()) {
+        --altitude_sample;
+        adaptive_agl_timestamp_s = altitude_sample->timestamp;
+        adaptive_agl_age_s = t_cam - altitude_sample->timestamp;
+        if (adaptive_agl_age_s >= 0.0 && adaptive_agl_age_s <= 2.0 &&
+            std::isfinite(altitude_sample->xyz.z()) &&
+            altitude_sample->xyz.z() > 0.5) {
+          adaptive_agl_m = altitude_sample->xyz.z();
+          adaptive_agl_source = "past_gps_relative_u";
         }
       }
+    }
+    if (agl_scene_scale_enabled && formal_navigation_ready() &&
+        adaptive_agl_timestamp_s >= 0.0 &&
+        std::isfinite(adaptive_agl_m)) {
+      sys->feed_measurement_agl(adaptive_agl_timestamp_s, adaptive_agl_m,
+                                true);
+    }
+    const bool p4_visual_cadence_active =
+        online_alignment_mode && !sys->online_alignment_complete();
+    const bool p5_visual_cadence_active =
+        (args.adaptive_stride || args.adaptive_stride_shadow) &&
+        formal_navigation_ready();
+    const bool visual_cadence_planner_active = p5_visual_cadence_active;
+    const int adaptive_previous_gap =
+        adaptive_visual_scheduler.tracking_gap();
+    if (p5_visual_cadence_active && !adaptive_planner_started) {
+      adaptive_planner_started = true;
+      adaptive_last_raw_camera_time =
+          std::numeric_limits<double>::quiet_NaN();
+      adaptive_last_fed_camera_time =
+          std::numeric_limits<double>::quiet_NaN();
+      adaptive_last_tracker_packet_time =
+          -std::numeric_limits<double>::infinity();
+      adaptive_last_parallax_packet_time =
+          -std::numeric_limits<double>::infinity();
+      adaptive_track_age.clear();
+      adaptive_previous_track_ids.clear();
+      adaptive_median_track_age = std::numeric_limits<double>::quiet_NaN();
+    }
+    if (visual_cadence_planner_active &&
+        std::isfinite(adaptive_last_raw_camera_time))
+      adaptive_input.raw_camera_dt_s =
+          t_cam - adaptive_last_raw_camera_time;
+    if (visual_cadence_planner_active)
+      adaptive_last_raw_camera_time = t_cam;
+    if (visual_cadence_planner_active) {
+      adaptive_input.timestamp = t_cam;
+      adaptive_input.initialized = formal_navigation_ready();
+      if (std::isfinite(adaptive_last_fed_camera_time))
+        adaptive_input.actual_tracking_interval_s =
+            std::max(0.0, t_cam - adaptive_last_fed_camera_time);
 
       if (sys->initialized()) {
         auto state_pre = sys->get_state();
-        const Eigen::Vector3d p_wi_pre = state_pre->_imu->pos();
-        const Eigen::Vector3d v_wi_pre = state_pre->_imu->vel();
-        adaptive_input.horizontal_speed_mps = v_wi_pre.head<2>().norm();
-        adaptive_input.vertical_speed_mps = v_wi_pre.z();
-        Eigen::Matrix3d R_wi_pre = state_pre->_imu->Rot().transpose();
-        Eigen::Quaterniond q_pre(R_wi_pre);
-        const double qw = q_pre.w(), qx = q_pre.x(), qy = q_pre.y(), qz = q_pre.z();
-        adaptive_input.roll_deg = std::atan2(2.0 * (qw * qx + qy * qz),
-                                             1.0 - 2.0 * (qx * qx + qy * qy)) * 180.0 / M_PI;
-        adaptive_input.pitch_deg = std::asin(std::max(-1.0, std::min(1.0,
-                                              2.0 * (qw * qy - qz * qx)))) * 180.0 / M_PI;
-        adaptive_input.active_slam_features = (int)sys->get_features_SLAM().size();
-        const bool agl_reliable_for_overlap =
-            adaptive_height_valid &&
-            std::isfinite(adaptive_height_uncertainty) &&
-            adaptive_height_uncertainty <=
-                std::max(5.0, 0.20 * adaptive_input.relative_height_m);
-        if (std::isfinite(adaptive_input.relative_height_m) &&
-            adaptive_input.relative_height_m > 0.0 &&
-            agl_reliable_for_overlap &&
-            std::isfinite(adaptive_input.actual_received_camera_dt_s) &&
-            adaptive_input.actual_received_camera_dt_s > 0.0 &&
+        const Eigen::Vector3d position = state_pre->_imu->pos();
+        const Eigen::Vector3d velocity = state_pre->_imu->vel();
+        if (std::isfinite(adaptive_agl_m) &&
             state_pre->_cam_intrinsics_cameras.count(0) > 0 &&
             state_pre->_calib_IMUtoCAM.count(0) > 0) {
-          const auto camera_model = state_pre->_cam_intrinsics_cameras.at(0);
-          const Eigen::Matrix3d R_GtoC =
+          const auto camera_model =
+              state_pre->_cam_intrinsics_cameras.at(0);
+          GroundFootprintPredictionInput footprint;
+          footprint.R_GtoC =
               state_pre->_calib_IMUtoCAM.at(0)->Rot() *
               state_pre->_imu->Rot();
-          const Eigen::Vector3d p_CinG =
-              p_wi_pre - R_GtoC.transpose() *
+          footprint.p_CinG =
+              position - footprint.R_GtoC.transpose() *
                              state_pre->_calib_IMUtoCAM.at(0)->pos();
-          GroundFootprintOverlapInput overlap_input;
-          overlap_input.R_GtoC = R_GtoC;
-          overlap_input.p_CinG = p_CinG;
-          overlap_input.velocity_G = v_wi_pre;
-          overlap_input.ground_height_G =
-              p_CinG.z() - adaptive_input.relative_height_m;
+          footprint.velocity_G = velocity;
+          footprint.ground_height_G =
+              footprint.p_CinG.z() - adaptive_agl_m;
           const std::array<cv::Point2f, 4> corners = {
               cv::Point2f(0.0f, 0.0f),
               cv::Point2f(static_cast<float>(camera_model->w() - 1), 0.0f),
@@ -3826,273 +4566,167 @@ int main(int argc, char **argv) {
           for (size_t corner = 0; corner < corners.size(); ++corner) {
             const cv::Point2f normalized =
                 camera_model->undistort_cv(corners[corner]);
-            overlap_input.corner_rays_C[corner] =
+            footprint.corner_rays_C[corner] =
                 Eigen::Vector3d(normalized.x, normalized.y, 1.0);
           }
-          for (int stride : {1, 2, 4, 6, 8, 12}) {
-            overlap_input.prediction_horizon_s =
-                adaptive_input.actual_received_camera_dt_s * stride;
-            adaptive_input.ground_footprint_overlap_by_stride[stride] =
-                ground_footprint_polygon_overlap(overlap_input);
-          }
-          adaptive_input.ground_footprint_polygon_overlap =
-              adaptive_input.ground_footprint_overlap_by_stride[12];
+          footprint.valid = true;
+          adaptive_input.ground_footprint = footprint;
         }
-
-        if (adaptive_have_state_snapshot &&
-            state_pre->_timestamp > adaptive_state_snapshot_time + 1.0e-9) {
-          adaptive_input.position_jump_m =
-              (p_wi_pre - adaptive_state_snapshot_p).norm();
-          adaptive_input.velocity_jump_mps =
-              (v_wi_pre - adaptive_state_snapshot_v).norm();
-          const double qdot = std::max(
-              -1.0, std::min(1.0, std::fabs(q_pre.dot(adaptive_state_snapshot_q))));
-          adaptive_input.attitude_jump_deg =
-              2.0 * std::acos(qdot) * 180.0 / M_PI;
-        }
-        if (!adaptive_have_state_snapshot ||
-            state_pre->_timestamp > adaptive_state_snapshot_time + 1.0e-9) {
+        if (!adaptive_have_covariance_snapshot ||
+            state_pre->_timestamp > adaptive_covariance_snapshot_time + 1.0e-9) {
           const Eigen::MatrixXd covariance =
               StateHelper::get_full_covariance(state_pre);
           adaptive_covariance_all_finite = covariance.allFinite();
           adaptive_covariance_negative_diagonal_count = 0;
-          for (int i = 0; i < covariance.rows(); ++i) {
-            if (!std::isfinite(covariance(i, i)) || covariance(i, i) < 0.0)
-              adaptive_covariance_negative_diagonal_count++;
+          for (int diagonal = 0; diagonal < covariance.rows(); ++diagonal) {
+            if (!std::isfinite(covariance(diagonal, diagonal)) ||
+                covariance(diagonal, diagonal) < 0.0)
+              ++adaptive_covariance_negative_diagonal_count;
           }
-          if (covariance.rows() > 5 && std::isfinite(covariance(5, 5)) &&
-              covariance(5, 5) >= 0.0) {
-            adaptive_vio_height_sigma = std::sqrt(covariance(5, 5));
-            if (!std::isfinite(adaptive_vio_height_origin_sigma))
-              adaptive_vio_height_origin_sigma = adaptive_vio_height_sigma;
-          }
-          adaptive_have_state_snapshot = true;
-          adaptive_state_snapshot_time = state_pre->_timestamp;
-          adaptive_state_snapshot_p = p_wi_pre;
-          adaptive_state_snapshot_v = v_wi_pre;
-          adaptive_state_snapshot_q = q_pre;
+          adaptive_have_covariance_snapshot = true;
+          adaptive_covariance_snapshot_time = state_pre->_timestamp;
         }
         adaptive_input.covariance_all_finite =
             adaptive_covariance_all_finite;
         adaptive_input.covariance_negative_diagonal_count =
             adaptive_covariance_negative_diagonal_count;
+        const auto &visual_state_correction =
+            sys->get_latest_visual_update_state_correction();
+        adaptive_input.visual_state_correction_valid =
+            visual_state_correction.valid;
+        adaptive_input.visual_position_correction_m =
+            visual_state_correction.position_m;
+        adaptive_input.visual_velocity_correction_mps =
+            visual_state_correction.velocity_mps;
+        adaptive_input.visual_attitude_correction_deg =
+            visual_state_correction.attitude_deg;
 
-        ov_core::TrackerWarpVizPacket pkt_stride;
-        if (sys->get_warp_viz_packet(0, pkt_stride)) {
-          adaptive_input.active_msckf_features = (int)pkt_stride.curr_pts_raw.size();
-          if (pkt_stride.t_curr > adaptive_last_tracker_packet_time + 1.0e-9) {
-            std::unordered_set<size_t> current_track_ids;
-            std::vector<int> track_ages;
-            current_track_ids.reserve(pkt_stride.feature_ids.size());
-            track_ages.reserve(pkt_stride.feature_ids.size());
-            for (size_t id : pkt_stride.feature_ids) {
-              current_track_ids.insert(id);
-              const int age = adaptive_previous_track_ids.count(id) > 0
-                                  ? adaptive_track_age[id] + 1
-                                  : 1;
-              adaptive_track_age[id] = age;
-              track_ages.push_back(age);
-            }
-            for (size_t id : adaptive_previous_track_ids) {
-              if (current_track_ids.count(id) == 0)
-                adaptive_track_age.erase(id);
-            }
-            adaptive_previous_track_ids = std::move(current_track_ids);
-            if (!track_ages.empty()) {
-              std::sort(track_ages.begin(), track_ages.end());
-              adaptive_median_track_age =
-                  static_cast<double>(track_ages[track_ages.size() / 2]);
-            }
-            adaptive_input.median_track_age_frames = adaptive_median_track_age;
-            adaptive_last_tracker_packet_time = pkt_stride.t_curr;
-          }
-          adaptive_input.median_track_age_frames = adaptive_median_track_age;
-          if ((args.adaptive_stride_use_parallax ||
-               p4_visual_cadence_active) &&
-              pkt_stride.t_curr > adaptive_last_parallax_packet_time + 1.0e-9) {
-            const VisualMotionMetrics motion =
-                tracker_motion_metrics(pkt_stride);
-            adaptive_input.median_parallax_px =
-                motion.compensated_median_px;
-            adaptive_input.p95_parallax_px = motion.compensated_p95_px;
-            adaptive_input.raw_median_parallax_px = motion.raw_median_px;
-            adaptive_input.raw_p95_parallax_px = motion.raw_p95_px;
-            adaptive_input.rotation_median_parallax_px =
-                motion.rotation_median_px;
-            adaptive_input.rotation_p95_parallax_px = motion.rotation_p95_px;
-            adaptive_input.rotation_max_parallax_px = motion.rotation_max_px;
-            adaptive_input.track_survival_ratio = motion.survival_ratio;
-            adaptive_input.common_track_count = motion.common_tracks;
-            adaptive_input.parallax_measurement_timestamp_s = pkt_stride.t_curr;
-            adaptive_input.parallax_measurement_dt_s =
-                pkt_stride.t_curr - pkt_stride.t_prev;
-            adaptive_last_parallax_packet_time = pkt_stride.t_curr;
-          }
-        }
-
-        if (std::isfinite(adaptive_last_fed_camera_time))
-          adaptive_input.actual_tracking_frame_interval_s =
-              std::max(0.0, t_cam - adaptive_last_fed_camera_time);
-        if (std::isfinite(adaptive_last_backend_camera_time))
-          adaptive_input.actual_backend_frame_interval_s =
-              std::max(0.0, t_cam - adaptive_last_backend_camera_time);
-
-        const auto visual_health = sys->get_latest_visual_residual_health();
-        if (visual_health.valid &&
-            visual_health.timestamp > adaptive_last_health_packet_time + 1.0e-9) {
-          adaptive_last_health_packet_time = visual_health.timestamp;
-        }
-        if (visual_health.valid) {
-          adaptive_input.visual_residual_rmse_px = visual_health.mean_residual_px;
-          adaptive_input.visual_residual_p95_px = visual_health.p95_residual_px;
-        }
-        const auto msckf_stats = sys->get_last_msckf_stats();
-        adaptive_input.msckf_input_count = msckf_stats.n_features_in;
-        adaptive_input.msckf_accepted_count = msckf_stats.n_accepted;
-        adaptive_input.msckf_rejected_count =
-            msckf_stats.n_tri_failed + msckf_stats.n_chi2_rejected;
+        const auto visual_health =
+            sys->get_latest_visual_residual_health();
+        if (visual_health.valid)
+          adaptive_input.visual_residual_p95_px =
+              visual_health.p95_residual_px;
         const auto &visual_counts = sys->get_visual_update_counters();
-        if (visual_counts.msckf_accept_count > adaptive_last_msckf_accept_count) {
-          adaptive_last_msckf_accept_count = visual_counts.msckf_accept_count;
+        const size_t visual_accept_count =
+            visual_counts.msckf_accept_count +
+            visual_counts.regular_slam_accept_count +
+            visual_counts.delayed_slam_accept_count;
+        if (visual_accept_count > adaptive_last_visual_accept_count) {
+          adaptive_last_visual_accept_count = visual_accept_count;
           adaptive_last_accepted_backend_update_time = t_cam;
         }
         if (std::isfinite(adaptive_last_accepted_backend_update_time))
           adaptive_input.time_since_accepted_backend_update_s =
-              std::max(0.0, t_cam - adaptive_last_accepted_backend_update_time);
+              std::max(0.0, t_cam -
+                                adaptive_last_accepted_backend_update_time);
+      }
 
-        if (!adaptive_have_vio_height_origin) {
-          adaptive_vio_height_origin = p_wi_pre.z();
-          adaptive_have_vio_height_origin = true;
+      ov_core::TrackerWarpVizPacket tracking_packet;
+      if (sys->get_warp_viz_packet(0, tracking_packet)) {
+        adaptive_input.active_feature_count =
+            static_cast<int>(tracking_packet.curr_pts_raw.size());
+        if (tracking_packet.t_curr >
+            adaptive_last_tracker_packet_time + 1.0e-9) {
+          std::unordered_set<size_t> current_track_ids;
+          std::vector<int> track_ages;
+          current_track_ids.reserve(tracking_packet.feature_ids.size());
+          track_ages.reserve(tracking_packet.feature_ids.size());
+          for (size_t id : tracking_packet.feature_ids) {
+            current_track_ids.insert(id);
+            const int age = adaptive_previous_track_ids.count(id) > 0
+                                ? adaptive_track_age[id] + 1
+                                : 1;
+            adaptive_track_age[id] = age;
+            track_ages.push_back(age);
+          }
+          for (size_t id : adaptive_previous_track_ids)
+            if (current_track_ids.count(id) == 0)
+              adaptive_track_age.erase(id);
+          adaptive_previous_track_ids = std::move(current_track_ids);
+          if (!track_ages.empty()) {
+            std::sort(track_ages.begin(), track_ages.end());
+            adaptive_median_track_age =
+                static_cast<double>(
+                    track_ages[track_ages.size() / 2]);
+          }
+          adaptive_last_tracker_packet_time = tracking_packet.t_curr;
         }
-        if (!std::isfinite(adaptive_input.relative_height_m)) {
-          adaptive_input.relative_height_m = std::max(0.0, p_wi_pre.z() - adaptive_vio_height_origin);
-          adaptive_height_source = "vio_relative_fallback";
-          adaptive_height_timestamp = state_pre->_timestamp;
-          adaptive_height_age = std::max(0.0, t_cam - state_pre->_timestamp);
-          if (std::isfinite(adaptive_vio_height_sigma) &&
-              std::isfinite(adaptive_vio_height_origin_sigma))
-            adaptive_height_uncertainty = std::hypot(
-                adaptive_vio_height_sigma,
-                adaptive_vio_height_origin_sigma);
-          adaptive_height_valid =
-              std::isfinite(adaptive_input.relative_height_m);
+        if (args.adaptive_stride_use_parallax) {
+          adaptive_input.motion =
+              tracker_motion_metrics(tracking_packet);
+          adaptive_input.motion.median_track_age =
+              adaptive_median_track_age;
+          adaptive_input.motion_measurement_timestamp_s =
+              tracking_packet.t_curr;
+          if (tracking_packet.t_curr >
+              adaptive_last_parallax_packet_time + 1.0e-9)
+            adaptive_last_parallax_packet_time =
+                tracking_packet.t_curr;
         }
       }
-      if (!sys->initialized()) {
-        ov_core::TrackerWarpVizPacket pkt_stride;
-        if (sys->get_warp_viz_packet(0, pkt_stride)) {
-          adaptive_input.active_msckf_features =
-              static_cast<int>(pkt_stride.curr_pts_raw.size());
-          if (pkt_stride.t_curr >
-              adaptive_last_tracker_packet_time + 1.0e-9) {
-            std::unordered_set<size_t> current_track_ids;
-            std::vector<int> track_ages;
-            current_track_ids.reserve(pkt_stride.feature_ids.size());
-            track_ages.reserve(pkt_stride.feature_ids.size());
-            for (size_t id : pkt_stride.feature_ids) {
-              current_track_ids.insert(id);
-              const int age = adaptive_previous_track_ids.count(id) > 0
-                                  ? adaptive_track_age[id] + 1
-                                  : 1;
-              adaptive_track_age[id] = age;
-              track_ages.push_back(age);
-            }
-            for (size_t id : adaptive_previous_track_ids)
-              if (current_track_ids.count(id) == 0)
-                adaptive_track_age.erase(id);
-            adaptive_previous_track_ids = std::move(current_track_ids);
-            if (!track_ages.empty()) {
-              std::sort(track_ages.begin(), track_ages.end());
-              adaptive_median_track_age =
-                  static_cast<double>(track_ages[track_ages.size() / 2]);
-            }
-            adaptive_last_tracker_packet_time = pkt_stride.t_curr;
-          }
-          adaptive_input.median_track_age_frames = adaptive_median_track_age;
-          if ((args.adaptive_stride_use_parallax ||
-               p4_visual_cadence_active) &&
-              pkt_stride.t_curr >
-                  adaptive_last_parallax_packet_time + 1.0e-9) {
-            const VisualMotionMetrics motion =
-                tracker_motion_metrics(pkt_stride);
-            adaptive_input.median_parallax_px =
-                motion.compensated_median_px;
-            adaptive_input.p95_parallax_px = motion.compensated_p95_px;
-            adaptive_input.raw_median_parallax_px = motion.raw_median_px;
-            adaptive_input.raw_p95_parallax_px = motion.raw_p95_px;
-            adaptive_input.rotation_median_parallax_px =
-                motion.rotation_median_px;
-            adaptive_input.rotation_p95_parallax_px = motion.rotation_p95_px;
-            adaptive_input.rotation_max_parallax_px = motion.rotation_max_px;
-            adaptive_input.track_survival_ratio = motion.survival_ratio;
-            adaptive_input.common_track_count = motion.common_tracks;
-            adaptive_input.parallax_measurement_timestamp_s = pkt_stride.t_curr;
-            adaptive_input.parallax_measurement_dt_s =
-                pkt_stride.t_curr - pkt_stride.t_prev;
-            adaptive_last_parallax_packet_time = pkt_stride.t_curr;
-          }
-        }
-        if (std::isfinite(adaptive_last_fed_camera_time))
-          adaptive_input.actual_tracking_frame_interval_s =
-              std::max(0.0, t_cam - adaptive_last_fed_camera_time);
-      }
-      adaptive_decision = adaptive_stride_controller.update(adaptive_input);
-      adaptive_policy_state_transition_count +=
-          adaptive_decision.policy_state_changed ? 1 : 0;
-      adaptive_tracking_stride_change_count +=
-          adaptive_decision.tracking_stride_changed ? 1 : 0;
-      adaptive_backend_stride_change_count +=
-          adaptive_decision.backend_stride_changed ? 1 : 0;
-      adaptive_emergency_downshift_count +=
-          adaptive_decision.emergency_downshift ? 1 : 0;
-      adaptive_normal_recovery_count += adaptive_decision.normal_recovery ? 1 : 0;
-      adaptive_unnecessary_reversal_count +=
-          adaptive_decision.unnecessary_reversal ? 1 : 0;
-      adaptive_minimum_dwell_violation_count +=
-          adaptive_decision.minimum_dwell_violation ? 1 : 0;
-      adaptive_same_state_target_rewrite_count +=
-          adaptive_decision.same_state_target_rewrite ? 1 : 0;
+
+      adaptive_decision = adaptive_visual_scheduler.update(adaptive_input);
       if (adaptive_decision.changed) {
-        adaptive_switch_count++;
-        if (adaptive_decision.recommended_stride > adaptive_prev_stride)
-          adaptive_up_switch_count++;
+        ++adaptive_switch_count;
+        ++adaptive_tracking_stride_change_count;
+        if (adaptive_decision.tracking_gap > adaptive_previous_gap)
+          ++adaptive_up_switch_count;
         else
-          adaptive_down_switch_count++;
-        PRINT_INFO(CYAN "[adaptive-stride] t=%.3f state=%s tracking=%d->%d "
-                   "backend=%d->%d reason=%s h=%.1f roll=%.1f gyro=%.3f "
-                   "parallax=%.2f feats=%d+%d\n" RESET,
-                   t_cam, adaptive_decision.policy_state.c_str(),
-                   adaptive_prev_tracking_stride, adaptive_decision.tracking_stride,
-                   adaptive_prev_stride, adaptive_decision.backend_update_stride,
-                   adaptive_decision.switch_reason.c_str(),
-                   adaptive_input.relative_height_m, adaptive_input.roll_deg,
-                   adaptive_input.gyro_norm_radps, adaptive_input.median_parallax_px,
-                   adaptive_input.active_msckf_features,
-                   adaptive_input.active_slam_features);
+          ++adaptive_down_switch_count;
+        if (adaptive_decision.immediate_contraction)
+          ++adaptive_emergency_downshift_count;
+        PRINT_INFO(
+            CYAN "[adaptive-visual] t=%.3f mode=%s gap=%d->%d "
+                 "safe=%d reason=%s comp=%.2f ucb95=%.2f "
+                 "Neff=%.1f coverage=%.2f\n" RESET,
+            t_cam, adaptive_decision.mode_name.c_str(),
+            adaptive_previous_gap, adaptive_decision.tracking_gap,
+            adaptive_decision.instantaneous_safe_gap,
+            adaptive_decision.reason.c_str(),
+            adaptive_input.motion.compensated_median_px,
+            adaptive_input.motion.compensated_p95_ucb_px,
+            adaptive_input.motion.effective_track_count,
+            adaptive_input.motion.grid_occupancy_ratio);
       }
     }
-    bool do_cam_feed =
-        (args.cam_subsample <= 1) || (frame_idx % args.cam_subsample == 0);
-    if (visual_cadence_planner_active) {
+    const int fixed_camera_stride =
+        formal_navigation_ready() && args.post_alignment_camera_frame_stride > 0
+            ? args.post_alignment_camera_frame_stride
+            : args.cam_subsample;
+    bool do_cam_feed = (fixed_camera_stride <= 1) ||
+                       (frame_idx % fixed_camera_stride == 0);
+    if (p4_visual_cadence_active &&
+        sys->online_alignment_uses_upstream_dynamic_init()) {
+      // DynamicInitializer needs init_dyn_num_pose distinct camera poses in
+      // init_window_time. Derive the startup cadence from those two contracts
+      // and real camera timestamps; the old fixed stride=12 can otherwise make
+      // the requested initialization mathematically impossible.
+      const double target_camera_interval =
+          params.init_options.init_window_time /
+          static_cast<double>(
+              std::max(2, params.init_options.init_dyn_num_pose + 1));
+      do_cam_feed =
+          !std::isfinite(p4_dynamic_last_fed_camera_time) ||
+          t_cam - p4_dynamic_last_fed_camera_time + 1.0e-9 >=
+              target_camera_interval;
+    }
+    if (p5_visual_cadence_active) {
       adaptive_raw_frames_since_feed++;
       adaptive_raw_frames_since_tracking++;
-      adaptive_raw_frames_since_backend++;
     }
-    if (p4_visual_cadence_active || args.adaptive_stride) {
-      if (!sys->initialized()) {
-        adaptive_cadence_started = false;
-        const bool tracking_due =
-            adaptive_raw_frames_since_tracking >=
-            static_cast<size_t>(
-                std::max(1, adaptive_decision.tracking_stride));
-        do_cam_feed = tracking_due;
-      } else if (!adaptive_cadence_started) {
+    if (p4_visual_cadence_active) {
+      // P4's joint graph uses the frozen startup camera cadence. Its selector
+      // may thin further, but it must not silently override
+      // --camera-frame-stride.
+      adaptive_cadence_started = false;
+    } else if (args.adaptive_stride && formal_navigation_ready()) {
+      if (!adaptive_cadence_started) {
         adaptive_cadence_started = true;
         do_cam_feed = true;
       } else {
         const bool tracking_due =
             adaptive_raw_frames_since_tracking >=
-            static_cast<size_t>(std::max(1, adaptive_decision.tracking_stride));
+            static_cast<size_t>(std::max(1, adaptive_decision.tracking_gap));
         do_cam_feed = tracking_due;
       }
     }
@@ -4108,7 +4742,7 @@ int main(int argc, char **argv) {
       camera_adaptive_stats.last_speed = -1.0;
       camera_adaptive_stats.last_track_count = -1;
 
-      if (sys->initialized()) {
+      if (formal_navigation_ready()) {
         auto state_pre = sys->get_state();
         const Eigen::Vector3d p_wi_pre = state_pre->_imu->pos();
         const double speed_pre = state_pre->_imu->vel().norm();
@@ -4199,8 +4833,6 @@ int main(int argc, char **argv) {
       else
         camera_adaptive_stats.skip_count++;
     }
-    const size_t adaptive_frames_since_last_feed =
-        adaptive_raw_frames_since_feed;
     const double adaptive_time_since_last_feed =
         std::isfinite(adaptive_last_fed_camera_time)
             ? std::max(0.0, t_cam - adaptive_last_fed_camera_time)
@@ -4211,28 +4843,18 @@ int main(int argc, char **argv) {
             : 0.0;
     const size_t backend_count_before =
         sys->get_visual_update_counters().backend_frame_count;
-    const bool initialized_before_camera_feed = sys->initialized();
+    const bool initialized_before_camera_feed = formal_navigation_ready();
     if (do_cam_feed) {
+      if (p4_visual_cadence_active &&
+          sys->online_alignment_uses_upstream_dynamic_init())
+        p4_dynamic_last_fed_camera_time = t_cam;
       if (args.adaptive_stride && initialized_before_camera_feed) {
-        const bool safety_state =
-            adaptive_decision.state == AdaptivePolicyState::TURN_SAFETY ||
-            adaptive_decision.state == AdaptivePolicyState::LOW_ALTITUDE_SAFETY ||
-            adaptive_decision.state == AdaptivePolicyState::DESCENT_SAFETY;
-        const bool safety_forced =
-            safety_state &&
-            (adaptive_decision.policy_state_changed ||
-             adaptive_decision.transition_reason ==
-                 "low_altitude_band_change");
-        const bool visual_health_bad =
-            adaptive_decision.state == AdaptivePolicyState::VISUAL_DEGRADED &&
-            adaptive_decision.policy_state_changed;
-        sys->feed_measurement_camera_information_cadence(
-            msg, safety_forced, visual_health_bad);
+        sys->feed_measurement_camera_information_cadence(msg);
       } else {
         sys->feed_measurement_camera(msg);
       }
     }
-    if (online_alignment_mode && !sys->initialized() &&
+    if (online_alignment_mode && !sys->online_alignment_complete() &&
         provisional_navigation_out.is_open()) {
       ProvisionalNavigationOutput provisional;
       if (sys->get_online_alignment_provisional(t_cam, provisional)) {
@@ -4260,99 +4882,199 @@ int main(int argc, char **argv) {
     const bool backend_frame_fed =
         sys->get_visual_update_counters().backend_frame_count >
         backend_count_before;
+    if (agl_scene_scale_out.is_open()) {
+      const AglSceneScaleRuntimeStats &scale =
+          sys->get_agl_scene_scale_runtime_stats();
+      if (scale.evaluation_count > agl_scene_scale_last_logged_evaluation) {
+        const auto &ground = scale.ground;
+        const auto &decision = scale.decision;
+        agl_scene_scale_out
+            << scale.timestamp << "," << scale.mode_name << ","
+            << scale.agl_timestamp << "," << scale.agl_m << ","
+            << scale.agl_age_s << "," << (ground.valid ? 1 : 0) << ","
+            << ground.reason << "," << ground.map_height_m << ","
+            << ground.map_height_sigma_m << "," << ground.plane_tilt_deg
+            << "," << ground.plane_residual_mad_m << ","
+            << ground.plane_residual_rmse_m << ","
+            << ground.input_feature_count << ","
+            << ground.candidate_feature_count << ","
+            << ground.inlier_feature_count << "," << ground.inlier_ratio
+            << "," << ground.occupied_image_cells << ","
+            << ground.u_span_fraction << "," << ground.v_span_fraction
+            << "," << ground.distinct_clone_times << ","
+            << decision.coverage_s << "," << decision.max_gap_s << ","
+            << decision.median_ratio << "," << decision.mad << ","
+            << decision.candidate_scale << "," << decision.proposed_scale
+            << "," << decision.cumulative_scale << ","
+            << (decision.ready ? 1 : 0) << "," << decision.reason << ","
+            << (scale.reset_attempted ? 1 : 0) << ","
+            << (scale.reset_succeeded ? 1 : 0) << ","
+            << (scale.state_modified ? 1 : 0) << ","
+            << scale.applied_scale << "," << scale.reset_reason << ","
+            << scale.covariance_min_eigenvalue << ","
+            << (scale.covariance_psd_projected ? 1 : 0) << ","
+            << scale.covariance_psd_projection_magnitude << ","
+            << scale.covariance_psd_projection_limit << ","
+            << scale.evaluation_count << "," << scale.valid_ground_count
+            << "," << scale.proposal_count << ","
+            << scale.reset_attempt_count << ","
+            << scale.reset_success_count << "\n";
+        agl_scene_scale_last_logged_evaluation = scale.evaluation_count;
+      }
+    }
+    if (dynamic_turn_roi_out.is_open() && do_cam_feed) {
+      const DynamicTurnRoiRuntimeStats &roi =
+          sys->get_dynamic_turn_roi_runtime_stats();
+      dynamic_turn_roi_out
+          << t_cam << "," << (roi.decision.signal_valid ? 1 : 0) << ","
+          << roi.decision.raw_yaw_rate_radps << ","
+          << roi.decision.filtered_yaw_rate_radps << ","
+          << turn_direction_name(roi.decision.direction) << ","
+          << preferred_image_side_name(roi.decision.preferred_side) << ","
+          << roi.decision.strength << ","
+          << roi.decision.preferred_fraction << ","
+          << roi.decision.detection_exclusion_fraction << ","
+          << roi.decision.reason << "," << (tracking_frame_fed ? 1 : 0)
+          << "," << (backend_frame_fed ? 1 : 0) << ","
+          << roi.detection_masked_pixels << "," << roi.msckf_available
+          << "," << roi.msckf_selected_preferred << ","
+          << roi.msckf_selected_other << "," << roi.slam_available << ","
+          << roi.slam_selected_preferred << "," << roi.slam_selected_other
+          << "," << roi.delayed_slam_available << ","
+          << roi.delayed_slam_selected_preferred << ","
+          << roi.delayed_slam_selected_other << "\n";
+    }
+    const AdaptiveBackendDecision backend_decision =
+        sys->get_last_backend_update_decision();
+    const bool backend_decision_evaluated =
+        do_cam_feed && args.adaptive_stride &&
+        initialized_before_camera_feed;
+    const bool backend_reference_committed =
+        backend_decision_evaluated &&
+        sys->last_backend_reference_committed();
     if (adaptive_stride_out.is_open()) {
+      const VisualMotionMetrics &motion = adaptive_input.motion;
+      const ContinuousTrackingDecision &tracking =
+          adaptive_decision.tracking;
       adaptive_stride_out
-          << t_cam << "," << args.cam_subsample << ","
-          << adaptive_decision.recommended_stride << ","
-          << adaptive_input.relative_height_m << ","
-          << adaptive_input.horizontal_speed_mps << ","
-          << adaptive_input.vertical_speed_mps << ","
-          << adaptive_input.roll_deg << "," << adaptive_input.pitch_deg << ","
-          << adaptive_input.gyro_norm_radps << ","
-          << adaptive_input.median_parallax_px << ","
-          << adaptive_input.active_msckf_features << ","
-          << adaptive_input.active_slam_features << ","
-          << (adaptive_decision.reason_height_valid ? 1 : 0) << ","
-          << (adaptive_decision.reason_turn ? 1 : 0) << ","
-          << (adaptive_decision.reason_feature_low ? 1 : 0) << ","
-          << (adaptive_decision.reason_parallax_low ? 1 : 0) << ","
-          << (adaptive_decision.reason_parallax_high ? 1 : 0) << ","
-          << (adaptive_decision.reason_descent ? 1 : 0) << ","
-          << (adaptive_decision.reason_low_height ? 1 : 0) << ","
-          << adaptive_decision.hysteresis_state << ","
-          << adaptive_decision.hold_timer_s << ","
-          << adaptive_decision.base_stride << ","
-          << adaptive_decision.filtered_height_m << ","
-          << adaptive_decision.filtered_speed_mps << ","
-          << adaptive_decision.filtered_vertical_speed_mps << ","
-          << adaptive_decision.filtered_parallax_px << ","
-          << adaptive_decision.filtered_parallax_rate_pxps << ","
-          << adaptive_decision.normalized_parallax_px << ","
-          << adaptive_decision.parallax_target_stride << ","
-          << adaptive_input.actual_received_camera_dt_s << ","
-          << adaptive_input.parallax_measurement_dt_s << ","
-          << adaptive_decision.parallax_measurement_age_s << ","
-          << adaptive_time_since_last_feed << ","
-          << adaptive_frames_since_last_feed << ","
-          << adaptive_decision.effective_height_m << ","
-          << adaptive_decision.filtered_gyro_radps << ","
-          << (adaptive_decision.severe_turn ? 1 : 0) << ","
-          << (adaptive_decision.severe_feature_low ? 1 : 0) << ","
-          << (adaptive_decision.severe_parallax_high ? 1 : 0) << ","
-          << (adaptive_decision.severe_visual_stale ? 1 : 0) << ","
-          << (adaptive_decision.severe_descent ? 1 : 0) << ","
-          << (adaptive_decision.force_fullrate_tracking ? 1 : 0) << ","
+          << t_cam << "," << adaptive_decision.mode_name << ","
+          << adaptive_decision.reason << ","
+          << adaptive_decision.tracking_gap << ","
+          << adaptive_decision.instantaneous_safe_gap << ","
           << (adaptive_decision.changed ? 1 : 0) << ","
-          << adaptive_decision.switch_reason << ","
-          << adaptive_height_source << ","
-          << adaptive_height_timestamp << "," << adaptive_height_age << ","
-          << adaptive_height_uncertainty << ","
-          << (adaptive_height_valid ? 1 : 0) << ","
-          << (args.adaptive_stride ? "active" : "shadow") << ","
-          << (args.adaptive_stride ? adaptive_decision.backend_update_stride : args.cam_subsample) << ","
-          << (do_cam_feed ? 1 : 0) << ","
-          << adaptive_decision.policy_state << ","
-          << adaptive_decision.previous_policy_state << ","
-          << (adaptive_decision.policy_state_changed ? 1 : 0) << ","
-          << adaptive_decision.main_trigger << ","
-          << adaptive_decision.transition_reason << ","
-          << adaptive_decision.tracking_stride << ","
-          << adaptive_decision.backend_update_stride << ","
-          << (adaptive_decision.tracking_stride_changed ? 1 : 0) << ","
-          << (adaptive_decision.backend_stride_changed ? 1 : 0) << ","
-          << (adaptive_decision.emergency_downshift ? 1 : 0) << ","
-          << (adaptive_decision.normal_recovery ? 1 : 0) << ","
-          << (adaptive_decision.unnecessary_reversal ? 1 : 0) << ","
-          << (adaptive_decision.minimum_dwell_violation ? 1 : 0) << ","
-          << (adaptive_decision.same_state_target_rewrite ? 1 : 0) << ","
-          << adaptive_decision.state_dwell_s << ","
-          << adaptive_decision.transition_guard_s << ","
-          << adaptive_decision.low_altitude_band << ","
-          << adaptive_input.p95_parallax_px << ","
-          << adaptive_decision.filtered_parallax_p95_px << ","
-          << adaptive_decision.predicted_overlap << ","
-          << adaptive_decision.predicted_median_displacement_px << ","
-          << adaptive_decision.predicted_p95_displacement_px << ","
-          << adaptive_input.actual_tracking_frame_interval_s << ","
-          << adaptive_input.actual_backend_frame_interval_s << ","
-          << adaptive_input.median_track_age_frames << ","
-          << adaptive_input.visual_residual_rmse_px << ","
+          << (adaptive_decision.immediate_contraction ? 1 : 0) << ","
+          << (adaptive_decision.expansion_confirmed ? 1 : 0) << ","
+          << (adaptive_decision.new_motion_measurement ? 1 : 0) << ","
+          << adaptive_input.raw_camera_dt_s << ","
+          << adaptive_input.actual_tracking_interval_s << ","
+          << adaptive_input.motion_measurement_timestamp_s << ","
+          << adaptive_decision.motion_age_s << "," << motion.dt_s << ","
+          << motion.common_tracks << "," << motion.effective_track_count << ","
+          << motion.survival_ratio << "," << motion.median_track_age << ","
+          << motion.grid_occupancy_ratio << "," << motion.grid_entropy << ","
+          << motion.border_track_ratio << "," << motion.raw_p95_px << ","
+          << motion.rotation_p95_px << "," << motion.rotation_max_px << ","
+          << motion.compensated_median_px << ","
+          << motion.compensated_p95_px << ","
+          << motion.compensated_sigma_px << ","
+          << motion.compensated_p95_ucb_px << ","
+          << tracking.target_horizon_s << "," << tracking.safe_horizon_s
+          << "," << tracking.interval_horizon_s << ","
+          << tracking.compensated_horizon_s << ","
+          << tracking.raw_horizon_s << "," << tracking.rotation_horizon_s
+          << "," << tracking.survival_horizon_s << ","
+          << tracking.predicted_compensated_median_px << ","
+          << tracking.predicted_compensated_p95_ucb_px << ","
+          << (adaptive_decision.estimator_protection ? 1 : 0) << ","
+          << (adaptive_decision.tracking_protection ? 1 : 0) << ","
+          << adaptive_input.active_feature_count << ","
+          << adaptive_agl_m << "," << adaptive_agl_source << ","
+          << adaptive_agl_age_s << ","
+          << (tracking.ground_geometry_valid ? 1 : 0) << ","
+          << tracking.ground_overlap_horizon_s << ","
+          << tracking.predicted_ground_overlap << ","
           << adaptive_input.visual_residual_p95_px << ","
-          << adaptive_input.msckf_input_count << ","
-          << adaptive_input.msckf_accepted_count << ","
-          << adaptive_input.msckf_rejected_count << ","
           << adaptive_input.time_since_accepted_backend_update_s << ","
           << (adaptive_input.covariance_all_finite ? 1 : 0) << ","
           << adaptive_input.covariance_negative_diagonal_count << ","
-          << adaptive_input.position_jump_m << ","
-          << adaptive_input.velocity_jump_mps << ","
-          << adaptive_input.attitude_jump_deg << ","
+          << (adaptive_input.visual_state_correction_valid ? 1 : 0) << ","
+          << adaptive_input.visual_position_correction_m << ","
+          << adaptive_input.visual_velocity_correction_mps << ","
+          << adaptive_input.visual_attitude_correction_deg << ","
+          << (args.adaptive_stride ? "active" : "shadow") << ","
           << (tracking_frame_fed ? 1 : 0) << ","
           << (backend_frame_fed ? 1 : 0) << ","
           << adaptive_raw_frames_since_tracking << ","
-          << adaptive_raw_frames_since_backend << ","
           << adaptive_time_since_last_feed << ","
-          << adaptive_time_since_backend << "\n";
+          << adaptive_time_since_backend << ","
+          << (backend_decision_evaluated && backend_decision.trigger ? 1 : 0)
+          << "," << (backend_reference_committed ? 1 : 0) << ","
+          << (backend_decision_evaluated ? backend_decision.reason
+                                         : "not_evaluated")
+          << ","
+          << (backend_decision_evaluated
+                  ? backend_decision.information_score
+                  : 0.0)
+          << ","
+          << (backend_decision_evaluated
+                  ? backend_decision.elapsed_since_clone_s
+                  : 0.0)
+          << ","
+          << (backend_decision_evaluated
+                  ? backend_decision.minimum_temporal_separation_s
+                  : 0.0)
+          << ","
+          << (backend_decision_evaluated &&
+                      backend_decision.temporal_support_ready
+                  ? 1
+                  : 0)
+          << ","
+          << (backend_decision_evaluated
+                  ? backend_decision.translation_baseline_px
+                  : 0.0)
+          << ","
+          << (backend_decision_evaluated
+                  ? backend_decision.translation_p95_ucb_px
+                  : 0.0)
+          << ","
+          << (backend_decision_evaluated ? backend_decision.effective_tracks
+                                         : 0.0)
+          << ","
+          << (backend_decision_evaluated ? backend_decision.survival_ratio
+                                         : 0.0)
+          << ","
+          << (backend_decision_evaluated ? backend_decision.grid_occupancy
+                                         : 0.0)
+          << ","
+          << (backend_decision_evaluated &&
+                      backend_decision.visual_geometry_valid
+                  ? 1
+                  : 0)
+          << ","
+          << (backend_decision_evaluated && backend_decision.pure_rotation
+                  ? 1
+                  : 0)
+          << ","
+          << (backend_decision_evaluated &&
+                      backend_decision.information_trigger
+                  ? 1
+                  : 0)
+          << ","
+          << (backend_decision_evaluated &&
+                      backend_decision.latency_trigger
+                  ? 1
+                  : 0)
+          << ","
+          << (backend_decision_evaluated &&
+                      backend_decision.termination_trigger
+                  ? 1
+                  : 0)
+          << ","
+          << (backend_decision_evaluated &&
+                      backend_decision.forced_without_visual_information
+                  ? 1
+                  : 0)
+          << "\n";
     }
     if (do_cam_feed) {
       if (online_alignment_mode) {
@@ -4360,9 +5082,9 @@ int main(int argc, char **argv) {
         if (sys->get_online_alignment_result(online_result)) {
           online_result.diagnostics.first_openvins_output_time =
               online_alignment_first_output_time;
-          // Online alignment initializes the EKF directly in G_nav. The formal
-          // navigation output is therefore an identity frame boundary, not an
-          // evaluation-time or post-hoc alignment.
+          // Online alignment always defines a fixed, causal G_nav boundary.
+          // The local-origin mode changes only the estimator translation
+          // origin; it does not perform an evaluation-time alignment.
           if (!nav_frame.valid) {
             nav_frame.valid = true;
             nav_frame.dataset_first_imu_timestamp = dataset_first_imu_timestamp;
@@ -4373,15 +5095,25 @@ int main(int argc, char **argv) {
                 online_result.timestamp +
                 online_result.camera_to_imu_time_offset_s -
                 online_result.fc_to_board_time_offset_s;
+            nav_frame.camera_to_imu_time_offset_s =
+                online_result.camera_to_imu_time_offset_s;
             nav_frame.fc_time_offset = online_result.fc_to_board_time_offset_s;
             nav_frame.R_Gnav_W0 = Eigen::Matrix3d::Identity();
-            nav_frame.p_Gnav_W0 = Eigen::Vector3d::Zero();
+            nav_frame.p_Gnav_W0 =
+                args.online_alignment_local_estimator_origin
+                    ? online_result.p_IinG
+                    : Eigen::Vector3d::Zero();
             nav_frame.p_Gnav_I0 = online_result.p_IinG;
-            nav_frame.p_W0_I0 = online_result.p_IinG;
+            nav_frame.p_W0_I0 =
+                args.online_alignment_local_estimator_origin
+                    ? Eigen::Vector3d::Zero()
+                    : online_result.p_IinG;
             nav_frame.fc_source_position = online_result.p_IinG;
             nav_frame.fc_position_frame = "global_gnav";
             nav_frame.position_source =
-                "causal_online_fc_board_joint_alignment";
+                args.online_alignment_local_estimator_origin
+                    ? "causal_online_fc_board_joint_alignment_local_w0"
+                    : "causal_online_fc_board_joint_alignment";
             nav_frame.initialization_mode = "online_multisensor_alignment";
             nav_frame.fc_init_requested_level = "not_applicable";
             nav_frame.fc_init_applied_level = "not_applicable";
@@ -4412,17 +5144,13 @@ int main(int argc, char **argv) {
       }
       processed_image_count++;
       processed_image_timestamps.push_back(t_cam);
-      if (args.adaptive_stride || args.adaptive_stride_shadow) {
+      if (p5_visual_cadence_active) {
         adaptive_last_fed_camera_time = t_cam;
         adaptive_raw_frames_since_feed = 0;
         adaptive_raw_frames_since_tracking = 0;
       }
       if (backend_frame_fed) {
-        adaptive_backend_frame_count++;
         adaptive_last_backend_camera_time = t_cam;
-        adaptive_raw_frames_since_backend = 0;
-      } else if (args.adaptive_stride && sys->initialized()) {
-        adaptive_tracking_only_frame_count++;
       }
       if (args.camera_frame_adaptive)
         camera_adaptive_stats.last_feed_time = t_cam;
@@ -4433,8 +5161,8 @@ int main(int argc, char **argv) {
 
     // ------ query latest state ------
     if (args.dashboard_enabled)
-      dash.set_initialized(sys->initialized());
-    if (sys->initialized()) {
+      dash.set_initialized(formal_navigation_ready());
+    if (formal_navigation_ready()) {
       if (t_init_done < 0)
         t_init_done = t_cam;
       if (!delayed_vio_yaw_control_applied &&
@@ -4456,6 +5184,71 @@ int main(int argc, char **argv) {
         PRINT_INFO(CYAN "[ros-free] TIMED YAW SWITCH at t=%.3f -> mode=%s alpha=%.3f\n" RESET,
                    t_cam, args.vio_yaw_switch_mode.c_str(),
                    std::isnan(args.vio_yaw_switch_alpha) ? -1.0 : args.vio_yaw_switch_alpha);
+      }
+
+      if (args.post_alignment_fc_yaw_aid && do_cam_feed) {
+        if (fc_yaw_aid_next_time < 0.0)
+          fc_yaw_aid_next_time =
+              t_init_done + args.post_alignment_fc_yaw_aid_period_s;
+        if (t_cam + 1e-9 >= fc_yaw_aid_next_time) {
+          double fc_attitude_time = std::numeric_limits<double>::quiet_NaN();
+          double yaw_measurement_deg = std::numeric_limits<double>::quiet_NaN();
+          bool accepted = false;
+          std::string decision = "SKIP_NO_ALIGNMENT_RESULT";
+          VioManager::PoseAnchorLastUpdate update;
+          OnlineAlignmentResult alignment_result;
+          if (sys->get_online_alignment_result(alignment_result)) {
+            auto current_state = sys->get_state();
+            const double state_time = current_state ? current_state->_timestamp : t_cam;
+            fc_attitude_time =
+                state_time + alignment_result.camera_to_imu_time_offset_s -
+                alignment_result.fc_attitude_to_board_time_offset_s;
+            if (fc_attitude_time > t_cam + 1e-9) {
+              decision = "SKIP_NONCAUSAL_FC_TIME";
+            } else {
+              try {
+                FCInitExactOptions exact_options;
+                exact_options.level = FCInitLevel::I1_EXACT_TIME;
+                exact_options.max_bracket_gap_s = 0.45;
+                const FCInitResult fc_reference =
+                    fcinit_select_exact(online_fc_series, fc_attitude_time,
+                                        exact_options);
+                const Eigen::Matrix3d R_GtoF =
+                    ov_core::quat_2_Rot(fc_reference.state.q_GtoI);
+                const Eigen::Matrix3d R_GtoI_reference =
+                    alignment_result.R_FtoI_nominal * R_GtoF;
+                const double yaw_measurement_rad =
+                    yaw_from_Rwi(R_GtoI_reference.transpose());
+                yaw_measurement_deg = yaw_measurement_rad * 180.0 / M_PI;
+                if (current_state && current_state->_imu &&
+                    std::fabs(current_state->_timestamp - t_cam) <= 0.10) {
+                  accepted = sys->feed_measurement_pose_anchor(
+                      current_state->_timestamp, current_state->_imu->pos(),
+                      yaw_measurement_rad, true, 1.0e6,
+                      args.post_alignment_fc_yaw_aid_sigma_deg * M_PI / 180.0,
+                      args.post_alignment_fc_yaw_aid_gate_sigma, 0.0,
+                      5.0 * M_PI / 180.0);
+                  update = sys->get_last_pose_anchor_update();
+                  decision = update.decision;
+                } else {
+                  decision = "SKIP_STATE_TIME_MISALIGN";
+                }
+              } catch (const std::exception &error) {
+                decision = std::string("SKIP_FC_INTERPOLATION:") + error.what();
+              }
+            }
+          }
+          if (fc_yaw_aid_out.is_open()) {
+            fc_yaw_aid_out
+                << t_cam << "," << fc_attitude_time << ","
+                << yaw_measurement_deg << "," << update.yaw_residual_deg
+                << "," << update.nis << "," << update.gate_ratio << ","
+                << update.predicted_yaw_correction_deg << ","
+                << (accepted ? 1 : 0) << "," << decision << "\n";
+          }
+          fc_yaw_aid_next_time =
+              t_cam + args.post_alignment_fc_yaw_aid_period_s;
+        }
       }
 
       double t_gps = -1.0;
@@ -4764,6 +5557,19 @@ int main(int argc, char **argv) {
       Eigen::Matrix3d R_wi = state->_imu->Rot().transpose();
       Eigen::Vector3d p_wi = state->_imu->pos();
       Eigen::Vector3d v_wi = state->_imu->vel();
+      if (t_cam > state->_timestamp + 1e-9) {
+        Eigen::Matrix<double, 13, 1> propagated_state;
+        Eigen::Matrix<double, 12, 12> propagated_covariance;
+        if (sys->get_propagator()->fast_state_propagate(
+                state, t_cam, propagated_state, propagated_covariance)) {
+          const Eigen::Matrix3d R_GtoI_fast =
+              ov_core::quat_2_Rot(propagated_state.head<4>());
+          R_wi = R_GtoI_fast.transpose();
+          p_wi = propagated_state.block<3, 1>(4, 0);
+          // fast_state_propagate exposes velocity in the current IMU frame.
+          v_wi = R_wi * propagated_state.block<3, 1>(7, 0);
+        }
+      }
 
       if (args.dashboard_enabled) {
         vio_for_align.push_back({t_cam, p_wi});
@@ -5405,11 +6211,6 @@ int main(int argc, char **argv) {
         gps_alt_ref = std::numeric_limits<double>::quiet_NaN();
         gps_xy_ref = Eigen::Vector2d::Constant(std::numeric_limits<double>::quiet_NaN());
         gps_xy_vio_ref = Eigen::Vector2d::Zero();
-        adaptive_have_vio_height_origin = false;
-        adaptive_vio_height_origin_sigma =
-            std::numeric_limits<double>::quiet_NaN();
-        adaptive_vio_height_sigma =
-            std::numeric_limits<double>::quiet_NaN();
         prev_p_wi_valid = false;
         vio_for_align.clear();
         if (did_gps_init)
@@ -5530,7 +6331,8 @@ int main(int argc, char **argv) {
       PRINT_WARNING(YELLOW "[ros-free] failed to open camera stride audit: %s\n" RESET,
                     args.camera_stride_audit_path.c_str());
     } else {
-      audit << "configured_stride,total_image_input_count,processed_image_count,"
+      audit << "configured_stride,post_alignment_configured_stride,"
+            << "total_image_input_count,processed_image_count,"
             << "skipped_image_count,effective_processed_ratio,processed_image_dt_median,"
             << "processed_image_dt_p95,total_imu_sample_count,tracker_invocation_count,"
             << "msckf_update_count,regular_slam_update_count,delayed_slam_update_count,"
@@ -5568,14 +6370,15 @@ int main(int argc, char **argv) {
             << "camera_frame_adaptive_last_track_count,camera_frame_adaptive_last_reason,"
             << "p5_backend_frame_count,p5_tracking_only_frame_count,"
             << "p5_tracking_only_observation_drop_count,p5_tracking_only_clone_violation_count,"
+            << "p5_backend_trigger_count,p5_backend_clone_commit_count,"
+            << "p5_backend_trigger_without_clone_count,p5_backend_bootstrap_trigger_count,"
             << "p5_backend_information_trigger_count,p5_backend_latency_fallback_count,"
-            << "p5_backend_safety_trigger_count,"
-            << "p5_policy_state_transition_count,p5_tracking_stride_change_count,"
-            << "p5_backend_stride_change_count,p5_emergency_downshift_count,"
-            << "p5_normal_recovery_count,p5_unnecessary_reversal_count,"
-            << "p5_minimum_dwell_violation_count,p5_same_state_target_rewrite_count,"
+            << "p5_backend_termination_trigger_count,"
+            << "p5_backend_pure_rotation_hold_count,p5_tracking_gap_change_count,"
+            << "p5_immediate_contraction_count,"
             << "processed_image_timestamps\n";
       audit << args.cam_subsample << ","
+            << args.post_alignment_camera_frame_stride << ","
             << total_image_input_count << ","
             << processed_image_count << ","
             << skipped_image_count << ","
@@ -5655,17 +6458,17 @@ int main(int argc, char **argv) {
             << visual_counts.tracking_only_frame_count << ","
             << visual_counts.tracking_only_observation_drop_count << ","
             << visual_counts.tracking_only_clone_violation_count << ","
+            << visual_counts.backend_trigger_count << ","
+            << visual_counts.backend_clone_commit_count << ","
+            << visual_counts.backend_trigger_without_clone_count << ","
+            << visual_counts.backend_bootstrap_trigger_count << ","
             << visual_counts.backend_information_trigger_count << ","
             << visual_counts.backend_latency_fallback_count << ","
-            << visual_counts.backend_safety_trigger_count << ","
-            << adaptive_policy_state_transition_count << ","
+            << visual_counts.backend_termination_trigger_count << ","
+            << visual_counts.backend_pure_rotation_hold_count << ","
             << adaptive_tracking_stride_change_count << ","
-            << adaptive_backend_stride_change_count << ","
             << adaptive_emergency_downshift_count << ","
-            << adaptive_normal_recovery_count << ","
-            << adaptive_unnecessary_reversal_count << ","
-            << adaptive_minimum_dwell_violation_count << ","
-            << adaptive_same_state_target_rewrite_count << ",\"";
+            << "\"";
       for (size_t i = 0; i < processed_image_timestamps.size(); ++i) {
         if (i > 0)
           audit << ';';
@@ -5679,6 +6482,21 @@ int main(int argc, char **argv) {
                  processed_ratio);
     }
   }
+  if (agl_scene_scale_out.is_open()) {
+    agl_scene_scale_out.flush();
+    if (!agl_scene_scale_out.good()) {
+      PRINT_ERROR(RED "[AGL-SCALE] diagnostic CSV write failed: %s\n" RESET,
+                  args.agl_scene_scale_diag_path.c_str());
+      return EXIT_FAILURE;
+    }
+    agl_scene_scale_out.close();
+    const auto &scale = sys->get_agl_scene_scale_runtime_stats();
+    PRINT_INFO(GREEN "[AGL-SCALE] log=%s evaluations=%zu valid_ground=%zu "
+                     "proposals=%zu reset_attempts=%zu reset_success=%zu\n" RESET,
+               args.agl_scene_scale_diag_path.c_str(), scale.evaluation_count,
+               scale.valid_ground_count, scale.proposal_count,
+               scale.reset_attempt_count, scale.reset_success_count);
+  }
   if (adaptive_stride_out.is_open()) {
     adaptive_stride_out.flush();
     if (!adaptive_stride_out.good()) {
@@ -5690,7 +6508,7 @@ int main(int argc, char **argv) {
     PRINT_INFO(GREEN "[adaptive-stride] log=%s switches=%zu up=%zu down=%zu final=%d\n" RESET,
                args.adaptive_stride_log_path.c_str(), adaptive_switch_count,
                adaptive_up_switch_count, adaptive_down_switch_count,
-               adaptive_stride_controller.recommended_stride());
+               adaptive_visual_scheduler.tracking_gap());
   }
   if (pose_repair_out.is_open()) {
     pose_repair_out.flush();
@@ -5767,30 +6585,6 @@ int main(int argc, char **argv) {
                     error.what());
         return EXIT_FAILURE;
       }
-    } else if (online_alignment_r1_shadow_only) {
-      int solved_window_count = 0;
-      for (const auto &receipt : alignment_receipts)
-        if (receipt.window_id > 0 &&
-            receipt.optimizer_invocation_index > 0)
-          ++solved_window_count;
-      try {
-        write_online_alignment_shadow_metadata(
-            args.online_alignment_metadata_path, alignment_receipts,
-            sys->online_alignment_diagnostics());
-      } catch (const std::exception &error) {
-        PRINT_ERROR(RED "[ONLINE-ALIGN] shadow metadata write failed: %s\n" RESET,
-                    error.what());
-        return EXIT_FAILURE;
-      }
-      if (solved_window_count < 2) {
-        PRINT_ERROR(RED "[ONLINE-ALIGN] P4-R1 failed: only %d sliding-window optimizer invocation(s); trace=%s\n" RESET,
-                    solved_window_count,
-                    args.online_alignment_window_trace_path.c_str());
-        return EXIT_FAILURE;
-      }
-      PRINT_INFO(GREEN "[ONLINE-ALIGN] P4-R1 shadow completed with %d sliding-window optimizer invocations; no state was released; trace=%s\n" RESET,
-                 solved_window_count,
-                 args.online_alignment_window_trace_path.c_str());
     } else {
       try {
         write_online_alignment_failure_metadata(
@@ -5807,7 +6601,6 @@ int main(int argc, char **argv) {
       return EXIT_FAILURE;
     }
   }
-
   // Final frame only when the dashboard is part of this run.
   if (args.dashboard_enabled)
     dash.render_and_show(1);

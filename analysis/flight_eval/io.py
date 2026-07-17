@@ -130,15 +130,28 @@ def read_gps_csv(rp: ResolvedPath) -> pd.DataFrame:
         out["Vu"] = -out["Vd"]
     out.drop(columns=[c for c in ("Vd",) if c in out.columns], inplace=True)
 
-    out.attrs["has_velocity"] = all(c in out.columns for c in ("Ve", "Vn", "Vu"))
-    return out.sort_values("t").reset_index(drop=True)
+    has_velocity = all(c in out.columns for c in ("Ve", "Vn", "Vu"))
+    # Some FC exports contain byte-for-byte duplicate fixes at the same sensor
+    # timestamp.  A GPS update grid cannot contain two distinct updates at one
+    # time, and retaining them makes position-difference velocity singular.
+    out = out.sort_values("t").drop_duplicates("t", keep="first").reset_index(drop=True)
+    out.attrs["has_velocity"] = has_velocity
+    return out
 
 
 def read_tum(rp: ResolvedPath) -> pd.DataFrame:
-    """Read TUM trajectory rows.
+    """Read TUM or OpenVINS navigation trajectory rows.
 
     The evaluator needs t x y z. Quaternion values are preserved when present;
     short rows with missing quaternion values are accepted and filled with NaN.
+
+    Supported layouts are::
+
+        t x y z qx qy qz qw
+        t x y z vx vy vz qx qy qz qw
+
+    ``traj_nav.txt`` uses the second layout.  Treating its velocity columns as
+    quaternion components corrupts every attitude diagnostic in the report.
     """
     rows = []
     text = open_bytes(rp).read().decode("utf-8", errors="replace")
@@ -150,7 +163,9 @@ def read_tum(rp: ResolvedPath) -> pd.DataFrame:
         if len(parts) < 4:
             raise ValueError(f"TUM line {lineno} has {len(parts)} columns; need at least t x y z")
         vals = [float(x) for x in parts[:4]]
-        if len(parts) >= 8:
+        if len(parts) >= 11:
+            vals.extend(float(x) for x in parts[7:11])
+        elif len(parts) >= 8:
             vals.extend(float(x) for x in parts[4:8])
         else:
             vals.extend([np.nan, np.nan, np.nan, np.nan])
