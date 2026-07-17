@@ -371,9 +371,10 @@ void test_rejections_and_causal_recovery() {
   require(!candidate.result.released_to_openvins &&
               !candidate.selected_frame_timestamps.empty() &&
               !candidate.selected_feature_ids.empty() &&
-              !candidate.optimized_landmarks_G.empty() &&
+              candidate.optimized_landmarks_G.empty() &&
               candidate.solve_window_end > candidate.solve_window_start,
-          "AlignmentCandidate must retain its bounded solve snapshot and provenance");
+          "landmark-free AlignmentCandidate must retain its bounded solve "
+          "snapshot and provenance");
   const int solves_before_duplicate_try =
       initializer.last_diagnostics().nonlinear_solve_attempt_count;
   OnlineAlignmentResult pending_duplicate;
@@ -477,7 +478,7 @@ void test_rejections_and_causal_recovery() {
   require(!result.diagnostics.rejected_intervals.empty(),
           "high-angular-rate interval must be rejected and recorded");
   require(result.diagnostics.stereo_depths > 0,
-          "monocular multi-frame landmarks must be triangulated");
+          "monocular multi-frame epipolar pairs must be accepted");
   require(std::fabs(result.diagnostics.selected_window_duration_s - 5.0) <
               1e-9 &&
               result.diagnostics.keyframes <= options.max_keyframes,
@@ -601,6 +602,117 @@ void test_rejections_and_causal_recovery() {
               initializer.last_diagnostics().successful_release_count == 1 &&
               initializer.last_diagnostics().post_release_try_count == 1,
           "one-shot counters must distinguish solve, release, and rejected post-release call");
+}
+
+void test_formal_candidate_holdout_and_single_refinement_release() {
+  OnlineAlignmentOptions options = make_options();
+  options.formal_causal_lifecycle = true;
+  options.candidate_window_durations_s = {5.0};
+  options.reference_window_duration_s = 5.0;
+  options.candidate_short_validation_duration_s = 2.0;
+  options.sliding_window_min_advance_s = 0.5;
+  options.max_initial_clones = 0;
+  options.max_initial_slam_features = 0;
+  const SyntheticMotion motion;
+  const Eigen::Matrix3d R_mount =
+      Eigen::AngleAxisd(3.0 * kPi / 180.0, Eigen::Vector3d::UnitZ())
+          .toRotationMatrix() *
+      Eigen::AngleAxisd(-2.0 * kPi / 180.0, Eigen::Vector3d::UnitY())
+          .toRotationMatrix();
+  const Eigen::Vector3d bg(0.012, -0.008, 0.006);
+  const Eigen::Vector3d ba(0.12, -0.08, 0.05);
+  const double attitude_offset = 0.024;
+  options.fc_board_calibration_locked = true;
+  options.R_FtoI_declared = R_mount;
+  options.fc_attitude_to_board_time_offset_s = attitude_offset;
+  options.fc_navigation_to_board_time_offset_s = 0.0;
+
+  OnlineAlignmentInitializer initializer(options);
+  int frame_index = 0;
+  const auto feed_tick = [&](int tick) {
+    const double board_time = 0.005 * tick;
+    if (tick % 4 == 0) {
+      FCNavigationSample fc;
+      fc.timestamp = board_time;
+      fc.position_G = position_G(board_time);
+      fc.velocity_G = velocity_G(board_time);
+      fc.q_GtoF = ov_core::rot_2_quat(motion.rotation(board_time));
+      fc.navigation_frame = "G_nav";
+      fc.body_frame = "FC_body";
+      fc.position_valid = fc.velocity_valid = fc.attitude_valid =
+          fc.status_valid = true;
+      require(initializer.feed_fc_navigation(fc), "formal FC feed");
+    }
+    const double fc_attitude_time =
+        std::max(0.0, board_time - attitude_offset);
+    BoardImuSample imu;
+    imu.timestamp = board_time;
+    imu.angular_velocity =
+        R_mount * omega_F(fc_attitude_time) + bg;
+    const Eigen::Matrix3d R_GtoI =
+        R_mount * motion.rotation(fc_attitude_time);
+    imu.linear_acceleration =
+        R_GtoI * (acceleration_G(fc_attitude_time) + options.gravity_G) + ba;
+    imu.frame = "board_imu";
+    imu.status_valid = true;
+    require(initializer.feed_board_imu(imu), "formal IMU feed");
+    if (tick % 20 == 0 && board_time >= 0.1) {
+      const double camera_time =
+          board_time - options.camera_to_imu_time_offset_s;
+      require(initializer.feed_stereo(make_stereo_frame(
+                  camera_time, motion, R_mount,
+                  options.camera_to_imu_time_offset_s, attitude_offset,
+                  frame_index++)),
+              "formal visual feed");
+    }
+  };
+
+  for (int tick = 0; tick <= 1240; ++tick)
+    feed_tick(tick);
+  OnlineAlignmentResult result;
+  require(!initializer.try_initialize(6.2, result) &&
+              initializer.candidate_active(),
+          "formal finite graph must freeze a candidate before release");
+  const double candidate_camera_time =
+      initializer.current_candidate().result.timestamp;
+  const int solves_at_candidate =
+      initializer.last_diagnostics().nonlinear_solve_attempt_count;
+  bool released = false;
+  for (int tick = 1241; tick <= 2200 && !released; ++tick) {
+    feed_tick(tick);
+    if (tick % 20 == 0) {
+      const double camera_time =
+          0.005 * tick - options.camera_to_imu_time_offset_s;
+      released = initializer.try_initialize(camera_time, result);
+    }
+  }
+
+  require(released && result.released_to_openvins,
+          "passed causal holdout must release the single refined graph");
+  require(result.diagnostics.formal_candidate_holdout_passed &&
+              result.diagnostics.formal_candidate_holdout_duration_s >= 2.0 &&
+              result.diagnostics.formal_refinement_release &&
+              result.diagnostics.candidate_refinement_count == 1,
+          "formal receipt must prove two-second holdout and exactly one refinement");
+  require(result.diagnostics.nonlinear_solve_attempt_count ==
+                  solves_at_candidate + 1 &&
+              !result.diagnostics.candidate_closed_loop_correction_applied &&
+              result.diagnostics.candidate_closed_loop_update_count == 0,
+          "holdout must not perform sequential FC feedback or extra solves");
+  require(result.timestamp > candidate_camera_time + 1.5 &&
+              result.diagnostics.decision_time >= result.timestamp,
+          "release must move to the current causal camera horizon");
+  require(result.diagnostics.shared_window_bias_model &&
+              result.diagnostics.visual_statistics
+                      .triangulated_landmark_count == 0 &&
+              result.diagnostics.visual_pairing_policy ==
+                  "one_maximum_time_baseline_pair_per_feature_no_pixel_reuse" &&
+              result.diagnostics.fc_terminal_increment_max_correlation > 0.0,
+          "formal graph topology and correlated FC model must be observable in diagnostics");
+  require(!initializer.attempt_receipts().empty() &&
+              initializer.attempt_receipts().back().outcome ==
+                  "formal_refined_release",
+          "final receipt must identify the one refined atomic release");
 }
 
 void feed_minimal_nonvisual_streams(OnlineAlignmentInitializer &initializer,
@@ -1251,10 +1363,9 @@ void test_r1_shadow_rebuilds_advancing_fixed_time_windows() {
                 window.optimizer_invocation_index == expected_invocation &&
                 window.optimizer_invocation_count == 1,
             "R1 windows must contain one standard dynamic graph solve");
-    require(!window.shared_window_bias_model &&
+    require(window.shared_window_bias_model &&
                 !window.staged_solver_enabled,
-            "R1 receipts must prove per-keyframe bias topology replaced the "
-            "shared-bias staged solve");
+            "R1 receipts must prove one shared bg/ba pair and one joint solve");
     require(std::fabs((window.window_end_timestamp -
                        window.window_begin_timestamp) -
                       options.sliding_window_duration_s) < 1.0e-6,
@@ -1401,8 +1512,8 @@ void test_direct_sliding_release_uses_overlap_time_not_event_count() {
           "serial copies of the same maturation duration");
   require(released.initial_clones.size() >= 4,
           "direct release must carry a mature historical pose window");
-  require(!released.initial_landmarks.empty(),
-          "direct release must carry persistent graph landmarks");
+  require(released.initial_landmarks.empty(),
+          "landmark-free graph must not transfer nuisance visual states");
   require(released.initial_joint_covariance.rows() ==
               15 + 6 * static_cast<Eigen::Index>(
                            released.initial_clones.size()) +
@@ -1512,6 +1623,7 @@ void test_upstream_dynamic_mode_builds_only_causal_fc_gauge_targets() {
 
 int main() {
   test_rejections_and_causal_recovery();
+  test_formal_candidate_holdout_and_single_refinement_release();
   test_no_visual_fail_closed();
   test_practical_navigation_start_with_weak_alignment();
   test_missing_full_flight_calibration_fails_closed();

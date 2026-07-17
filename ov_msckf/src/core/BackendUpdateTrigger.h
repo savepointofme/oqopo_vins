@@ -9,6 +9,7 @@
 #include <cmath>
 #include <limits>
 #include <string>
+#include <unordered_set>
 
 namespace ov_msckf {
 
@@ -19,6 +20,7 @@ struct AdaptiveBackendSchedulerConfig {
   double minimum_grid_occupancy = 0.25;
   double minimum_grid_entropy = 0.35;
   double maximum_border_ratio = 0.75;
+  double termination_border_margin_fraction = 0.05;
   // Backend geometry should span more baseline than one nominal KLT step.
   double minimum_compensated_median_px = 10.0;
   double maximum_compensated_p95_ucb_px = 30.0;
@@ -68,12 +70,59 @@ inline bool backend_reference_commit_allowed(bool trigger,
   return trigger && snapshot_valid && clone_created;
 }
 
+inline bool backend_feature_termination_imminent(
+    const VisualFrameSnapshot &reference,
+    const VisualFrameSnapshot &current, int image_width, int image_height,
+    const AdaptiveBackendSchedulerConfig &config) {
+  if (image_width <= 0 || image_height <= 0)
+    return false;
+  std::unordered_set<size_t> reference_ids;
+  for (const VisualTrackPoint &track : reference.tracks)
+    if (track.valid)
+      reference_ids.insert(track.feature_id);
+  if (reference_ids.empty())
+    return false;
+
+  const double margin_x =
+      config.termination_border_margin_fraction * image_width;
+  const double margin_y =
+      config.termination_border_margin_fraction * image_height;
+  int current_count = 0;
+  int common_count = 0;
+  int border_count = 0;
+  for (const VisualTrackPoint &track : current.tracks) {
+    if (!track.valid)
+      continue;
+    ++current_count;
+    common_count += reference_ids.count(track.feature_id) > 0 ? 1 : 0;
+    if (track.raw.allFinite() &&
+        (track.raw.x() <= margin_x ||
+         track.raw.x() >= image_width - margin_x ||
+         track.raw.y() <= margin_y ||
+         track.raw.y() >= image_height - margin_y))
+      ++border_count;
+  }
+  const double survival_ratio =
+      static_cast<double>(common_count) /
+      static_cast<double>(reference_ids.size());
+  const double border_ratio =
+      current_count > 0
+          ? static_cast<double>(border_count) / current_count
+          : 1.0;
+  return current_count < config.minimum_common_tracks ||
+         common_count < config.minimum_common_tracks ||
+         survival_ratio < config.minimum_survival_ratio ||
+         border_ratio > config.maximum_border_ratio;
+}
+
 class AdaptiveBackendScheduler {
 public:
   explicit AdaptiveBackendScheduler(
       const AdaptiveBackendSchedulerConfig &config =
           AdaptiveBackendSchedulerConfig())
       : config_(config) {}
+
+  const AdaptiveBackendSchedulerConfig &config() const { return config_; }
 
   AdaptiveBackendDecision
   evaluate(const AdaptiveBackendSchedulerInput &input) const {

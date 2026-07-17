@@ -2,6 +2,13 @@
 
 日期：2026-07-17
 
+> **状态：已由代码级报告取代。** 本文是架构调研草案，其中没有把所有结论
+> 逐项绑定到固定 commit、入口函数和 parameter blocks，不能单独作为实现或
+> 验收依据。正式依据改为
+> [P4_P5_FORMAL_CODE_AUDIT_AND_IMPLEMENTATION_REPORT_20260717.md](P4_P5_FORMAL_CODE_AUDIT_AND_IMPLEMENTATION_REPORT_20260717.md)
+> 与修订后的
+> [P4_FORMAL_INITIALIZATION_IMPLEMENTATION_SPEC_20260717.md](P4_FORMAL_INITIALIZATION_IMPLEMENTATION_SPEC_20260717.md)。
+
 ## 1. 审查范围
 
 本报告只回答 P4 应当建立在什么算法架构上，不修改代码、参数、P5、GPS-Z/AGL 后处理或评价口径。

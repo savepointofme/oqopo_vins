@@ -143,6 +143,14 @@ struct StateObservability {
   double data_information_min_eigenvalue = 0.0;
   double data_information_max_eigenvalue = 0.0;
   double data_information_condition = std::numeric_limits<double>::infinity();
+  /// Physical tangent-unit scale used to form z = dx / scale. Release rank
+  /// gates use H_z = scale^2 H_x, so radians, metres, m/s and bias units are
+  /// never compared through one dimensional threshold.
+  double information_normalization_scale = 1.0;
+  double normalized_data_information_min_eigenvalue = 0.0;
+  double normalized_data_information_max_eigenvalue = 0.0;
+  double normalized_data_information_condition =
+      std::numeric_limits<double>::infinity();
   int prior_residual_count = 0;
   int imu_residual_count = 0;
   int visual_residual_count = 0;
@@ -181,10 +189,13 @@ struct SensorProvenance {
 };
 
 struct OnlineAlignmentOptions {
-  /// Production P4 path. Initialize the local metric VIO once with the
-  /// upstream OpenVINS dynamic initializer, then use this class only to build
-  /// synchronized causal FC targets for a low-dimensional yaw+translation
-  /// gauge window. The repeated FC/IMU/visual Ceres graph is bypassed.
+  /// Formal production lifecycle: one finite joint candidate window, a later
+  /// causal holdout measured in sensor time, at most one newly advanced joint
+  /// refinement, then one atomic terminal-state release.
+  bool formal_causal_lifecycle = false;
+  /// Legacy comparison only. Initialize local VIO upstream, then estimate a
+  /// low-dimensional FC yaw/translation gauge. The formal runner must keep
+  /// this false whenever formal_causal_lifecycle is true.
   bool upstream_dynamic_init_fc_gauge = false;
   /// Diagnostic ablation: replace the solved release attitude with the
   /// synchronized FC attitude composed with the accepted FC-to-board mount.
@@ -318,11 +329,16 @@ struct OnlineAlignmentOptions {
   /// fixed to declared priors. Keep false unless those priors have an
   /// independently accepted runtime lineage.
   bool navigation_allow_startup_prior_release = false;
+  /// Dimensionless minimum eigenvalue of H_z after each 3-D state group is
+  /// scaled by its configured maximum admissible one-sigma uncertainty.
   double min_information_eigenvalue = 1e-8;
   double max_information_condition = 1e12;
   double fc_attitude_sigma_deg = 2.0;
   double fc_position_sigma_m = 2.0;
   double fc_velocity_sigma_mps = 0.75;
+  /// Fraction of terminal FC PVA error covariance assigned to independent
+  /// Phi=I process increments across the complete physical window.
+  double fc_process_variance_fraction = 0.25;
   double visual_pixel_sigma = 1.5;
   double gyro_bias_prior_sigma_rad_s = 0.10;
   double accel_bias_prior_sigma_mps2 = 1.0;
@@ -588,6 +604,17 @@ struct OnlineAlignmentDiagnostics {
   int fc_position_velocity_factor_count = 0;
   double fc_position_velocity_time_weight_sum = 0.0;
   std::string fc_position_velocity_weight_model = "none";
+  std::string fc_error_state_transition_model = "none";
+  double fc_process_variance_fraction = 0.0;
+  double fc_terminal_increment_max_correlation = 0.0;
+  std::string visual_pairing_policy = "none";
+  int visual_unique_measurement_count = 0;
+  int formal_candidate_holdout_fc_samples = 0;
+  int formal_candidate_holdout_imu_samples = 0;
+  int formal_candidate_holdout_visual_frames = 0;
+  double formal_candidate_holdout_duration_s = 0.0;
+  bool formal_candidate_holdout_passed = false;
+  bool formal_refinement_release = false;
   double fc_terminal_attitude_residual_deg =
       std::numeric_limits<double>::infinity();
   double fc_terminal_position_residual_m =
@@ -756,6 +783,7 @@ struct AlignmentAttemptReceipt {
   std::vector<double> selected_frame_timestamps;
   int selected_tracks = 0;
   int selected_landmarks = 0;
+  int selected_visual_pairs = 0;
   int factor_count = 0;
   double solve_wall_time_s = 0.0;
   int optimizer_invocation_count = 0;
@@ -924,6 +952,12 @@ private:
   bool previous_tracking_snapshot_valid_ = false;
 
   bool candidate_active_ = false;
+  bool formal_refinement_pending_ = false;
+  double formal_candidate_camera_time_ = -1.0;
+  int formal_candidate_holdout_fc_samples_ = 0;
+  int formal_candidate_holdout_imu_samples_ = 0;
+  int formal_candidate_holdout_visual_frames_ = 0;
+  double formal_candidate_holdout_duration_s_ = 0.0;
   OnlineAlignmentCandidateFilter candidate_filter_;
   AlignmentResult candidate_result_;
   double candidate_created_time_ = -1.0;
@@ -992,6 +1026,7 @@ private:
   void fail_retry(double stream_time, const std::string &reason);
   void copy_runtime_counters(OnlineAlignmentDiagnostics &diagnostics) const;
   bool validate_candidate(double now, AlignmentResult &result);
+  bool validate_formal_candidate(double now, AlignmentResult &result);
   bool advance_candidate_filter(OnlineAlignmentCandidateFilter &filter,
                                 double target_board_time,
                                 std::string &reason) const;

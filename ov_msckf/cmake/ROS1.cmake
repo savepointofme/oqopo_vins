@@ -96,6 +96,9 @@ list(APPEND LIBRARY_SOURCES
         src/core/ImuFilter.cpp
         src/core/OnlineAlignmentCandidateFilter.cpp
         src/core/OnlineAlignmentInitializer.cpp
+        src/core/p4/factors/Factor_P4Epipolar.cpp
+        src/core/p4/factors/Factor_P4FcTrajectory.cpp
+        src/core/p4/factors/Factor_P4ImuSharedBias.cpp
         src/core/VioManager.cpp
         src/core/VioManagerHelper.cpp
         src/update/UpdaterHelper.cpp
@@ -213,6 +216,10 @@ install(TARGETS test_fc_init_loader
 add_executable(test_online_alignment_initializer src/test_online_alignment_initializer.cpp)
 target_link_libraries(test_online_alignment_initializer ov_msckf_lib ${thirdparty_libraries})
 add_test(NAME test_online_alignment_initializer COMMAND test_online_alignment_initializer)
+
+add_executable(test_p4_formal_factors src/test_p4_formal_factors.cpp)
+target_link_libraries(test_p4_formal_factors ov_msckf_lib ${thirdparty_libraries})
+add_test(NAME test_p4_formal_factors COMMAND test_p4_formal_factors)
 
 add_executable(test_online_vio_fc_gauge_aligner
   src/test_online_vio_fc_gauge_aligner.cpp)

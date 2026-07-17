@@ -422,6 +422,7 @@ struct Args {
   bool online_alignment_diagnostic_graph_q_fc_pv_zero_bias = false;
   bool online_alignment_diagnostic_never_anchor = false;
   std::string online_alignment_release_policy = "practical_navigation_start";
+  double online_alignment_fc_process_variance_fraction = 0.25;
   double online_alignment_visual_perturbation_px = 0.0;
   double online_alignment_visual_perturbation_fraction = 0.0;
   std::string initialization_mode;
@@ -800,8 +801,10 @@ void write_online_alignment_metadata(const std::string &path,
   };
   const auto &d = result.diagnostics;
   output << "{\n"
-         << "  \"schema\": \"openvins_online_multisensor_alignment_v14\",\n"
+         << "  \"schema\": \"openvins_online_multisensor_alignment_v15\",\n"
          << "  \"mode\": \"online_multisensor_alignment\",\n"
+         << "  \"algorithm_id\": "
+         << "\"openvins_p4_fc_pva_shared_bias_epipolar_v1\",\n"
          << "  \"status\": \"" << alignment_readiness_name(result.readiness)
          << "\",\n"
          << "  \"readiness_level\": \""
@@ -1067,6 +1070,29 @@ void write_online_alignment_metadata(const std::string &path,
          << json_scalar(d.fc_position_velocity_time_weight_sum) << ",\n"
          << "  \"fc_position_velocity_weight_model\": \""
          << json_escape(d.fc_position_velocity_weight_model) << "\",\n"
+         << "  \"fc_error_state_transition_model\": \""
+         << json_escape(d.fc_error_state_transition_model) << "\",\n"
+         << "  \"fc_process_variance_fraction\": "
+         << json_scalar(d.fc_process_variance_fraction) << ",\n"
+         << "  \"fc_terminal_increment_max_correlation\": "
+         << json_scalar(d.fc_terminal_increment_max_correlation) << ",\n"
+         << "  \"visual_pairing_policy\": \""
+         << json_escape(d.visual_pairing_policy) << "\",\n"
+         << "  \"visual_unique_measurement_count\": "
+         << d.visual_unique_measurement_count << ",\n"
+         << "  \"formal_candidate_holdout_fc_samples\": "
+         << d.formal_candidate_holdout_fc_samples << ",\n"
+         << "  \"formal_candidate_holdout_imu_samples\": "
+         << d.formal_candidate_holdout_imu_samples << ",\n"
+         << "  \"formal_candidate_holdout_visual_frames\": "
+         << d.formal_candidate_holdout_visual_frames << ",\n"
+         << "  \"formal_candidate_holdout_duration_s\": "
+         << json_scalar(d.formal_candidate_holdout_duration_s) << ",\n"
+         << "  \"formal_candidate_holdout_passed\": "
+         << (d.formal_candidate_holdout_passed ? "true" : "false")
+         << ",\n"
+         << "  \"formal_refinement_release\": "
+         << (d.formal_refinement_release ? "true" : "false") << ",\n"
          << "  \"fc_attitude_gauge_anchor_timestamp_s\": "
          << json_scalar(d.fc_attitude_gauge_anchor_timestamp_s) << ",\n"
          << "  \"fc_attitude_gauge_anchor_rate_rad_s\": "
@@ -1280,7 +1306,18 @@ void write_online_alignment_metadata(const std::string &path,
            << "\",\"covariance_std\":["
            << json_scalar(state.covariance_std.x()) << ","
            << json_scalar(state.covariance_std.y()) << ","
-           << json_scalar(state.covariance_std.z()) << "]}";
+           << json_scalar(state.covariance_std.z()) << "]"
+           << ",\"information_normalization_scale\":"
+           << json_scalar(state.information_normalization_scale)
+           << ",\"normalized_data_information_min_eigenvalue\":"
+           << json_scalar(
+                  state.normalized_data_information_min_eigenvalue)
+           << ",\"normalized_data_information_max_eigenvalue\":"
+           << json_scalar(
+                  state.normalized_data_information_max_eigenvalue)
+           << ",\"normalized_data_information_condition\":"
+           << json_scalar(state.normalized_data_information_condition)
+           << "}";
   }
   output << "],\n  \"estimated_states\": ";
   write_string_list(d.estimated_state_list);
@@ -1552,6 +1589,8 @@ void write_online_alignment_attempt_receipts(
            << receipt.selected_keyframe_count
            << ", \"selected_tracks\": " << receipt.selected_tracks
            << ", \"selected_landmarks\": " << receipt.selected_landmarks
+           << ", \"selected_visual_pairs\": "
+           << receipt.selected_visual_pairs
            << ", \"factor_count\": " << receipt.factor_count
            << ", \"solve_wall_time_s\": "
            << json_scalar(receipt.solve_wall_time_s)
@@ -1964,6 +2003,7 @@ void print_help() {
                 "  --canonical-init-state-json PATH  Canonical seed-state audit record (default: OUTPUT sibling canonical_init_state.json)\n"
                 "  --online-alignment-metadata-json PATH  Causal online alignment release record (default: OUTPUT sibling online_alignment_metadata.json)\n"
                 "  --online-alignment-release-policy POLICY  practical_navigation_start (default) or strict_full_alignment.\n"
+                "  --online-alignment-fc-process-fraction F  Formal correlated FC PVA model process fraction in (0,1), default 0.25.\n"
                 "  --online-alignment-disable-visual  Negative control: remove all monocular reprojection factors; full alignment is forbidden.\n"
                 "  --online-alignment-navigation-allow-without-visual  Explicitly allow navigation-only release in the no-vision control.\n"
                 "  --online-alignment-retain-bg-prior  Compatibility flag; production already retains the joint-graph bg estimate.\n"
@@ -2159,6 +2199,9 @@ bool parse_args(int argc, char **argv, Args &a) {
     else if (s == "--online-alignment-release-policy")
       a.online_alignment_release_policy =
           next("--online-alignment-release-policy");
+    else if (s == "--online-alignment-fc-process-fraction")
+      a.online_alignment_fc_process_variance_fraction = std::atof(
+          next("--online-alignment-fc-process-fraction").c_str());
     else if (s == "--online-alignment-visual-perturbation-px")
       a.online_alignment_visual_perturbation_px = std::atof(
           next("--online-alignment-visual-perturbation-px").c_str());
@@ -2461,6 +2504,13 @@ bool parse_args(int argc, char **argv, Args &a) {
       a.online_alignment_release_policy != "strict_full_alignment") {
     std::cerr << "invalid --online-alignment-release-policy: "
               << a.online_alignment_release_policy << "\n";
+    return false;
+  }
+  if (!(a.online_alignment_fc_process_variance_fraction > 0.0) ||
+      !(a.online_alignment_fc_process_variance_fraction < 1.0) ||
+      !std::isfinite(a.online_alignment_fc_process_variance_fraction)) {
+    std::cerr << "--online-alignment-fc-process-fraction must be finite and "
+                 "strictly between zero and one\n";
     return false;
   }
   if (a.online_alignment_visual_perturbation_px < 0.0 ||
@@ -3284,13 +3334,14 @@ int main(int argc, char **argv) {
         PRINT_INFO(CYAN "[ONLINE-ALIGN][DEBUG] FC row contracts validated\n" RESET);
 
         OnlineAlignmentOptions online_options;
-        // Formal P4: run the upstream OpenVINS visual-inertial dynamic
-        // initializer once. The initialized metric local VIO is then paired
-        // causally with FC navigation over one real-time window to estimate
-        // only global yaw and translation. Metric scale is recovered later by
-        // the independent AGL output postprocess, never from FC horizontal
-        // velocity. No repeated joint Ceres graph is permitted in this path.
-        online_options.upstream_dynamic_init_fc_gauge = true;
+        // Formal P4 starts uninitialized and solves q/p/v at every selected
+        // keyframe with one window-shared bg/ba pair.  FC PVA, complete 15-D
+        // CPI factors, and landmark-free monocular epipolar factors enter the
+        // same finite graph.  A frozen candidate then receives a short causal
+        // holdout and at most one advanced joint refinement before atomic
+        // terminal-state injection.
+        online_options.formal_causal_lifecycle = true;
+        online_options.upstream_dynamic_init_fc_gauge = false;
         online_options.sliding_window_shadow_only = false;
         online_options.sliding_window_direct_state_release = false;
         online_options.sliding_window_deferred_release_certification = false;
@@ -3300,6 +3351,8 @@ int main(int argc, char **argv) {
         online_options.sliding_window_diagnostic_never_anchor =
             args.online_alignment_diagnostic_never_anchor;
         online_options.fc_attitude_gauge_factor_enabled = true;
+        online_options.fc_process_variance_fraction =
+            args.online_alignment_fc_process_variance_fraction;
         online_options.diagnostic_release_attitude_from_fc =
             args.online_alignment_release_attitude_from_fc;
         online_options.diagnostic_release_graph_attitude_fc_pv_zero_bias =
@@ -3488,7 +3541,8 @@ int main(int argc, char **argv) {
         PRINT_INFO(CYAN "[ONLINE-ALIGN] frames G=%s F=%s I=%s; shared target-parallax visual scheduler, T_C_I locked, manual 7deg/4.089deg corrections absent\n" RESET,
                    navigation_frame.c_str(), fc_body_frame.c_str(),
                    board_imu_frame.c_str());
-        PRINT_INFO(CYAN "[ONLINE-ALIGN] formal P4 uses one upstream dynamic VIO initialization followed by an 8s causal FC/VIO velocity-position Sim(3) window; one atomic reset is allowed; repeated joint Ceres is disabled\n" RESET);
+        PRINT_INFO(CYAN "[ONLINE-ALIGN] formal P4 uses an 8s FC+IMU+epipolar joint graph with shared bg/ba, a 2s immutable causal holdout, one advanced refinement, and one atomic q/p/v/bg/ba+15x15 release; FC process fraction=%.3f\n" RESET,
+                   online_options.fc_process_variance_fraction);
       } else {
       if (cam0.empty())
         throw std::runtime_error("no camera frames remain after --start-time trim; cannot choose FC init by camera time");

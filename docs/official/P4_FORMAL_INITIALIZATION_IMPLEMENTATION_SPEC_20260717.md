@@ -1,31 +1,38 @@
-# P4 正式有限时间滑窗联合初始化算法与实现冻结规格
+# P4 正式有限时间联合初始化算法与实现合同（代码审计修订版）
 
 日期：2026-07-17
-性质：实现前冻结规格，不是已完成实现，也不是实验结果
-当前源码快照：`fdd8d745229c7115b56b5d2d765f462a3fd68b4b`
-配套调研：[P4_INITIALIZATION_LITERATURE_AND_ARCHITECTURE_REVIEW_20260717.md](P4_INITIALIZATION_LITERATURE_AND_ARCHITECTURE_REVIEW_20260717.md)
+性质：`REVISED_IMPLEMENTATION_CONTRACT / AWAITING_BUILD_AND_FLIGHT_VALIDATION`
+审计基线：tag `baseline/p4-p5-chatgpt-work-20260717`，commit `a96540c68f4211039741ff461883f18479aa9dec`
+代码级调研与实现报告：[P4_P5_FORMAL_CODE_AUDIT_AND_IMPLEMENTATION_REPORT_20260717.md](P4_P5_FORMAL_CODE_AUDIT_AND_IMPLEMENTATION_REPORT_20260717.md)
+
+> 2026-07-17 代码审计修订：原稿中“高度重叠窗口连续一整窗确认”、
+> `P_current + P_previous` 独立差值 covariance、9D CPI 抽取、P4 内重估
+> P3 mount/time，以及以 start-heading alignment 为主口径的条款不成立，
+> 已由本版明确替换。代码完成不等于 P4/P5 正式通过；只有依赖齐全的
+> native build、Monte Carlo consistency 和 fly1–fly4 验收完成后才能改状态。
 
 ## 1. 本报告解决什么问题
 
 本文把下一版正式 P4 的算法、坐标、时间、状态、因子、窗口生命周期、代码文件、函数输入输出、代码复用来源和验收条件一次冻结。后续实现不得靠“看起来差不多”改变这里的语义；如果实现中发现本规格的数学前提不成立，必须先更新本报告并说明证据，再改代码。
 
-当前工作树的生产入口仍在执行：
+冻结基线 `a96540c...` 的生产入口执行：
 
     upstream OpenVINS dynamic initializer
       -> local metric VIO
       -> FC yaw + translation gauge
       -> AGL scale postprocess
 
-证据是 `run_serial_msckf_ros_free.cpp` 的在线配置仍把 `upstream_dynamic_init_fc_gauge` 设为 `true`。这条路径已经被前一份架构审查否决：FC 没有进入 q/p/v/bg/ba 的初始联合估计，错误的局部速度、尺度和 bias 也不能由 yaw+translation 修好。
+证据是该基线 `run_serial_msckf_ros_free.cpp` 的在线配置把 `upstream_dynamic_init_fc_gauge` 设为 `true`。本 patch 已把正式 runner 改为 `formal_causal_lifecycle=true`、`upstream_dynamic_init_fc_gauge=false`；旧路径只保留为显式 legacy 对照，不再是正式入口。
 
 本规格要求替换为：
 
     FC navigation q/p/v ─┐
     board raw IMU ───────┼─> causal fixed-duration window
     monocular KLT tracks ┘             │
-                                      ├─ rotation/time/mount/bg stage
-                                      ├─ metric p/v/ba stage
-                                      ├─ bounded joint refinement
+                                      ├─ fixed P3 mount/time + bg seed
+                                      ├─ shared-bias metric joint graph
+                                      ├─ immutable causal holdout
+                                      ├─ one advanced joint refinement
                                       ├─ covariance/information validation
                                       └─ atomic OpenVINS q/p/v/bg/ba injection
 
@@ -37,7 +44,7 @@ P4 的物理分类是“FC 主系统到 board IMU 从系统的飞行中传递对
 
 1. FC q/p/v 从初始状态生成开始就进入度量联合估计，不再先跑错误局部 VIO 后做 gauge。
 2. 窗口由传感器时间长度定义；FC、IMU、视觉量测数由窗口和实际频率自然产生，不以固定 10 次、固定 N 次更新或 3/5/8/12 选择表决定释放。
-3. 每次窗口推进都用当前窗内完整 FC/IMU/视觉证据重新估计；旧候选递归滤波器不再代替滑窗联合估计。
+3. 有限窗先产生 candidate；随后约 2 s 的不相交因果 holdout 只验证、不反馈；通过后最多做一次推进到当前因果终点的完整联合 refinement。旧候选递归滤波器不得代替联合 refinement。
 4. Camera–IMU 外参、FC–board nominal mounting、FC attitude latency、FC navigation latency 和 Velcro transient flex 是不同物理量。
 5. q/p/v/bg/ba 的置信状态分别计算；未被数据支持的量明确标为 prior-retained，不伪装成已标定。
 6. 向 OpenVINS 的状态注入是一次原子操作，状态顺序和协方差顺序严格为 `[δθ, δp, δv, δbg, δba]`。
@@ -57,7 +64,7 @@ P4 的物理分类是“FC 主系统到 board IMU 从系统的飞行中传递对
 - 禁止将每一行 FC q/p/v 当成相互独立、同方差的绝对观测；这会随关键帧密度重复乘信息。
 - 禁止每关键帧独立建立 bg/ba；正式短窗采用 shared bg/ba。
 - 禁止每个推进窗口重新生成和优化全部显式 landmark。
-- 禁止 candidate 创建后冻结图，只用 FC p/v 递归滤波验证。
+- 禁止 candidate 创建后只用 FC p/v 递归反馈改变 q/p/v/bg/ba。允许且要求冻结 candidate 后用随后约 2 s 的 IMU/FC/视觉因果 holdout 做只读验证；成功只授权一次新的完整联合 refinement。
 - 禁止高角速度一律删除视觉帧。转弯既可能有模糊，也提供安装角和 bias 激励，必须按真实视觉健康和三源残差分类。
 - 禁止把转弯时的 FC–board flex residual 写回永久 mounting calibration。
 - 禁止用固定左转补偿、固定右转补偿或固定 yaw 角抵消 fly1/fly3。
@@ -105,19 +112,20 @@ P4 的物理分类是“FC 主系统到 board IMU 从系统的飞行中传递对
 
 这个公式必须有 identity、纯旋转、非零平移三个单元测试。
 
-### 4.3 FC–board nominal mounting 与在线 residual
+### 4.3 FC–board nominal mounting 与 P4 shadow residual
 
 外部接受标定提供：
 
     R_FtoI_nominal
     P_mount_nominal
 
-在线只估本次启动窗口的小残差：
+正式第一版 P4 把 P3 接受的 nominal mounting 作为固定输入：
 
-    R_FtoI =
-      Exp(δθ_mount) R_FtoI_nominal
+    R_FtoI = R_FtoI_nominal
 
-`δθ_mount` 是 I 系左扰动。由 FC 生成 board 姿态：
+P4 可以计算 `δθ_mount_shadow` 作为诊断，但不得让它改变 q/p/v/bg/ba，
+不得写回 nominal calibration，也不得用它吸收 Velcro flex。由 FC 生成
+board 姿态：
 
     R_GtoI,k^FC =
       R_FtoI R_GtoF,k
@@ -126,10 +134,9 @@ P4 的物理分类是“FC 主系统到 board IMU 从系统的飞行中传递对
 
 ### 4.4 杆臂
 
-声明量：
+当前声明量：
 
     p_IinF
-    P_lever_arm
 
 FC q/p/v 转换为 board IMU q/p/v：
 
@@ -142,7 +149,8 @@ FC q/p/v 转换为 board IMU q/p/v：
       v_FinG,k
       + R_FtoG,k (ω_F,k × p_IinF)
 
-用于 accelerometer seed 时必须包含完整刚体杆臂加速度：
+如果未来选择从 FC 二阶差分生成 accelerometer-bias seed，则必须包含完整刚体
+杆臂加速度：
 
     a_IinG,k^FC =
       a_FinG,k
@@ -151,7 +159,10 @@ FC q/p/v 转换为 board IMU q/p/v：
           + ω_F,k × (ω_F,k × p_IinF)
         ]
 
-不能继续使用只含平移加速度、忽略转弯杆臂项的 seed。
+本 patch 不使用这种高噪声二阶差分 seed：首窗 `ba_seed=0`，后续窗可用上一窗
+shared ba warm start，正式 ba 始终由完整 CPI+FC joint graph 估计。因此当前代码
+不得声称已实现 `alpha/centripetal` ba seed；一旦增加该 seed，上式和相应左右转
+测试是前置条件。
 
 ### 4.5 重力与 IMU 符号
 
@@ -186,10 +197,10 @@ FC q/p/v 转换为 board IMU q/p/v：
 
 - `dt_CI`：锁定 Camera–IMU calibration；
 - `dt_FI_nav`：位置/速度时间映射，使用外部声明，不由角速度相关推断；
-- `dt_FI_att = dt_FI_att_nominal + δt_att`；
-- `δt_att`：只在当前窗口多轴激励、相关峰曲率和边界条件同时成立时估计，否则固定为零并标记 `FIXED_EXTERNAL_CALIBRATION`。
+- `dt_FI_att`：使用 P3 接受的外部声明；
+- P4 可输出只读 time residual diagnostic，但本版不搜索、不写回、不进入 q/p/v/bg/ba 联合图。
 
-`δt_att` 不直接作为 Ceres 连续参数，因为 FC interpolation 在样本边界的导数不稳定。它使用外层一维搜索，进入最终联合精化时保持固定，并把剩余时间不确定度传播进终端 covariance。
+P3 声明的 `σ_dt_att` 必须通过终端角速度 Jacobian 传播到 P4 attitude covariance。`dt_FI_nav` 若没有独立 uncertainty 声明，metadata 必须明确记录“treated fixed by current contract”，不能暗示已传播未知 uncertainty。
 
 ## 5. 输入合同
 
@@ -208,14 +219,18 @@ FC q/p/v 转换为 board IMU q/p/v：
     attitude_valid
     status_valid
 
-新增噪声合同不放进每一行，而放进 `P4Options`：
+当前噪声合同不放进每一行，而放进 `OnlineAlignmentOptions`：
 
-    fc_terminal_covariance       9x9, [θ,p,v]
-    fc_increment_noise_psd       9x9, [θ,p,v] per second
-    fc_attitude_latency_sigma_s
-    lever_arm_covariance         3x3
+    fc_attitude_sigma_deg
+    fc_position_sigma_m
+    fc_velocity_sigma_mps
+    fc_process_variance_fraction scalar in (0,1)
+    fc_attitude_to_board_time_offset_sigma_s
+    fc_board_mount_sigma_deg
 
-如果输入文件没有 FC covariance，runner 可由明确配置的 attitude/position/velocity sigma 构造对角矩阵；不得在 initializer 内偷偷使用硬编码。
+initializer 由这些显式声明构造 `[theta,p,v]` terminal covariance；mount/time
+uncertainty进入 attitude block。当前 stream 没有 navigation-time 和 lever-arm
+uncertainty 字段，metadata 必须记录 treated fixed，不能偷偷硬编码一个假 covariance。
 
 ### 5.2 board IMU
 
@@ -251,7 +266,7 @@ IMU 噪声直接使用当前 estimator 参数：
     observation.track_length
     observation.left_valid
 
-`right_*`、`depth_m` 和 `stereo_valid` 在正式单目 P4 中不参与因子。`normalized_left` 必须是按锁定 intrinsics/distortion 得到的 bearing；新代码只把它扩成 `[x,y,1]` 并归一化。
+`right_*`、`depth_m` 和 `stereo_valid` 在正式单目 P4 中不参与因子。`normalized_left` 必须是按锁定 intrinsics/distortion 得到的归一化像平面坐标；新代码只把它扩成规范齐次尺度 `[x,y,1]`。不得再把两个齐次向量各自作单位长度归一化，因为 Sampson denominator 对这种独立缩放并不保持不变。
 
 ### 5.4 在线和评价数据边界
 
@@ -309,8 +324,7 @@ IMU 噪声直接使用当前 estimator 参数：
 `FULL_ALIGNMENT_READY` 额外要求：
 
 - ba 有数据增量信息；
-- mount residual 有数据增量信息；
-- time residual 若被开放估计，也有内部曲率和跨窗稳定证据。
+- mount/time 只以 P3 external calibration lineage 出现；shadow residual 不得冒充 P4 estimated state。
 
 OpenVINS 实际注入始终是一次原子 q/p/v/bg/ba 注入。所谓“分级”是各状态组在滑窗中的内部 readiness 分级，不是把半个 IMU state 提前写进 EKF。
 
@@ -322,6 +336,7 @@ OpenVINS 实际注入始终是一次原子 q/p/v/bg/ba 注入。所谓“分级�
     gravity_G
     p_IinF
     dt_FI_nav
+    R_FtoI_nominal, dt_FI_att
     camera intrinsics/distortion
     IMU noise model
 
@@ -337,13 +352,10 @@ OpenVINS 实际注入始终是一次原子 q/p/v/bg/ba 注入。所谓“分级�
 
     bg               3
     ba               3
-    δθ_mount         3
-
-`δt_att` 由外层一维搜索得到，在联合图中固定。
 
 总 tangent 维数：
 
-    9K + 9
+    9K + 6
 
 这里允许每关键帧 q/p/v，是因为 IMU 和视觉约束连接的是时变 pose/velocity；不允许每关键帧 bg/ba，是因为数秒初始化窗内 bias 首先采用 shared 模型。它与旧图“每帧 q/p/v/bg/ba + landmark”不是同一拓扑。
 
@@ -384,36 +396,36 @@ OpenVINS 实际注入始终是一次原子 q/p/v/bg/ba 注入。所谓“分级�
 
 `max_keyframes` 只是内存/实时性上限，默认沿用 36；它不是 release 所需量测次数。
 
-### 8.3 持续重估
+### 8.3 有限 candidate、因果 holdout 与一次 refinement
 
-每次窗口推进：
+生产生命周期固定为：
 
-    build current window
-      -> reuse unchanged raw segments/preintegrations
-      -> warm-start overlap states
-      -> solve all stages on current window
-      -> compute current group readiness
-      -> compare overlapping states with previous solved windows
-      -> not ready: slide again
-      -> ready: atomic release and close P4
+    solve finite current window
+      -> freeze candidate(q/p/v/bg/ba/P at t_candidate_C)
+      -> collect approximately 2 s later causal FC/IMU/visual data
+      -> propagate candidate with holdout IMU only
+      -> compare endpoint against holdout FC and epipolar observations
+      -> fail: discard candidate and slide to a fresh finite window
+      -> pass: authorize exactly one newly advanced full joint solve
+      -> inject that refined terminal state at current t_end_C
+      -> atomically close P4
 
-不存在 `candidate_active_ -> validate_candidate()` 短路。旧候选滤波器不再是生产路径。
+holdout 期间不得把 FC residual 反馈到 frozen candidate，不得更新 candidate
+covariance，也不得增加第二次 refinement。refinement 失败即消耗本次授权并回到
+fresh-window retry。
 
-### 8.4 readiness 的时间语义
+### 8.4 readiness 与相邻窗口统计
 
-每个状态组维护：
+readiness 由“当前有限图内部质量 + 随后约 2 s 不相交因果 holdout + 一次
+refinement 自身质量”组成，不按固定更新次数，也不要求再连续一个完整
+`T_window`。因此默认 8 s 图的最早正常释放约为 10 s 加求解/帧对齐延迟，
+不是约 16 s。
 
-    ready_since_sensor_time
-    latest_ready_window_end
-    latest_cross_window_normalized_delta
-
-一个组只有在连续一个 `T_window` 的滑窗推进时间里始终满足内部 gate，才从 `ESTIMATED_UNSTABLE` 变为 `TRUSTED`。这意味着确认长度自动等于实际求解窗口长度，不使用固定 N 次支持或固定 2 次反馈。
-
-窗口重叠比较使用：
-
-    d² = δx^T (P_current + P_previous)^-1 δx
-
-同时保留物理 fail-closed 上限，但 release 依据首先是归一化统计量。对 bias 还检查在一个完整 `T_window` 上的线性趋势是否显著非零。
+相邻 8 s 窗以 0.5 s 推进时共享 93.75% 的时间数据。没有两次估计的
+cross-covariance 时，`P_current + P_previous` 不是差值 covariance，禁止把它
+用于 normalized release gate。旧 overlap 路径若为实验保留，只能报告物理
+差值上限并把 normalized 值标为 unavailable；正式 P4 的独立证据来自随后
+holdout。
 
 ### 8.5 P4 与 P5
 
@@ -494,23 +506,21 @@ OpenVINS 实际注入始终是一次原子 q/p/v/bg/ba 注入。所谓“分级�
 
 time score 是全部 whitened rate residual、FC/IMU relative rotation residual 和 rotation-only visual residual 的和。搜索：
 
-1. 以 `min(median_dt_fc, median_dt_imu)/2` 为 coarse step；
-2. 范围由外部 latency sigma 和硬边界共同限定；
-3. 取最小 coarse cell；
-4. 用相邻三点抛物线做一次 sub-sample refinement；
-5. 只有最小值不在边界、曲率为正、二轴 excitation 通过时接受 residual offset；
-6. 否则返回 nominal offset 和 `FIXED_EXTERNAL_CALIBRATION`。
+正式 P4 不搜索 P3 time/mount。它只在 P3 固定时间映射上配对 FC rate 与
+board gyro，并在固定 `R_FtoI_nominal` 下 robust estimate `bg_seed`。rate residual、
+excitation eigenvalues 和 shadow residual 进入 diagnostics，不进入 calibration
+写回或独立 release gate。
 
 输出：
 
-    dt_attitude
-    dt_attitude_variance
-    R_FtoI_seed
+    dt_attitude_fixed
+    dt_attitude_declared_variance
+    R_FtoI_fixed
     bg_seed
     excitation eigenvalues
     robust residual statistics
 
-### 9.3 阶段 C：DRT rotation-only visual/bg refinement
+### 9.3 阶段 C：DRT rotation-only 研究边界
 
 直接参考 DRT-VIO 的 rotation-only gyro-bias 子问题。对每个相邻 keyframe pair：
 
@@ -519,12 +529,13 @@ time score 是全部 whitened rate residual、FC/IMU relative rotation residual 
     locked R_ItoC
     IMU ΔR(bg_lin), J_q_bg
 
-构造消去 translation 的最小特征值 residual，联合优化：
+DRT 官方实现可构造消去 translation 的最小特征值 residual，并优化：
 
     bg
-    δθ_mount
 
-其中视觉 residual 主要约束 bg/relative rotation；FC relative rotation 把 mount 引入同一旋转子问题。
+但本次 production patch 不 vendor DRT，也不把它当 shared-ba/FC joint graph 的
+正确性证据。正式图直接使用固定 P3 calibration、完整 OpenVINS CPI 和
+landmark-free epipolar factor；DRT 只保留为未来 bg seed 的独立研究项。
 
 FC 预测的 I 相对旋转：
 
@@ -544,9 +555,11 @@ OpenVINS CPI 约定的 residual 必须保持：
 
 不能因换成 Eigen quaternion 改变乘法次序。
 
-DRT residual 只用于 rotation seed/refinement，不直接用于最终 covariance，因为其最小特征值不是标准高斯量测。最终联合图使用可按像素噪声 whitening 的 epipolar/Sampson residual。
+本 patch 不调用 DRT residual。若未来把它加入 rotation seed，也不得直接用于最终
+covariance，因为其最小特征值不是已冻结的标准高斯量测；当前最终联合图只使用
+可按像素噪声 whitening 的 epipolar/Sampson residual、完整 CPI 和 FC PVA。
 
-### 9.4 阶段 D：FC metric q/p/v seed 与 ba seed
+### 9.4 阶段 D：FC metric q/p/v seed
 
 对每个 keyframe：
 
@@ -562,34 +575,17 @@ DRT residual 只用于 rotation seed/refinement，不直接用于最终 covarian
       + R_FtoG(t_F_att)
         (ω_F × p_IinF)
 
-用含角加速度和向心项的 `a_IinG^FC` 形成每时刻 ba sample，取 robust location 作为 `ba_seed`。
+首窗 shared `ba` 从零值开始；后续失败重试窗口可以用上一窗 shared ba warm
+start。代码不从 FC velocity 二阶差分伪造一个“已完成的 ba seed”。这一步已经
+给出 `G_nav` 中的度量 q/p/v；视觉不是用来事后求 scale，而是在 joint graph 中
+通过 pose coupling 提供相对几何。
 
-这一步已经给出 `G_nav` 中的度量 q/p/v。视觉不是用来事后求一个 scale；视觉和 IMU是在后续图中检查并修正这些 seed。
-
-### 9.5 阶段 E：translation/velocity/ba reduced solve
-
-固定阶段 C 的 q、bg、mount 和 time，优化：
-
-    p_k, v_k for every keyframe
-    shared ba
-
-加入：
-
-- shared-bias 9D CPI factor；
-- FC terminal absolute p/v factor；
-- FC density-invariant p/v increment factors；
-- monocular bearing epipolar factors；
-- ba physical prior。
-
-该阶段的作用是先在较好条件数下解决 metric translation、velocity 和 accelerometer bias，避免一开始把所有旋转和平移耦合交给大图。
-
-### 9.6 阶段 F：bounded joint refinement
+### 9.5 阶段 E：单窗 joint solve
 
 变量：
 
     q_k, p_k, v_k
     shared bg, ba
-    shared δθ_mount
 
 固定：
 
@@ -605,19 +601,28 @@ DRT residual 只用于 rotation seed/refinement，不直接用于最终 covarian
     FC terminal absolute p/v
     FC relative q/p/v increments
     bearing epipolar/Sampson visual residual
-    mount/bg/ba priors
+    bg/ba priors
 
 求解器：
 
     trust_region_strategy = LEVENBERG_MARQUARDT
-    linear_solver = SPARSE_NORMAL_CHOLESKY
-    fallback = DENSE_QR only if sparse backend unavailable
-    max_iterations = 15
-    num_threads = configured build/runtime threads
+    linear_solver = DENSE_SCHUR
+    max_iterations = solver_max_iterations
+    max_solver_time = solver_max_time_s
+    num_threads = 1
 
-`max_iterations` 是计算上限，不是收敛证据；release 仍由 residual、information、covariance 和跨窗稳定决定。
+`max_iterations/max_solver_time` 是计算上限，不是收敛证据。每次 solve 都从当前
+shared bg/ba linearization 构造完整 CPI；本 patch 依赖 upstream CPI 的 bias
+Jacobian 在该次 solve 内修正，不声称已实现 solve 后再次真实重积分。若 Monte
+Carlo 或飞行数据表明 linearization 误差不可接受，再增加“solve -> rebuild CPI at
+solved biases -> bounded resolve”，并单独计作 joint solve 内部数值步骤，不能突破
+生命周期的一次 advanced refinement 语义。
 
-在准备 release 的窗口上，必须以已求得 bg/ba 重新对全部相邻区间做一次真实 CPI preintegration，然后再做最后一次短 refinement。这样 release 不依赖过远 bias linearization 的一阶修正。普通未 ready 的推进窗口可复用 Jacobian correction。
+### 9.6 阶段 F：immutable holdout 与一次 advanced refinement
+
+初次 joint solve 只形成 frozen candidate。随后约 2 s holdout 用 IMU 传播该候选，
+FC/视觉只评价不反馈。通过后只授权一次新终点 full joint solve；该 solve 重新从
+当前窗口原始 IMU 构造 CPI，并拥有最终 covariance。失败则丢弃候选、窗口前移。
 
 ### 9.7 阶段 G：terminal covariance 与 calibration uncertainty
 
@@ -626,7 +631,10 @@ DRT residual 只用于 rotation seed/refinement，不直接用于最终 covarian
     P_terminal =
       Cov([δθ_K, δp_K, δv_K, δbg, δba])
 
-`δθ_mount` 是联合 nuisance variable，因此其相关性自然进入 terminal marginal。
+P3 mounting 在本版是 fixed external calibration，不在 P4 联合优化。其声明的
+isotropic small-angle sigma 加入 FC terminal attitude covariance，同时 metadata
+单独报告 calibration covariance；这表示 calibration uncertainty 的一阶传播，
+不是把 fixed mount 伪造成 P4 data posterior。
 
 time offset 在外层搜索中固定，必须额外传播：
 
@@ -634,7 +642,10 @@ time offset 在外层搜索中固定，必须额外传播：
       P_terminal
       + J_x_dt σ_dt² J_x_dt^T
 
-`J_x_dt` 通过在 `dt ± ε` 上重建 time-dependent FC constraints 并各做一次短 solve 的中心差分获得。lever arm covariance 同样通过 analytic/numeric Jacobian加到 terminal p/v 子块。
+当前实现至少把 `σ_dt_att` 通过终端角速度 Jacobian传播到 FC attitude boundary。
+`dt_FI_nav` 和 lever arm 若缺少外部 uncertainty 声明，必须明确按 fixed input
+处理；不得写成“已传播”。完整 `J_x_dt/J_x_lever` Monte Carlo coverage 是正式
+飞行验收前的未完成验证项。
 
 最后执行：
 
@@ -656,12 +667,11 @@ time offset 在外层搜索中固定，必须额外传播：
 
 为 q、p、v、bg、ba、mount 构造：
 
-    posterior std
-    data-only minimum information eigenvalue
+    posterior std in physical tangent units
+    dimensionless data-only minimum information eigenvalue
     prior information contribution
     IMU/FC/visual Jacobian support
-    cross-window normalized delta
-    full-window trend
+    causal holdout residuals
     source status
 
 `prior_only` 的定义不是“估计值接近 prior”，而是移除 prior 后该状态组的数据 Schur information 不足。
@@ -674,55 +684,39 @@ release 必须同时满足：
 - visual 和 IMU 均对 q/p/v 的至少一个相关子空间有非零增量信息；
 - FC 对 global gauge 和 metric p/v 有增量信息；
 - 没有 saturation、time boundary、flex dominance 或 covariance correction safety failure；
-- 各必要状态组连续一个 `T_window` 处于 ready；
+- frozen candidate 的随后约 2 s causal holdout通过，且唯一一次 advanced refinement 自身 gate 通过；
 - release timestamp 不晚于当前已喂入的 IMU/camera 因果 horizon。
 
 ## 10. 因子数学定义
 
 ### 10.1 shared-bias CPI factor
 
-新因子 residual 维数 9，参数块：
+新 adapter 保留 upstream `Factor_ImuCPIv1` 的完整 15D residual/covariance，
+参数块：
 
-    q_i, p_i, v_i,
-    q_j, p_j, v_j,
-    bg, ba
+    q_i, shared_bg, v_i, shared_ba, p_i,
+    q_j,            v_j,            p_j
 
-残差按当前 `Factor_ImuCPIv1` 的顺序抽取：
+adapter 调用 upstream factor 时把 `bg_i/bg_j` 指向同一参数块、把
+`ba_i/ba_j` 指向同一参数块；返回 shared-bias Jacobian 时分别求和：
 
-    r_R =
-      2 vec(
-        q_i_to_j
-        ⊗ q_breve^-1
-        ⊗ q_bg_correction
-      )
+    J_shared_bg = J_bg_i + J_bg_j
+    J_shared_ba = J_ba_i + J_ba_j
 
-    r_v =
-      R_GtoI,i (
-        v_j - v_i + gravity_G Δt
-      )
-      - J_b δbg
-      - H_b δba
-      - beta
-
-    r_p =
-      R_GtoI,i (
-        p_j - p_i - v_i Δt
-        + 0.5 gravity_G Δt²
-      )
-      - J_a δbg
-      - H_a δba
-      - alpha
-
-whitening covariance 从原 CPI 15x15 `P_meas` 中按 residual index `[0..2, 6..8, 12..14]` 抽取完整 9x9 子矩阵，保留交叉项。不能简单拿三个 3x3 对角块。
+这样 bias random-walk 两组 residual 在 shared model 下严格为零，但完整 whitening
+和它们与 R/v/p 的 cross terms 保留。禁止抽取 9×9 子矩阵，因为 upstream
+实际 residual 顺序为 `[R, bg, v, ba, p]`，删行后并不等价于在原 15D likelihood
+中绑定参数。
 
 ### 10.2 FC terminal factor
 
-选择一个 tri-source consistency 最好的 keyframe作为 attitude anchor，不要求是窗口最后一帧。其绝对姿态 residual：
+FC 使用一个 dense correlated trajectory factor。绝对 boundary 位于被实际
+注入的 terminal camera timestamp；其姿态 residual：
 
     r_q_abs =
       Log(
-        R_GtoI,anchor
-        (R_FtoI R_GtoF,anchor)^T
+        R_GtoI,K
+        (R_FtoI R_GtoF,K)^T
       )
 
 窗口最后一帧提供 absolute p/v：
@@ -733,7 +727,9 @@ whitening covariance 从原 CPI 15x15 `P_meas` 中按 residual index `[0..2, 6..
     r_v_abs =
       v_K - v_IinG,K^FC
 
-attitude anchor 使用 `fc_terminal_covariance` 的 attitude 3x3 marginal；terminal p/v 使用同一配置的 p/v 6x6 marginal。因为两者可能不在同一 timestamp，不能伪造它们之间的跨时刻相关项。这样即使 terminal 正处在 Velcro flex 瞬态，global attitude gauge 仍可由窗口内健康 anchor 建立，再由 IMU/视觉传播到 terminal。
+terminal q/p/v 使用同一个 9×9 `P_terminal`。若输入只声明三个独立 sigma，
+off-diagonal 为零；不得臆造相关项。attitude time uncertainty 通过终端角速度
+加入其 3×3 block。
 
 ### 10.3 FC increment factor
 
@@ -753,14 +749,21 @@ attitude anchor 使用 `fc_terminal_covariance` 的 attitude 3x3 marginal；term
       (v_j - v_i)
       - (v_j^FC - v_i^FC)
 
-其 covariance 由连续时间 PSD 离散化：
+冻结 FC error state：
 
-    Q_inc(Δt) =
-      FcIncrementNoiseModel::discretize(
-        fc_increment_noise_psd, Δt
-      )
+    e = [δθ, δp, δv]
+    Φ = I9
+    P0 = (1-f) P_terminal
+    Qd_i = f P_terminal Δt_i / T_window,  0 < f < 1
+    Cov(e_i,e_j) = P0 + Σ_{k<=min(i,j)} Qd_k
 
-在 Brownian increment 模型下，改变 keyframe 密度不会凭空增加同一物理时间段的信息。必须用同一合成轨迹的稀/密 keyframe 对照验证 estimate 和 covariance 基本不变。
+一次性构造所有 absolute errors 的 joint covariance `Σ_abs`，再用线性变换
+`A=[terminal absolute; chronological increments]` 得到 `Σ_r=AΣ_absAᵀ`，
+对整个 residual 一次 whitening。terminal 与相邻 increments 相关，不能拆成
+独立 Ceres residual blocks。在此 Brownian surrogate 下，改变 keyframe density
+不得改变同一线性物理 error path 的 likelihood。`Φ=I9` 是明确的第一版模型，
+不是对 FC 内部滤波器真实 dynamics 的宣称；必须由真实数据 density ablation
+和 Monte Carlo coverage 验证。
 
 ### 10.4 monocular epipolar factor
 
@@ -776,7 +779,7 @@ attitude anchor 使用 `fc_terminal_covariance` 的 attitude 3x3 marginal；term
       f_j^T [t_Ci_in_Cj]_x
       R_Ci_to_Cj f_i
 
-使用 normalized Sampson denominator，把 residual 转为近似 pixel sigma 可解释量。baseline 太小时该 pair 不建 translation factor，但仍可参与 DRT rotation-only factor。
+使用 normalized Sampson denominator，把 residual 转为近似 pixel sigma 可解释量。baseline 太小时该 pair 不建 epipolar translation factor；本 patch 的 rotation 信息由 FC attitude、完整 CPI 和其它有效视觉 pair 提供。只有未来通过独立 golden test 引入 DRT 后，纯旋转 pair 才可额外进入 DRT rotation-only seed。
 
 visual factor 直接连接 q_i,p_i,q_j,p_j 和固定 Camera–IMU calibration，不建立 landmark parameter block。
 
@@ -784,7 +787,6 @@ visual factor 直接连接 q_i,p_i,q_j,p_j 和固定 Camera–IMU calibration，
 
 只允许以下有物理来源的 prior：
 
-    δθ_mount ~ N(0, P_mount_nominal)
     bg ~ N(bg_seed, P_bg_prior)
     ba ~ N(ba_seed, P_ba_prior)
 
@@ -817,11 +819,12 @@ visual factor 直接连接 q_i,p_i,q_j,p_j 和固定 Camera–IMU calibration，
 
     WAIT_INPUTS
       -> COLLECTING_WINDOW
-      -> SOLVING_ROTATION
-      -> SOLVING_TRANSLATION
-      -> JOINT_REFINING
-      -> VALIDATING_WINDOW
-          -> COLLECTING_WINDOW       not ready, slide
+      -> JOINT_SOLVING_CANDIDATE
+      -> CANDIDATE_VALIDATING        immutable ~2 s holdout
+          -> COLLECTING_WINDOW       reject and slide
+          -> CANDIDATE_REFINING      holdout pass, one authorization
+      -> JOINT_SOLVING_REFINEMENT
+          -> COLLECTING_WINDOW       refinement failure
           -> NAVIGATION_READY        atomic release
           -> FULL_ALIGNMENT_READY    atomic release
       -> CLOSED_AFTER_RELEASE
@@ -830,367 +833,68 @@ visual factor 直接连接 q_i,p_i,q_j,p_j 和固定 Camera–IMU calibration，
 
     FATAL_CONFIGURATION_ERROR
 
-不再存在生产语义：
-
-    CANDIDATE_VALIDATING
-    CANDIDATE_REFINING
-    fixed candidate replay
-    upstream dynamic init FC gauge
-    shadow-only release
+不再存在生产语义：candidate sequential FC feedback、无限 refinement、
+upstream dynamic init FC gauge、shadow-only release。`CANDIDATE_VALIDATING`
+表示 immutable holdout，绝不表示旧 recursive candidate filter。
 
 ## 13. 逐文件实现合同
 
-新实现不能继续堆进当前 226 KB 的 `OnlineAlignmentInitializer.cpp`。正式代码拆成一个薄 supervisor、六个算法模块和五个 P4 专用 factor；旧 candidate/gauge 代码不作为新实现容器。
+本次 correctness patch 先把新 likelihood 拆到 `core/p4/factors/`，并把 formal
+lifecycle 作为显式 option 接入现有 supervisor；旧 candidate/gauge 路径仍仅供
+历史对照，不由 runner 正式配置选择。把 buffer/calibrator/solver/validator 再
+拆成薄 supervisor 是后续可维护性工作，不能在没有独立行为等价测试时做大规模
+搬运。
 
-### 13.1 `ov_msckf/src/core/p4/P4Types.h`
+### 13.1 本 patch 的实际边界
 
-从头实现，只定义数据，不放求解逻辑。
+本 patch 不虚构未落地的 `P4Types/P4WindowBuffer/P4JointRefiner` 文件。为降低一次性
+搬运造成的坐标和生命周期回归，buffer、插值、构窗、求解、covariance 和 release
+gate 暂时保留在已有 `OnlineAlignmentInitializer` 中；新的统计 likelihood 单独放进
+`core/p4/factors/`。正式 runner 只选择新的 `formal_causal_lifecycle` 分支，旧
+candidate/gauge/shadow 代码不在本次删除，以便现有对照测试继续编译，但不能作为
+正式入口。
 
-主要类型：
+本 patch 的真实改动文件和责任如下：
 
-    struct P4Options;
-    struct P4Keyframe;
-    struct P4ImuInterval;
-    struct P4VisualPair;
-    struct P4Window;
-    struct P4RotationSolution;
-    struct P4MetricSolution;
-    struct P4JointSolution;
-    struct P4GroupEvidence;
-    struct P4ReleaseDecision;
-
-`P4Keyframe`：
-
-    double t_camera;
-    double t_board;
-    double t_fc_attitude;
-    double t_fc_navigation;
-    FCNavigationSample fc_attitude;
-    FCNavigationSample fc_navigation;
-    StereoAlignmentFrame visual;
-    Eigen::Vector4d q_seed;
-    Eigen::Vector3d p_seed;
-    Eigen::Vector3d v_seed;
-
-`P4JointSolution`：
-
-    vector<P4State> states;       // q/p/v per keyframe
-    Vector3d bg;
-    Vector3d ba;
-    Vector3d mount_residual;
-    double attitude_time_offset;
-    MatrixXd tangent_covariance;
-    FactorDiagnostics diagnostics;
-
-所有 struct 的 frame、unit、quaternion convention 写在字段注释中。禁止用无 frame 后缀的 `position`、`rotation` 等歧义名称。
-
-### 13.2 `P4WindowBuffer.h/.cpp`
-
-从当前 `OnlineAlignmentInitializer.cpp` 移动并精简以下函数：
-
-| 新函数 | 当前来源 | 处理 |
+| 文件 | 责任 | 复用/实现规则 |
 | --- | --- | --- |
-| `interpolateImu()` | `interpolate_imu()`，当前约 107–142 行 | 保留有限值、状态和 saturation 检查；补充 exact bracket diagnostics |
-| `interpolateFc()` | `interpolate_fc()`，当前约 144–189 行 | 保留 p/v 线性和 quaternion SLERP；拆分 attitude/nav valid |
-| `computeFcRates()` | `make_fc_rates()`，当前约 197–217 行 | 保留 passive rotation 符号；增加 SO(3) smoothing 和 angular acceleration |
-| `extractImuInterval()` | `interval_imu_samples()`，当前约 267–279 行 | 保留精确边界插值；输出原始 sample index span |
-
-公开接口：
-
-    class P4WindowBuffer {
-    public:
-      bool feedFc(
-          const FCNavigationSample& sample,
-          P4RejectReason* reason);
-
-      bool feedImu(
-          const BoardImuSample& sample,
-          P4RejectReason* reason);
-
-      bool feedVisual(
-          const StereoAlignmentFrame& frame,
-          P4RejectReason* reason);
-
-      P4BuildWindowResult buildWindow(
-          double causal_camera_horizon,
-          const P4Options& options) const;
-
-      void pruneBefore(double camera_timestamp);
-      void reset();
-    };
-
-`buildWindow()` 输入是因果 camera horizon 和物理配置；输出包含 `status/window/diagnostics`，不修改 buffer。只有 supervisor 接受本次 solve 后才 prune，避免构窗失败破坏数据。
-
-### 13.3 `P4PreintegrationCache.h/.cpp`
-
-直接使用 `ov_core::CpiV1`，不复制另一套 preintegration。
-
-接口：
-
-    class P4PreintegrationCache {
-    public:
-      const P4Preintegration& getOrBuild(
-          const P4ImuInterval& interval,
-          const Vector3d& bg_linearization,
-          const Vector3d& ba_linearization,
-          const P4ImuNoise& noise);
-
-      void invalidateIntervalsBefore(double board_time);
-      void clear();
-    };
-
-`P4Preintegration` 保存：
-
-    DT
-    q_breve
-    alpha
-    beta
-    J_q, J_a, J_b, H_a, H_b
-    P_meas_15x15
-    bg_linearization
-    ba_linearization
-    raw_interval_identity
-
-cache key 至少含：
-
-    [start board timestamp,
-     end board timestamp,
-     first/last raw sample serial,
-     IMU noise model identity]
-
-普通推进窗口允许用 CPI bias Jacobian warm start。准备 release 时调用：
-
-    rebuildAtSolvedBiases(
-        current_window, solved_bg, solved_ba)
-
-强制真实重积分并重新 refine。
-
-### 13.4 `P4MotionCalibrator.h/.cpp`
-
-从头实现 FC–board rotation/time seed；不复用旧 candidate filter。
-
-接口：
-
-    class P4MotionCalibrator {
-    public:
-      P4RotationSolution solve(
-          const P4Window& window,
-          const P4PreintegrationCache& preintegrations,
-          const P4Calibration& calibration,
-          const P4Options& options) const;
-
-    private:
-      vector<P4RatePair> buildRatePairs(
-          const P4Window& window,
-          double attitude_time_offset) const;
-
-      P4WahbaSolution robustWahbaWithBias(
-          const vector<P4RatePair>& pairs,
-          const Matrix3d& rotation_prior) const;
-
-      P4TimeSearchResult searchAttitudeTimeOffset(
-          const P4Window& window,
-          const P4Calibration& calibration) const;
-
-      P4IntervalHealth classifyIntervalHealth(
-          const P4RotationEvidence& evidence) const;
-    };
-
-输入是当前完整窗口和外部 calibration；输出是本窗口 estimate，不修改永久 calibration。
-
-### 13.5 `ov_msckf/src/core/p4/thirdparty/drt/`
-
-只 vendor DRT rotation-only 子问题的必要代码，保持原许可证和 attribution：
-
-    DrtCayley.h
-    DrtSmallestEigenvalue.h
-    README.md
-
-精确来源：
-
-- `D:\vscode_dir\p4_init_refs_20260717\drt-vio-init\include\geometry.hpp::Quaternion2Cayley()`；
-- `D:\vscode_dir\p4_init_refs_20260717\drt-vio-init\include\initMethod\opengvMethod.hpp::GetSmallestEVwithJacobian()`；
-- 原仓库 commit `fb0ac8d3fc4d9f683888565882838b6f1c330435`；
-- GPLv3。
-
-vendor helper 保持数值实现不变；只做 namespace、include 和格式适配。OpenVINS 类型转换放在外层 wrapper，不改 helper。
-
-### 13.6 `P4VisualConstraintBuilder.h/.cpp`
-
-接口：
-
-    class P4VisualConstraintBuilder {
-    public:
-      vector<P4VisualPair> buildPairs(
-          const P4Window& window,
-          const P4CameraCalibration& camera,
-          const P4Options& options) const;
-
-      P4RotationOnlyConstraint buildDrtRotationConstraint(
-          const P4VisualPair& pair,
-          const P4Preintegration& preintegration,
-          const Matrix3d& R_ItoC) const;
-
-      P4TranslationDirection estimateTranslationDirection(
-          const P4VisualPair& pair,
-          const Matrix3d& relative_rotation,
-          const Vector3d& fc_translation_seed) const;
-
-      P4VisualHealth evaluateVisualHealth(
-          const P4VisualPair& pair) const;
-    };
-
-`buildPairs()`：
-
-- 按 feature ID 收集 common normalized bearing；
-- 检查 finite、image-space distribution、survival 和 rank；
-- 相邻 frame pair 用于 CPI/rotation；
-- 额外长 baseline pair只在提升 translation information 时加入；
-- 不三角化 landmark；
-- 不按固定 feature 数截断成同一批点，超过计算上限时按 image grid 和 track age 均衡选取。
-
-`estimateTranslationDirection()` 只生成 seed/diagnostic。最终图仍使用原始 correspondence 的 epipolar factor，不能把一个估计方向重复当成多次独立观测。
-
-### 13.7 `P4MetricInitializer.h/.cpp`
-
-从头实现阶段 D/E。
-
-接口：
-
-    class P4MetricInitializer {
-    public:
-      P4MetricSeed buildFcMetricSeed(
-          const P4Window& window,
-          const P4RotationSolution& rotation,
-          const P4Calibration& calibration) const;
-
-      P4MetricSolution solve(
-          const P4Window& window,
-          const P4MetricSeed& seed,
-          const vector<P4Preintegration>& preintegrations,
-          const vector<P4VisualPair>& visual_pairs,
-          const P4Options& options) const;
-    };
-
-`buildFcMetricSeed()` 是全部杆臂、重力和时间公式的唯一实现位置。其他模块不得各写一套 FC->board 转换。
-
-### 13.8 `P4JointRefiner.h/.cpp`
-
-从头实现正式 Ceres graph。
-
-接口：
-
-    class P4JointRefiner {
-    public:
-      P4JointSolution refine(
-          const P4Window& window,
-          const P4RotationSolution& rotation,
-          const P4MetricSolution& metric,
-          const vector<P4Preintegration>& preintegrations,
-          const vector<P4VisualPair>& visual_pairs,
-          const P4Calibration& calibration,
-          const P4Options& options) const;
-
-      P4JointSolution reintegrateAndRefineForRelease(
-          const P4Window& window,
-          const P4JointSolution& preliminary,
-          P4PreintegrationCache& cache,
-          const P4Calibration& calibration,
-          const P4Options& options) const;
-    };
-
-该文件只负责 parameter blocks、factor blocks、loss、solver 和结果读取；窗口构造、状态 gate、metadata 写出都不放在这里。
-
-### 13.9 `P4ReleaseValidator.h/.cpp`
-
-把当前 `evaluate_family()`、`evaluate_family_residuals()` 和 `schur_information()` 的通用思想移入，删除与 candidate/gauge/landmark history 绑定的分支。
-
-接口：
-
-    class P4ReleaseValidator {
-    public:
-      P4WindowEvidence evaluateWindow(
-          const P4Window& window,
-          const P4JointSolution& solution,
-          const P4FactorRegistry& factors,
-          const P4Options& options) const;
-
-      P4ReleaseDecision updateAcrossWindows(
-          const P4WindowEvidence& current,
-          P4ReadinessHistory& history,
-          const P4Options& options) const;
-
-      Matrix<double,15,15> recoverTerminalCovariance(
-          const P4JointSolution& solution,
-          const P4FactorRegistry& factors,
-          const P4CalibrationUncertainty& uncertainty) const;
-    };
-
-`updateAcrossWindows()` 的 history 以 timestamp 存储并按 `T_window` prune，绝不按 deque size 或 update count release。
-
-### 13.10 `P4Initializer.h/.cpp`
-
-这是新算法总控：
-
-    class P4Initializer {
-    public:
-      bool feedFc(const FCNavigationSample&);
-      bool feedImu(const BoardImuSample&);
-      bool feedVisual(const StereoAlignmentFrame&);
-
-      P4TryResult tryInitialize(
-          double causal_camera_horizon,
-          AlignmentResult& release);
-
-      void reset();
-    };
-
-`tryInitialize()` 唯一允许的调用顺序：
-
-    buildWindow()
-    motion_calibrator.solve()
-    visual_builder.buildPairs()
-    metric_initializer.buildFcMetricSeed()
-    metric_initializer.solve()
-    joint_refiner.refine()
-    release_validator.evaluateWindow()
-    release_validator.updateAcrossWindows()
-    if ready:
-      joint_refiner.reintegrateAndRefineForRelease()
-      release_validator.recoverTerminalCovariance()
-      fill AlignmentResult
-      close
-
-任何阶段失败都返回结构化 reason，并保留后续窗口重试能力。
-
-### 13.11 `OnlineAlignmentInitializer.h/.cpp`
-
-保留类名以减少 `VioManager` API 扰动，但改为薄 facade：
-
-    OnlineAlignmentInitializer::feed_fc_navigation()
-      -> P4Initializer::feedFc()
-
-    OnlineAlignmentInitializer::feed_board_imu()
-      -> P4Initializer::feedImu()
-
-    OnlineAlignmentInitializer::feed_stereo()
-      -> P4Initializer::feedVisual()
-
-    OnlineAlignmentInitializer::try_initialize()
-      -> P4Initializer::tryInitialize()
-
-删除生产成员：
-
-    OnlineAlignmentCandidateFilter
-    candidate_active_
-    candidate_visual_snapshots_
-    make_fc_gauge_target()
-    commit_shadow_gauge_release()
-    previous_window_states_ old mixed semantics
-    upstream_dynamic_init_fc_gauge flags
-    shadow/direct/deferred combinatorial flags
-
-旧实现如需保留用于对照，移到明确的 `legacy/` 或只存在于 git 历史；不能与正式路径靠布尔组合共存。
+| `OnlineAlignmentInitializer.h/.cpp` | 三流因果构窗、共享 bg/ba 图、immutable holdout、一次 refinement、15×15 terminal covariance | 复用现有插值、CPI、Schur/covariance 工具；替换旧 per-keyframe bias、landmark reprojection 和 overlap normalized release |
+| `core/p4/factors/Factor_P4ImuSharedBias.*` | 完整 15D CPI 的 shared-bias adapter | 直接调用 OpenVINS `Factor_ImuCPIv1`；两个端点绑定同一 bg/ba，Jacobian 列求和 |
+| `core/p4/factors/Factor_P4FcTrajectory.*` | terminal absolute + chronological increments 的单个稠密相关 FC PVA likelihood | 从头实现冻结的 Φ/Qd/Σ/A 和 whitening；不拆成独立 residual blocks |
+| `core/p4/factors/Factor_P4Epipolar.*` | 固定 camera–IMU 外参的 landmark-free normalized Sampson residual | 从头实现；每 feature 只建一个最大时距 pair |
+| `VioManager.cpp` | 正式 P4 fail-closed 接线、原子注入；P5 termination 输入接线 | upstream initializer 只保留给显式 legacy gauge 实验 |
+| `BackendUpdateTrigger.h` | 从真实 track survival/border 状态计算 P5 termination risk | 不依赖固定帧号或未来轨迹 |
+| `run_serial_msckf_ros_free.cpp` | 唯一正式配置和可审计 metadata | `formal=true`、`upstream gauge=false`、P3 mount/time fixed |
+| `cmake/ROS1.cmake`, `cmake/ROS2.cmake` | 新 factors 和测试编译入口 | 两套构建都必须包含同一 sources/tests |
+| `test_p4_formal_factors.cpp` | shared CPI、FC covariance/density、epipolar geometry/Jacobian killer tests | C++ 原生依赖齐全时运行 |
+| `scripts/validate_p4_formal_contract.py` | 无 ROS/Ceres 主机上的独立数学与 source topology 检查 | 不能替代 C++ build、Monte Carlo 或 flight validation |
+
+### 13.2 当前调用顺序
+
+    feed_fc_navigation / feed_board_imu / feed_stereo
+      -> try_initialize(causal camera horizon)
+      -> build one finite common-support window
+      -> q/p/v per keyframe + one shared bg/ba
+      -> dense FC factor + complete shared-bias CPI + sparse epipolar pairs
+      -> solve and recover terminal marginal
+      -> freeze candidate
+      -> later ~2 s IMU-only propagation, FC/visual holdout evaluation
+      -> if fail: discard candidate and slide
+      -> if pass: authorize exactly one newly advanced joint solve
+      -> atomic camera-clock q/p/v/bg/ba + 15x15 covariance release
+      -> close P4 permanently
+
+### 13.3 明确延后而非伪装完成的重构
+
+只有原生 tests、Monte Carlo consistency 和 fly1–fly4 验收通过后，才允许把现有
+supervisor 机械拆分成 `P4WindowBuffer`、`P4JointRefiner`、
+`P4ReleaseValidator` 等薄模块。该重构必须保持 residual、parameter ordering、
+timestamp 和 state-machine traces 的 golden equivalence；它不是本次算法正确性的
+前置条件，也不得写成本 patch 已创建的文件。
+
+DRT vendor 同样不在本 patch 范围。若未来引入，只限 rotation/bg seed，必须先有
+许可证、固定 commit 和 residual/Jacobian golden fixture；不得用它替换 OpenVINS
+CPI，或声称它证明 shared ba、FC PVA 与完整 joint graph。
 
 ## 14. P4 专用 factor 文件
 
@@ -1214,38 +918,25 @@ vendor helper 保持数值实现不变；只做 namespace、include 和格式适
 
 修改：
 
-- residual 从 15 维变 9 维；
 - 参数从前后两个 bg/ba 变为一个 shared bg 和一个 shared ba；
-- 删除 bias random-walk residual；
-- whitening 使用 9x9 完整 covariance 子矩阵；
-- 参数顺序改成报告 10.1 节，并为每个 block 写 static assertion/test。
+- upstream factor 的前后 bias pointer 绑定到同一 shared block；
+- shared Jacobian 分别为两个 endpoint Jacobian 之和；
+- residual、完整 15×15 whitening 和 covariance cross terms 原样保留；
+- 参数顺序按报告 10.1 节，并为每个 block 写 equivalence test。
 
-### 14.2 `Factor_P4FcTerminal.h/.cpp`
+### 14.2 `Factor_P4FcTrajectory.h/.cpp`
 
-从头实现。输入：
+从头实现 dense correlated trajectory likelihood。输入：
 
-    FC synchronized PVA
-    lever arm
-    q/p/v state blocks
-    mount residual block
-    terminal covariance
+    all synchronized FC PVA targets and timestamps
+    all q/p/v state blocks
+    terminal 9x9 covariance
+    process_variance_fraction f
 
-输出 3D attitude 或 6D p/v whitened residual。attitude anchor 和 terminal p/v 分成两个 residual block，避免它们必须来自同一个 timestamp。
+输出维数 `9K`，顺序为 terminal absolute 后接 chronological increments；
+使用完整 `AΣ_absAᵀ` 一次 whitening，不把共享 endpoint 的 residual 当独立。
 
-### 14.3 `Factor_P4FcIncrement.h/.cpp`
-
-从当前 `OnlineAlignmentInitializer.cpp` 的 FC terminal/increment functor 只复用已经通过坐标测试的杆臂和 relative rotation表达；噪声离散化和 factor API 从头实现。
-
-输入：
-
-    synchronized FC endpoint PVA
-    state_i/state_j
-    shared mount residual
-    Q_inc(dt)
-
-输出 9D whitened q/p/v increment residual。
-
-### 14.4 `Factor_P4DrtRotationOnly.h/.cpp`
+### 14.3 DRT rotation-only reference（不进入本次 production patch）
 
 外层 wrapper 直接适配：
 
@@ -1261,9 +952,13 @@ vendor helper 保持数值实现不变；只做 namespace、include 和格式适
 - DRT 固定 observation count warning；
 - DRT 200 次迭代配置。
 
-新 wrapper 使用 OpenVINS `CpiV1` 的 `q_breve/J_q` 和锁定 `R_ItoC`。robust scale 由 normalized bearing noise/MAD 产生。
+DRT 官方代码在 `gyroBiasEstimator()` 中只优化 `biasg`；后续 translation/gravity
+阶段沿用构造函数置零的 `biasa`。因此 DRT 只能作为 rotation/bg seed 的研究
+依据，不能证明本项目 shared-ba/FC joint graph。第一版 production patch 不
+vendor DRT 代码，以免把未完成的 license/golden equivalence 冒充正式依赖；
+若后续引入，必须先满足上述 golden test。
 
-### 14.5 `Factor_P4Epipolar.h/.cpp`
+### 14.4 `Factor_P4Epipolar.h/.cpp`
 
 从头实现 normalized Sampson residual。参数：
 
@@ -1286,13 +981,14 @@ vendor helper 保持数值实现不变；只做 namespace、include 和格式适
 
 | 来源 | commit | 许可证 | 使用方式 | 不使用部分 |
 | --- | --- | --- | --- | --- |
-| 当前 OpenVINS 分支 | `fdd8d745...` | GPLv3/MIT mixed by file | 直接复用 CpiV1、JPL manifold、state injection；移动 interpolation/helpers | 旧 candidate/gauge production path |
-| DRT-VIO | `fb0ac8d...` | GPLv3 | vendor Cayley/smallest-EV helper；适配 rotation-only bias factor | tracker、preintegrator、gravity/scale完整 pipeline、硬编码门限 |
+| 当前 OpenVINS 基线 | `a96540c...`（上游接口审计 `6948812...`） | GPLv3/MIT mixed by file | 直接复用完整 CpiV1 likelihood、JPL manifold、atomic state injection | upstream initializer + gauge 正式路径 |
+| DRT-VIO | `fb0ac8d...` | GPLv3 | 只作 rotation/bg 研究依据，本 patch 不复制代码 | translation/ba、tracker、preintegrator、硬编码门限 |
+| VINS-Mono | `90dabb5...` | GPLv3 | 只作 staged SFM→VI alignment 对照 | 不复制 solver |
 | ORB-SLAM3 | `4452a3c...` | GPLv3 | 只采用“fixed/seed pose + per-KF velocity + shared bg/ba”的架构依据 | 不复制 g2o 实现 |
-| IC-GVINS | `644eed9...` | GPLv3 | 只采用“外部导航先建立 metric/global INS，再加视觉”的架构依据 | 不复制零速、双天线 yaw、轮式假设 |
-| mix-cal | `eda6c67...` | BSD-3-Clause | 只参考刚体 angular-rate/specific-force关系和退化分析 | 不把 FC navigation 当第二套同步 raw IMU |
+| GVINS | `d2cf40b...` | GPLv3 | 只作 VIO init 后 GNSS alignment 的反例对照 | 不复制 GNSS solver |
+| MINS | `d0e0ea2...` | GPLv3 | 只参考多传感器 calibration/state ownership | 不复制 updater |
 
-DRT vendor 目录必须保留：
+若未来加入 DRT vendor 目录，必须保留：
 
     original repository URL
     original commit
@@ -1353,138 +1049,93 @@ DRT vendor 目录必须保留：
 
 ### 16.3 `run_serial_msckf_ros_free.cpp`
 
-删除正式配置：
+正式配置必须显式覆盖旧默认：
 
-    upstream_dynamic_init_fc_gauge = true
-    candidate_window_durations_s
-    candidate_filter gates
-    shadow/direct/deferred release switches
-    diagnostic mixed-source release switches
+    formal_causal_lifecycle = true
+    upstream_dynamic_init_fc_gauge = false
+    sliding_window_shadow_only = false
+    sliding_window_direct_state_release = false
+    sliding_window_deferred_release_certification = false
+    max_initial_clones = 0
+    max_initial_slam_features = 0
+    candidate_window_durations_s = {8.0}
+    candidate_short_validation_duration_s = 2.0
+    candidate_refinement_enabled = true
 
-新增显式配置：
+本 patch 新增显式 FC model 配置：
 
-    p4_window_duration_s
-    p4_window_advance_s
-    p4_tracking_stride
-    fc_terminal_covariance
-    fc_increment_noise_psd
-    mount_prior_covariance
-    lever_arm_covariance
-    attitude_time_offset_prior/sigma
-    solver runtime budget
+    --online-alignment-fc-process-fraction f, 0 < f < 1
 
-metadata schema 升级，必须写出当前算法 ID，例如：
+其余 window、tracking、terminal sigma、mount/time declaration 和 solver budget
+暂沿用已有已审计字段，不能在本 patch 中改名后丢失历史对照。metadata schema
+升级并写出固定算法 ID：
 
-    openvins_p4_fc_metric_drt_shared_bias_v1
+    openvins_p4_fc_pva_shared_bias_epipolar_v1
 
-不能继续沿用旧 v6/v8/v9 candidate metadata 并把字段置零冒充新算法。
+legacy candidate/gauge 字段可以为兼容保留，但 formal-specific FC covariance、
+visual pair policy、holdout counts、one-refinement receipt 和 normalized information
+字段必须同时存在；不得靠把旧字段置零冒充新算法。
 
 ### 16.4 CMake
 
 当前 `ov_msckf/cmake/ROS1.cmake` 和 `ROS2.cmake` 显式列 `LIBRARY_SOURCES`。两处同时加入全部 `src/core/p4/*.cpp` 和 factors；不能只依赖 header glob。
 
-新增 test targets：
+本 patch 新增并实际接入的正式 test target：
 
-    test_p4_coordinates
-    test_p4_drt_rotation
-    test_p4_shared_bias_imu_factor
-    test_p4_fc_factors
-    test_p4_visual_factors
-    test_p4_window_lifecycle
+    test_p4_formal_factors
     test_online_alignment_initializer
+    test_adaptive_stride
 
-旧 `test_online_alignment_candidate_filter` 不再作为正式 P4 验收；如果保留，只证明 legacy 代码，不得列入完成证据。
+`test_p4_formal_factors` 聚合 shared CPI、FC covariance/density、epipolar geometry
+和各参数 Jacobian killer tests。旧 `test_online_alignment_candidate_filter` 保留时
+只证明 legacy 代码，不得列入正式 P4 完成证据。
 
 ## 17. 单元与合成验证
 
-### 17.1 坐标和时间
+### 17.1 本 patch 已落地的 dependency-light 检查
 
-`test_p4_coordinates.cpp` 必须覆盖：
+`scripts/validate_p4_formal_contract.py` 在没有 ROS/Ceres 的主机上检查：FC dense
+covariance SPD、terminal exact、terminal/increment correlation、coarse/fine density
+invariance，以及 runner/factor/lifecycle/P5/handoff 的 source topology。它只是一道
+独立可执行检查，不能替代 native C++ 或 flight validation。
 
-1. identity mount/extrinsic/lever arm；
-2. 非交换 roll-pitch-yaw mount composition；
-3. passive JPL left perturbation正负号；
-4. camera center from `p_IinC`；
-5. lever-arm position、velocity、angular-acceleration、centripetal项；
-6. `dt_CI/dt_att/dt_nav` 正负号；
-7. gravity 与 accelerometer bias seed符号。
+### 17.2 本 patch 已落地的原生 factor killer tests
 
-这些测试失败时禁止跑真实飞行实验。
+`test_p4_formal_factors.cpp` 覆盖：
 
-### 17.2 DRT golden test
+- shared CPI adapter 与原 15D factor 在 tied endpoints 下 residual 完全一致；
+- shared bg/ba Jacobian 等于两个 endpoint columns 之和；
+- FC covariance SPD、terminal exact、cross-correlation 和 density invariance；
+- FC q/p/v Jacobian 对独立 JPL finite difference；
+- known two-view geometry 的 epipolar residual；
+- off-epipolar detection；
+- epipolar q/p Jacobian 对独立 JPL finite difference；
+- quaternion ambient scalar trick 与 `State_JPLQuatLocal` 一致。
 
-`test_p4_drt_rotation.cpp`：
+### 17.3 生命周期与 P5 tests
 
-- 用固定 random seed 生成 bearing pairs；
-- 使用导入时由 clone 原始 DRT helper 生成并提交的 golden residual/Jacobian fixture；
-- 调 vendor helper；
-- residual 绝对差不超过数值双精度容差；
-- Jacobian 用 finite difference 复核；
-- 加已知 bg 后必须沿正确方向收敛。
+`test_online_alignment_initializer.cpp` 增加 formal candidate -> later holdout -> one
+advanced refinement -> current camera-clock atomic release；release 后不得再次求解。
 
-### 17.3 shared-bias CPI
+`test_adaptive_stride.cpp` 增加 healthy tracks、track loss 和 border concentration
+三类 feature-termination 输入检查。
 
-`test_p4_shared_bias_imu_factor.cpp`：
+### 17.4 仍属于正式验收而非本容器已通过的 synthetic/Monte Carlo
 
-- 与原 15D `Factor_ImuCPIv1` 在 `bg_i=bg_j, ba_i=ba_j` 时的 `R/v/p` residual完全一致；
-- 9x9 covariance index提取正确；
-- q/p/v/bg/ba 每个 Jacobian finite difference；
-- 零运动、恒速、恒角速、恒加速度；
-- covariance 有交叉项时 whitening正确。
-
-### 17.4 FC factor
-
-`test_p4_fc_factors.cpp`：
-
-- perfect synchronized PVA residual 为零；
-- mount perturbation correction方向正确；
-- time offset正负方向正确；
-- 杆臂在左右相反转弯下符号相反但均能恢复；
-- terminal attitude anchor不在末帧时，IMU能正确传播到 terminal；
-- keyframe density改变时，increment information不被重复放大。
-
-### 17.5 visual factor
-
-`test_p4_visual_factors.cpp`：
-
-- 已知相对 pose 投影产生零 epipolar residual；
-- 纯旋转 pair 只进入 DRT rotation，不进入 translation factor；
-- 正/负 translation direction满足 epipolar sign ambiguity；
-- 错误 q 和错误 translation direction均产生可检测 residual；
-- 非零 `p_IinC`；
-- q/p Jacobian finite difference；
-- feature 全集中在一条线时 rank gate拒绝。
-
-### 17.6 端到端 synthetic
-
-至少生成：
-
-    straight + acceleration
-    left turn
-    right turn
-    climb/descent
-    mixed-axis maneuver
-    temporary FC-board flex
-    FC attitude latency
-    visual outlier burst
-    IMU bias
-
-每组知道真实 q/p/v/bg/ba/mount/time。验收使用 normalized error：
+目标环境仍须覆盖 straight acceleration、left/right turn、climb/descent、mixed-axis
+maneuver、temporary flex、FC latency、visual outlier burst 和 IMU bias。每组使用真实
+`q/p/v/bg/ba` 和
 
     error^T covariance^-1 error
 
-而不是只看绝对误差。还必须验证：
+做 NEES/coverage，而不只看绝对误差。必须验证坐标/时间/杆臂符号、window 前移、
+duplicate data、finite symmetric PSD covariance、左右转一致性和安全失败不 release。
 
-- q/p/v/bg/ba correction方向；
-- 反馈/warm-start 后残差下降；
-- flex 只降低相关 FC attitude interval权重，不写回永久 mount；
-- 左右转得到一致的 nominal mount，不出现固定方向补偿；
-- duplicate FC/IMU 不重复建 factor；
-- window 前移后旧数据退出、新数据进入；
-- sample count变化不改变 release语义；
-- 未支持 ba 标为 prior-retained；
-- covariance finite/symmetric/PSD；
-- clipping、time boundary 或安全失败时不 release。
+### 17.5 DRT golden test（只在未来 vendor DRT 时）
+
+本 patch 没有 DRT dependency，因此当前正式 build 不要求 DRT golden。未来若
+vendor，必须用固定 commit 原 helper 生成 residual/Jacobian fixture，并做 finite
+difference 与已知 bg 收敛方向检查；完成前不得进入 production。
 
 ## 18. 集成验证顺序
 
@@ -1494,13 +1145,9 @@ metadata schema 升级，必须写出当前算法 ID，例如：
 
     cmake --build build_p4_sliding_r1 \
       --target \
-        test_p4_coordinates \
-        test_p4_drt_rotation \
-        test_p4_shared_bias_imu_factor \
-        test_p4_fc_factors \
-        test_p4_visual_factors \
-        test_p4_window_lifecycle \
+        test_p4_formal_factors \
         test_online_alignment_initializer \
+        test_adaptive_stride \
         run_serial_msckf_ros_free \
       -j12
 
@@ -1539,8 +1186,8 @@ fly1/fly3 调通后，固定全部配置，在 fly2/fly4 上直接运行。目�
 口径：
 
 - GPS update time 采样；
-- start-heading alignment 为主；
-- absolute navigation/no post alignment同时报告；
+- absolute navigation/no post alignment 为主；
+- start-heading alignment 只作漂移诊断；
 - best-fit 只做诊断；
 - reference velocity用 FC raw Ve/Vn/Vu；
 - 不用旧 corrected fly2 或错误 truth目录。
@@ -1559,7 +1206,7 @@ fly1/fly3 调通后，固定全部配置，在 fly2/fly4 上直接运行。目�
 ### 19.1 算法正确性
 
 - 所有 coordinate/factor Jacobian测试通过；
-- DRT golden equivalence通过；
+- 若未来 vendor DRT，其 golden equivalence先通过；当前 patch不依赖 DRT；
 - synthetic 各状态估计与 covariance统计一致；
 - 改变 keyframe density不系统改变解或 covariance；
 - 左右转不会产生相反方向的永久 mount补偿；
@@ -1570,7 +1217,7 @@ fly1/fly3 调通后，固定全部配置，在 fly2/fly4 上直接运行。目�
 - 每个 advanced window 都有新的 solve receipt；
 - receipt 的 sample count由时间窗自然变化；
 - 不存在固定 10 次、固定 update count release；
-- readiness history以 timestamp prune；
+- candidate holdout以 sensor timestamp计时，不按固定 update count；
 - release后只成功一次；
 - release后 P4 不继续改 OpenVINS state。
 
@@ -1581,7 +1228,7 @@ fly1/fly3 调通后，固定全部配置，在 fly2/fly4 上直接运行。目�
 同时：
 
 - buffer size受 `T_window+margin` 限制；
-- preintegration cache hit rate和重建原因可见；
+- 每个 CPI interval的精确边界支持和失败原因可见；
 - 单窗 factor/parameter count有上限；
 - 总处理时间随飞行长度线性增长，不随历史长度平方增长。
 
@@ -1615,11 +1262,11 @@ fly1–fly4 都必须：
     terminal q/p/v
     terminal state std
     family RMS/P95/max
-    data information eigenvalues
-    cross-window normalized deltas
-    ready_since for each group
+    physical-unit and dimensionless-normalized data information eigenvalues
+    formal holdout FC/IMU/visual counts and duration
+    formal holdout pass/fail and single-refinement receipt
     stage wall times
-    cache hit/miss
+    exact CPI interval support/failure reason
     release decision/reason
 
 `online_alignment_metadata.json` 保存最终：
@@ -1637,49 +1284,52 @@ fly1–fly4 都必须：
 
 ## 21. 实现顺序与每步出口
 
-### P0：冻结基准和合同
+### I0：冻结基准和合同
 
-- 保存当前正确 frozen global baseline 路径、命令、配置和指标；
-- 不重跑已有冻结基准；
-- 本报告评审通过后才进入代码。
+- 固定 branch/tag/commit，记录基线真实入口和调用链。
 
-出口：基准 identity和本规格无歧义。
+状态：完成。出口：`a96540c...` identity 与基线缺陷表。
 
-### P1：坐标、DRT 和 factor
+### I1：坐标、上游等价性和 factor
 
-- 先写 `test_p4_coordinates`；
-- vendor DRT helper并做 golden test；
-- 实现 shared-bias CPI、FC、epipolar factor；
-- 全部 finite-difference Jacobian通过。
+- 固定 OpenVINS、VINS-Mono、ORB-SLAM3、GVINS、MINS、DRT commit；
+- 对 OpenVINS CPI 做 shared-parameter equivalence；
+- 冻结 FC dense covariance 与 epipolar pair policy；
+- DRT 只保留代码级研究结论。
 
-出口：不接 VioManager也能证明数学方向。
+状态：源码与 tests 已实现；等待原生 C++ 执行。出口：
+`test_p4_formal_factors` 全绿。
 
-### P2：单窗 solver
+### I2：单窗 solver
 
-- 实现 window、cache、motion、metric、joint、covariance；
-- synthetic 端到端通过；
-- 左右转、flex、latency、density invariance通过。
+- 在现有 supervisor 中实现每帧 q/p/v + shared bg/ba；
+- 安装 dense FC、完整 CPI、one-pair-per-track epipolar；
+- 回收 terminal 15×15 covariance 和 dimensionless information gates。
 
-出口：单窗给出正确 q/p/v/bg/ba 和 covariance。
+状态：代码完成，dependency-light density/source checks 通过；等待 native build、
+Monte Carlo。出口：单窗真值误差与 covariance coverage 通过。
 
-### P3：真正滑窗
+### I3：因果 lifecycle
 
-- 实现 timestamp-based advance、warm start、overlap comparison和一整窗 readiness duration；
-- 删除 candidate short-circuit；
-- 验证每个新窗口都重估。
+- timestamp-based finite candidate、约 2 s immutable holdout；
+- holdout 通过只授权一次 advanced joint refinement；
+- 禁止缺少 cross-covariance 的 overlap normalized gate；
+- current camera-clock atomic release 后永久关闭。
 
-出口：生命周期与审计要求一致。
+状态：代码和测试场景已加入；等待 native test。出口：state-machine receipt与
+timestamp assertions全绿。
 
-### P4：OpenVINS 接入
+### I4：OpenVINS 接入
 
-- `OnlineAlignmentInitializer` 变薄 facade；
-- `VioManager` 删除 upstream gauge生产分支；
-- terminal-only atomic injection；
-- runner/CMake/metadata升级。
+- runner正式选择 formal path并显式关闭 upstream gauge；
+- `VioManager` formal fail-closed；terminal-only atomic injection；
+- ROS1/ROS2 CMake、algorithm ID、formal metadata；
+- P5 real feature-termination input。
 
-出口：最新源码 build/test 全通过，旧二进制不作为证据。
+状态：代码完成；旧实现留作 legacy 编译对照但不由正式 runner选择。出口：GitHub
+ROS-free/ROS1/ROS2 build全绿，旧二进制不作为证据。
 
-### P5：飞行验证
+### I5：飞行验证
 
 - fly1/fly3 半圈到一圈；
 - fly2/fly4 holdout；
@@ -1696,19 +1346,20 @@ fly1–fly4 都必须：
 - [ ] `R_GtoI = R_FtoI R_GtoF` 的非交换旋转测试通过。
 - [ ] `t_F = t_C + dt_CI - dt_FI` 的符号测试通过。
 - [ ] FC nav 和 FC attitude 使用两个独立 time mapping。
-- [ ] 杆臂 velocity、angular acceleration和centripetal项都实现。
+- [ ] 杆臂 position/velocity 项已实现；当前未使用 FC 二阶差分 ba seed，metadata未冒充 angular-acceleration/centripetal seed 已实现。
 - [ ] gravity/accelerometer符号与 Propagator一致。
 - [ ] q/p/v 是每 keyframe，bg/ba 是 shared。
 - [ ] FC metric PVA 在初始化图内，不是事后 gauge。
-- [ ] 视觉使用 DRT rotation-only seed和无 landmark epipolar final factor。
-- [ ] DRT vendor 与原 clone golden一致。
+- [ ] 视觉 final factor 无 landmark，且每 feature 只选一对 pixel observations。
+- [ ] production patch 未把 DRT translation/ba 能力写成已证明；若未来 vendor，原 clone golden一致。
 - [ ] FC terminal absolute只出现一次，increments按物理时间 whitening。
 - [ ] 改变 keyframe density不重复乘 FC信息。
 - [ ] 高角速度不是自动视觉拒绝条件。
 - [ ] flex interval不写回永久 mount。
-- [ ] 当前窗推进后完整重估，没有 fixed candidate replay。
-- [ ] readiness按 `T_window` 传感器时间，不按次数。
-- [ ] covariance包含 mount/time/lever-arm uncertainty影响。
+- [ ] frozen candidate 的随后约 2 s holdout 不做 FC feedback。
+- [ ] holdout 通过后只进行一次 advanced full joint refinement。
+- [ ] overlapping windows 未在缺少 cross-covariance 时使用 `Pcur+Pprev` normalized gate。
+- [ ] covariance包含已声明的 mount/attitude-time uncertainty；navigation-time/lever-arm缺少声明时明确 treated fixed。
 - [ ] ba prior-retained时 covariance和status真实。
 - [ ] OpenVINS只注入 terminal q/p/v/bg/ba和15x15 covariance。
 - [ ] P4 期间 P5未生效。
