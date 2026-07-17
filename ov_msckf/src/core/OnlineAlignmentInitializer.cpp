@@ -1208,8 +1208,15 @@ bool OnlineAlignmentInitializer::feed_stereo(const StereoAlignmentFrame &frame) 
           options_.visual_perturbation_px * std::sin(phase),
           options_.visual_perturbation_px * std::cos(1.7 * phase));
       observation.raw_left += perturbation;
-      if (observation.right_valid)
+      observation.normalized_left += Eigen::Vector2d(
+          perturbation.x() / options_.camera_intrinsics[0](0),
+          perturbation.y() / options_.camera_intrinsics[0](1));
+      if (observation.right_valid) {
         observation.raw_right += perturbation;
+        observation.normalized_right += Eigen::Vector2d(
+            perturbation.x() / options_.camera_intrinsics[1](0),
+            perturbation.y() / options_.camera_intrinsics[1](1));
+      }
     }
   }
   const VisualFrameSnapshot snapshot = make_visual_snapshot(buffered);
