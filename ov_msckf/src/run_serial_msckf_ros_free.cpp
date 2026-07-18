@@ -804,7 +804,7 @@ void write_online_alignment_metadata(const std::string &path,
          << "  \"schema\": \"openvins_online_multisensor_alignment_v15\",\n"
          << "  \"mode\": \"online_multisensor_alignment\",\n"
          << "  \"algorithm_id\": "
-         << "\"openvins_p4_fc_pva_shared_bias_epipolar_v1\",\n"
+         << "\"openvins_p4_fc_yaw_pv_per_keyframe_bias_reprojection_v4\",\n"
          << "  \"status\": \"" << alignment_readiness_name(result.readiness)
          << "\",\n"
          << "  \"readiness_level\": \""
@@ -1104,6 +1104,8 @@ void write_online_alignment_metadata(const std::string &path,
          << json_scalar(d.fc_attitude_gauge_sigma_deg) << ",\n"
          << "  \"fc_terminal_attitude_residual_deg\": "
          << json_scalar(d.fc_terminal_attitude_residual_deg) << ",\n"
+         << "  \"fc_window_attitude_max_residual_deg\": "
+         << json_scalar(d.fc_window_attitude_max_residual_deg) << ",\n"
          << "  \"fc_terminal_position_residual_m\": "
          << json_scalar(d.fc_terminal_position_residual_m) << ",\n"
          << "  \"fc_terminal_velocity_residual_mps\": "
@@ -1216,6 +1218,8 @@ void write_online_alignment_metadata(const std::string &path,
   output << ",\n  \"mount_residual_deg\": " << d.mount_residual_deg
          << ",\n  \"rate_residual_rms_rad_s\": "
          << d.rate_residual_rms_rad_s
+         << ",\n  \"rate_residual_max_rad_s\": "
+         << json_scalar(d.rate_residual_max_rad_s)
          << ",\n  \"visual_imu_rotation_residual_deg\": "
          << json_scalar(d.visual_imu_rotation_residual_deg) << ",\n"
          << "  \"state\": {\"q_Gnav_to_I_xyzw\": ";
@@ -3334,12 +3338,14 @@ int main(int argc, char **argv) {
         PRINT_INFO(CYAN "[ONLINE-ALIGN][DEBUG] FC row contracts validated\n" RESET);
 
         OnlineAlignmentOptions online_options;
-        // Formal P4 starts uninitialized and solves q/p/v at every selected
-        // keyframe with one window-shared bg/ba pair.  FC PVA, complete 15-D
-        // CPI factors, and landmark-free monocular epipolar factors enter the
-        // same finite graph.  A frozen candidate then receives a short causal
-        // holdout and at most one advanced joint refinement before atomic
-        // terminal-state injection.
+        // Formal P4 starts uninitialized and solves q/p/v/bg/ba at every
+        // selected keyframe. Standard 15-D CPI factors carry bias random walks
+        // between states; correlated FC PVA and explicit multi-view monocular
+        // explicit multi-view landmark reprojection factors enter the same
+        // finite graph. Each solution is
+        // frozen and propagated through a disjoint future sensor-time holdout.
+        // A failed candidate is replaced by a newly advanced joint window;
+        // only the exact state that passed its holdout can be injected.
         online_options.formal_causal_lifecycle = true;
         online_options.upstream_dynamic_init_fc_gauge = false;
         online_options.sliding_window_shadow_only = false;
@@ -3363,7 +3369,7 @@ int main(int argc, char **argv) {
         online_options.reference_window_duration_s = 8.0;
         online_options.candidate_window_durations_s = {8.0};
         online_options.candidate_short_validation_duration_s = 2.0;
-        online_options.candidate_refinement_enabled = true;
+        online_options.candidate_refinement_enabled = false;
         online_options.min_fc_samples = 20;
         online_options.min_imu_samples = 600;
         online_options.min_stereo_frames = 12;
@@ -3417,6 +3423,16 @@ int main(int argc, char **argv) {
         // inert even when a calibration record was accepted.
         online_options.fc_attitude_sigma_deg =
             std::max(0.05, online_options.fc_board_mount_sigma_deg);
+        // Holdout errors are handoff-accuracy checks, not solver-failure
+        // safety bounds. Velocity must remain within the declared one-sigma FC
+        // accuracy; position additionally permits the corresponding drift over
+        // the complete holdout. Attitude uses the declared FC+mount uncertainty.
+        online_options.candidate_max_relative_velocity_residual_mps =
+            online_options.fc_velocity_sigma_mps;
+        online_options.candidate_max_relative_position_residual_m =
+            online_options.fc_position_sigma_m +
+            online_options.candidate_short_validation_duration_s *
+                online_options.fc_velocity_sigma_mps;
         online_options.p_IinF = parse_declared_vector3(
             require_declaration("p_IinF_m"), "p_IinF_m");
         online_options.visual_factors_enabled =
@@ -3541,7 +3557,7 @@ int main(int argc, char **argv) {
         PRINT_INFO(CYAN "[ONLINE-ALIGN] frames G=%s F=%s I=%s; shared target-parallax visual scheduler, T_C_I locked, manual 7deg/4.089deg corrections absent\n" RESET,
                    navigation_frame.c_str(), fc_body_frame.c_str(),
                    board_imu_frame.c_str());
-        PRINT_INFO(CYAN "[ONLINE-ALIGN] formal P4 uses an 8s FC+IMU+epipolar joint graph with shared bg/ba, a 2s immutable causal holdout, one advanced refinement, and one atomic q/p/v/bg/ba+15x15 release; FC process fraction=%.3f\n" RESET,
+        PRINT_INFO(CYAN "[ONLINE-ALIGN] formal P4 solves an 8s FC+IMU+multi-view landmark reprojection graph with per-keyframe q/p/v/bg/ba and standard 15-D CPI random walks, propagates the accepted graph endpoint through a disjoint 2s IMU holdout without FC feedback, and atomically releases the verified endpoint only after q/p/v and visual agreement; failed candidates slide and re-solve; FC process fraction=%.3f\n" RESET,
                    online_options.fc_process_variance_fraction);
       } else {
       if (cam0.empty())
@@ -3892,14 +3908,114 @@ int main(int argc, char **argv) {
       PRINT_WARNING(YELLOW "[STATE-SAFETY] failed to open %s\n" RESET, args.state_safety_diag_path.c_str());
     } else {
       state_safety_out
-          << "time,frame_id,cov_dim,n_clones,n_slam,n_aruco,n_should_marg,n_invalid_landmark_id,"
+          << "time,state_time,frame_id,internal_initialized,public_initialized,"
+          << "cov_dim,n_clones,n_slam,n_aruco,n_should_marg,n_invalid_landmark_id,"
           << "cov_all_finite,cov_nan_count,cov_inf_count,cov_sym_fro,cov_sym_max_abs,"
           << "cov_min_diag,cov_max_diag,cov_trace,cov_neg_diag_count,cov_min_eig,"
+          << "visual_update_valid,visual_update_time,visual_dpx,visual_dpy,visual_dpz,"
+          << "visual_dvx,visual_dvy,visual_dvz,visual_datt_deg,"
           << "bgx,bgy,bgz,bax,bay,baz,vx,vy,vz,px,py,pz,qx,qy,qz,qw\n";
       state_safety_out.flush();
       PRINT_INFO(GREEN "[STATE-SAFETY] writing %s\n" RESET, args.state_safety_diag_path.c_str());
     }
   }
+  const auto write_state_safety = [&](double sample_time,
+                                      int sample_frame_id) {
+    if (!state_safety_out.is_open() || !sys->internal_vio_initialized())
+      return;
+    const auto state = sys->get_state();
+    if (state == nullptr || state->_imu == nullptr)
+      return;
+
+    const Eigen::MatrixXd P = StateHelper::get_full_covariance(state);
+    const int cov_dim = static_cast<int>(P.rows());
+    int cov_nan_count = 0;
+    int cov_inf_count = 0;
+    int cov_neg_diag_count = 0;
+    double cov_min_diag = std::numeric_limits<double>::quiet_NaN();
+    double cov_max_diag = std::numeric_limits<double>::quiet_NaN();
+    double cov_trace = std::numeric_limits<double>::quiet_NaN();
+    double cov_sym_fro = std::numeric_limits<double>::quiet_NaN();
+    double cov_sym_max_abs = std::numeric_limits<double>::quiet_NaN();
+    double cov_min_eig = std::numeric_limits<double>::quiet_NaN();
+    if (cov_dim > 0) {
+      cov_min_diag = std::numeric_limits<double>::infinity();
+      cov_max_diag = -std::numeric_limits<double>::infinity();
+      cov_trace = 0.0;
+      for (int row = 0; row < P.rows(); ++row) {
+        const double diagonal = P(row, row);
+        if (std::isfinite(diagonal)) {
+          cov_min_diag = std::min(cov_min_diag, diagonal);
+          cov_max_diag = std::max(cov_max_diag, diagonal);
+          cov_trace += diagonal;
+          if (diagonal < 0.0)
+            ++cov_neg_diag_count;
+        }
+        for (int column = 0; column < P.cols(); ++column) {
+          const double value = P(row, column);
+          if (std::isnan(value))
+            ++cov_nan_count;
+          else if (!std::isfinite(value))
+            ++cov_inf_count;
+        }
+      }
+      const Eigen::MatrixXd asymmetry = P - P.transpose();
+      cov_sym_fro = asymmetry.norm();
+      cov_sym_max_abs = asymmetry.cwiseAbs().maxCoeff();
+      if (args.state_safety_eig_every > 0 &&
+          (sample_frame_id % args.state_safety_eig_every) == 0 &&
+          P.allFinite()) {
+        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> solver(
+            0.5 * (P + P.transpose()), Eigen::EigenvaluesOnly);
+        if (solver.info() == Eigen::Success && solver.eigenvalues().rows() > 0)
+          cov_min_eig = solver.eigenvalues().minCoeff();
+      }
+    }
+
+    int n_aruco = 0;
+    int n_should_marg = 0;
+    int n_invalid_landmark_id = 0;
+    for (const auto &entry : state->_features_SLAM) {
+      const auto &landmark = entry.second;
+      if (static_cast<int>(entry.first) <=
+          4 * state->_options.max_aruco_features)
+        ++n_aruco;
+      if (landmark && landmark->should_marg)
+        ++n_should_marg;
+      if (!landmark || landmark->_featid != entry.first || landmark->id() < 0 ||
+          landmark->id() + landmark->size() > cov_dim)
+        ++n_invalid_landmark_id;
+    }
+
+    const auto &visual = sys->get_latest_visual_update_state_correction();
+    const Eigen::Vector3d bg = state->_imu->bias_g();
+    const Eigen::Vector3d ba = state->_imu->bias_a();
+    const Eigen::Vector3d velocity = state->_imu->vel();
+    const Eigen::Vector3d position = state->_imu->pos();
+    const Eigen::Quaterniond q_ItoG(state->_imu->Rot().transpose());
+    state_safety_out << std::fixed << std::setprecision(9)
+        << sample_time << "," << state->_timestamp << "," << sample_frame_id
+        << "," << (sys->internal_vio_initialized() ? 1 : 0)
+        << "," << (sys->initialized() ? 1 : 0) << "," << cov_dim << ","
+        << state->_clones_IMU.size() << "," << state->_features_SLAM.size()
+        << "," << n_aruco << "," << n_should_marg << ","
+        << n_invalid_landmark_id << "," << (P.allFinite() ? 1 : 0) << ","
+        << cov_nan_count << "," << cov_inf_count << "," << cov_sym_fro
+        << "," << cov_sym_max_abs << "," << cov_min_diag << ","
+        << cov_max_diag << "," << cov_trace << "," << cov_neg_diag_count
+        << "," << cov_min_eig << "," << (visual.valid ? 1 : 0) << ","
+        << visual.timestamp << "," << visual.position_G.x() << ","
+        << visual.position_G.y() << "," << visual.position_G.z() << ","
+        << visual.velocity_G.x() << "," << visual.velocity_G.y() << ","
+        << visual.velocity_G.z() << "," << visual.attitude_deg << ","
+        << std::scientific << std::setprecision(9) << bg.x() << "," << bg.y()
+        << "," << bg.z() << "," << ba.x() << "," << ba.y() << ","
+        << ba.z() << "," << velocity.x() << "," << velocity.y() << ","
+        << velocity.z() << "," << position.x() << "," << position.y() << ","
+        << position.z() << "," << q_ItoG.x() << "," << q_ItoG.y() << ","
+        << q_ItoG.z() << "," << q_ItoG.w() << std::defaultfloat << "\n";
+    state_safety_out.flush();
+  };
 
   std::ofstream pose_repair_out;
   if (args.pose_repair_sim_gps) {
@@ -4908,6 +5024,8 @@ int main(int argc, char **argv) {
         sys->feed_measurement_camera(msg);
       }
     }
+    if (do_cam_feed)
+      write_state_safety(t_cam, frame_idx + 1);
     if (online_alignment_mode && !sys->online_alignment_complete() &&
         provisional_navigation_out.is_open()) {
       ProvisionalNavigationOutput provisional;
@@ -5697,83 +5815,6 @@ int main(int argc, char **argv) {
           restart_pending = true;
           restart_reason = "state_health_fault";
         }
-      }
-      if (state_safety_out.is_open() && do_cam_feed) {
-        Eigen::MatrixXd P = StateHelper::get_full_covariance(state);
-        const int cov_dim = (int)P.rows();
-        int cov_nan_count = 0;
-        int cov_inf_count = 0;
-        int cov_neg_diag_count = 0;
-        double cov_min_diag = std::numeric_limits<double>::quiet_NaN();
-        double cov_max_diag = std::numeric_limits<double>::quiet_NaN();
-        double cov_trace = std::numeric_limits<double>::quiet_NaN();
-        double cov_sym_fro = std::numeric_limits<double>::quiet_NaN();
-        double cov_sym_max_abs = std::numeric_limits<double>::quiet_NaN();
-        double cov_min_eig = std::numeric_limits<double>::quiet_NaN();
-        if (cov_dim > 0) {
-          cov_min_diag = std::numeric_limits<double>::infinity();
-          cov_max_diag = -std::numeric_limits<double>::infinity();
-          cov_trace = 0.0;
-          for (int r = 0; r < P.rows(); r++) {
-            const double d = P(r, r);
-            if (std::isfinite(d)) {
-              cov_min_diag = std::min(cov_min_diag, d);
-              cov_max_diag = std::max(cov_max_diag, d);
-              cov_trace += d;
-              if (d < 0.0)
-                cov_neg_diag_count++;
-            } else if (std::isnan(d)) {
-              cov_nan_count++;
-            } else {
-              cov_inf_count++;
-            }
-            for (int c = 0; c < P.cols(); c++) {
-              const double v = P(r, c);
-              if (std::isnan(v)) cov_nan_count++;
-              else if (!std::isfinite(v)) cov_inf_count++;
-            }
-          }
-          Eigen::MatrixXd Psym = P - P.transpose();
-          cov_sym_fro = Psym.norm();
-          cov_sym_max_abs = Psym.cwiseAbs().maxCoeff();
-          if (args.state_safety_eig_every > 0 &&
-              ((frame_idx + 1) % args.state_safety_eig_every) == 0 &&
-              P.allFinite()) {
-            Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(
-                0.5 * (P + P.transpose()), Eigen::EigenvaluesOnly);
-            if (es.info() == Eigen::Success && es.eigenvalues().rows() > 0)
-              cov_min_eig = es.eigenvalues().minCoeff();
-          }
-        }
-        int n_aruco = 0;
-        int n_should_marg = 0;
-        int n_invalid_landmark_id = 0;
-        for (const auto &kv : state->_features_SLAM) {
-          const auto &lm = kv.second;
-          if ((int)kv.first <= 4 * state->_options.max_aruco_features)
-            n_aruco++;
-          if (lm && lm->should_marg)
-            n_should_marg++;
-          if (!lm || lm->_featid != kv.first || lm->id() < 0 ||
-              lm->id() + lm->size() > cov_dim)
-            n_invalid_landmark_id++;
-        }
-        state_safety_out << std::fixed << std::setprecision(9)
-            << t_cam << "," << (frame_idx + 1) << ","
-            << cov_dim << "," << state->_clones_IMU.size() << ","
-            << state->_features_SLAM.size() << "," << n_aruco << ","
-            << n_should_marg << "," << n_invalid_landmark_id << ","
-            << (P.allFinite() ? 1 : 0) << "," << cov_nan_count << "," << cov_inf_count << ","
-            << cov_sym_fro << "," << cov_sym_max_abs << ","
-            << cov_min_diag << "," << cov_max_diag << "," << cov_trace << ","
-            << cov_neg_diag_count << "," << cov_min_eig << ","
-            << std::scientific << std::setprecision(9)
-            << bg.x() << "," << bg.y() << "," << bg.z() << ","
-            << ba.x() << "," << ba.y() << "," << ba.z() << ","
-            << v_wi.x() << "," << v_wi.y() << "," << v_wi.z() << ","
-            << p_wi.x() << "," << p_wi.y() << "," << p_wi.z() << ","
-            << q.x() << "," << q.y() << "," << q.z() << "," << q.w()
-            << std::defaultfloat << "\n";
       }
       {
 

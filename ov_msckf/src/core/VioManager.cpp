@@ -3509,7 +3509,7 @@ bool VioManager::configure_online_alignment(
   if (configured.upstream_dynamic_init_fc_gauge) {
     PRINT_INFO(CYAN "[ONLINE-ALIGN] upstream OpenVINS dynamic initialization plus causal VIO/FC yaw-translation window enabled; metric scale is deferred to the independent AGL output postprocess; repeated joint Ceres disabled\n" RESET);
   } else if (configured.formal_causal_lifecycle) {
-    PRINT_INFO(CYAN "[ONLINE-ALIGN] formal finite FC+IMU+epipolar joint initialization enabled; shared window biases, immutable causal holdout, one refinement, and atomic terminal release\n" RESET);
+    PRINT_INFO(CYAN "[ONLINE-ALIGN] formal finite FC+IMU+epipolar joint initialization enabled; shared window biases, immutable causal holdout, verified IMU endpoint propagation, and atomic terminal release\n" RESET);
   } else {
     PRINT_INFO(CYAN "[ONLINE-ALIGN] experimental causal FC + board-IMU + visual supervisor enabled; ordinary initializer fallback disabled\n" RESET);
   }
@@ -4264,10 +4264,14 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // is normal aircraft motion and must never be treated as an EKF jump.
   latest_visual_update_state_correction_.valid = true;
   latest_visual_update_state_correction_.timestamp = state->_timestamp;
+  latest_visual_update_state_correction_.position_G =
+      state->_imu->pos() - visual_update_prior_position;
+  latest_visual_update_state_correction_.velocity_G =
+      state->_imu->vel() - visual_update_prior_velocity;
   latest_visual_update_state_correction_.position_m =
-      (state->_imu->pos() - visual_update_prior_position).norm();
+      latest_visual_update_state_correction_.position_G.norm();
   latest_visual_update_state_correction_.velocity_mps =
-      (state->_imu->vel() - visual_update_prior_velocity).norm();
+      latest_visual_update_state_correction_.velocity_G.norm();
   const Eigen::Matrix3d visual_update_rotation_error =
       state->_imu->Rot() * visual_update_prior_rotation.transpose();
   const double visual_update_rotation_cosine = std::max(

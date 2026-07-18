@@ -173,6 +173,9 @@ void VioManager::initialize_with_online_alignment(
   applied_result.diagnostics.handoff_raw_covariance_std =
       covariance_std(result.covariance);
 
+  const bool verified_formal_candidate_release =
+      result.diagnostics.formal_candidate_holdout_passed &&
+      !result.diagnostics.formal_refinement_release;
   const bool apply_native_handoff_inflation =
       result.diagnostics.direct_sliding_state_release &&
       !online_alignment_release_covariance_override_enabled_;
@@ -207,11 +210,28 @@ void VioManager::initialize_with_online_alignment(
         accel_bias_inflation};
     PRINT_INFO(
         GREEN
-        "[ONLINE-ALIGN] terminal-state handoff with upstream covariance "
+        "[ONLINE-ALIGN] direct terminal-state handoff with upstream covariance "
         "inflation [att %.1f vel %.1f bg %.1f ba %.1f]\n"
         RESET,
         orientation_inflation, velocity_inflation, gyro_bias_inflation,
         accel_bias_inflation);
+  } else if (verified_formal_candidate_release &&
+             !online_alignment_release_covariance_override_enabled_) {
+    // The formal joint graph already returns the Schur marginal of its
+    // terminal q/p/v/bg/ba state. Applying the generic dynamic-initializer
+    // block inflation here would replace that graph posterior with a second,
+    // unrelated uncertainty model (in particular velocity x100). Preserve the
+    // estimator-derived marginal and expose that choice in the run receipt.
+    applied_result.diagnostics.handoff_covariance_model =
+        "formal_joint_terminal_schur_marginal";
+    applied_result.diagnostics.handoff_covariance_inflation_applied = false;
+    applied_result.diagnostics.handoff_covariance_inflation = {1.0, 1.0, 1.0,
+                                                               1.0};
+    PRINT_INFO(
+        GREEN
+        "[ONLINE-ALIGN] formal terminal-state handoff preserves joint-graph "
+        "Schur marginal covariance\n"
+        RESET);
   } else if (online_alignment_release_covariance_override_enabled_) {
     applied_result.diagnostics.handoff_covariance_model =
         "diagnostic_cli_diagonal_no_history";

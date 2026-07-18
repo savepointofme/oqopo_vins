@@ -121,6 +121,12 @@ run_one() {
       --init-ba-sigma 1
     )
   fi
+  if [[ "${P4_STATE_SAFETY_DIAG:-0}" == "1" ]]; then
+    cmd+=(
+      --state-safety-diag "${out}/state_safety.csv"
+      --state-safety-eig-every 1
+    )
+  fi
   if [[ -n "${DISPLAY:-}" ]]; then
     cmd+=(--viz-fast --dash-every 5)
     printf 'visible_dashboard\n' > "${out}/visualization_mode.txt"

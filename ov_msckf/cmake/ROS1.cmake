@@ -98,7 +98,6 @@ list(APPEND LIBRARY_SOURCES
         src/core/OnlineAlignmentInitializer.cpp
         src/core/p4/factors/Factor_P4Epipolar.cpp
         src/core/p4/factors/Factor_P4FcTrajectory.cpp
-        src/core/p4/factors/Factor_P4ImuSharedBias.cpp
         src/core/VioManager.cpp
         src/core/VioManagerHelper.cpp
         src/update/UpdaterHelper.cpp

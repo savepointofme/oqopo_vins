@@ -1,0 +1,17 @@
+{
+  "experiment_id": "p4_formal_joint_20260718_focus",
+  "flight_name": "fly1",
+  "method_name": "true_frozen_global_baseline_oc_stride12",
+  "date": "20260718",
+  "status": "reference",
+  "gps_csv": "C:/Users/baloney/Desktop/20260517_gsmq_d455_fly1/result/fc_rebuild_20260614/gps_refined_finealign.csv",
+  "vio_traj": "C:/Users/baloney/Desktop/实验目录/_OPENVINS_ORGANIZED_20260625/01_final_locked_stride_sweep/stable_config_stride_validation_20260622/runs/fly1_oc_stride12/traj.txt",
+  "vio_bias": "C:/Users/baloney/Desktop/实验目录/_OPENVINS_ORGANIZED_20260625/01_final_locked_stride_sweep/stable_config_stride_validation_20260622/runs/fly1_oc_stride12/traj.txt.bias",
+  "diag_csv": "C:/Users/baloney/Desktop/实验目录/_OPENVINS_ORGANIZED_20260625/01_final_locked_stride_sweep/stable_config_stride_validation_20260622/runs/fly1_oc_stride12/diag.csv",
+  "t0": 1054.896608591,
+  "t1": 1150.967029333,
+  "alignment": {"mode": "start_heading", "course_window_s": 60.0},
+  "sampling": {"mode": "gps_update_after_vio", "max_delay_s": 0.2},
+  "segmentation": {"mode": "geometry"},
+  "notes": "Frozen global baseline restricted to the exact formal P4 focus interval."
+}

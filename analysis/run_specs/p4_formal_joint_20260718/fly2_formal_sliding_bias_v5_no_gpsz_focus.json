@@ -1,0 +1,17 @@
+{
+  "experiment_id": "p4_formal_sliding_bias_v5_focus",
+  "flight_name": "fly2",
+  "method_name": "formal_joint_p4_time_stable_sliding_bias_no_gpsz_stride12",
+  "date": "20260718",
+  "status": "diagnostic",
+  "gps_csv": "C:/Users/baloney/Desktop/20260518_gsmq_d455_fly2/result/fc_rebuild_20260614/gps_refined_finealign.csv",
+  "vio_traj": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/sliding_bias_v5/diagnostics/fly2_no_gpsz/traj_nav.txt",
+  "vio_bias": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/sliding_bias_v5/diagnostics/fly2_no_gpsz/traj.txt.bias",
+  "diag_csv": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/sliding_bias_v5/diagnostics/fly2_no_gpsz/diag.csv",
+  "t0": 826.089930773,
+  "t1": 899.987980843,
+  "alignment": {"mode": "start_heading", "course_window_s": 60.0},
+  "sampling": {"mode": "gps_update_after_vio", "max_delay_s": 0.2},
+  "segmentation": {"mode": "geometry"},
+  "notes": "Targeted diagnostic: identical formal P4 initialization and fixed stride 12, with estimator GPS-Z updates disabled. GPS is evaluation-only."
+}

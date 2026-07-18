@@ -189,9 +189,10 @@ struct SensorProvenance {
 };
 
 struct OnlineAlignmentOptions {
-  /// Formal production lifecycle: one finite joint candidate window, a later
-  /// causal holdout measured in sensor time, at most one newly advanced joint
-  /// refinement, then one atomic terminal-state release.
+  /// Formal production lifecycle: repeatedly form a finite joint candidate,
+  /// freeze it, and verify that exact state on a later disjoint sensor-time
+  /// holdout. Failed candidates slide and re-solve; a passed candidate is
+  /// atomically released without an unverified post-holdout refinement.
   bool formal_causal_lifecycle = false;
   /// Legacy comparison only. Initialize local VIO upstream, then estimate a
   /// low-dimensional FC yaw/translation gauge. The formal runner must keep
@@ -438,6 +439,7 @@ struct OnlineAlignmentDiagnostics {
   double angular_excitation_rad_s = 0.0;
   double second_axis_ratio = 0.0;
   double rate_residual_rms_rad_s = std::numeric_limits<double>::infinity();
+  double rate_residual_max_rad_s = std::numeric_limits<double>::infinity();
   double visual_imu_rotation_residual_deg = std::numeric_limits<double>::infinity();
   double estimated_fc_to_board_time_offset_s = 0.0;
   double time_offset_sigma_s = std::numeric_limits<double>::infinity();
@@ -616,6 +618,12 @@ struct OnlineAlignmentDiagnostics {
   bool formal_candidate_holdout_passed = false;
   bool formal_refinement_release = false;
   double fc_terminal_attitude_residual_deg =
+      std::numeric_limits<double>::infinity();
+  /// Maximum full-attitude disagreement between any optimized keyframe and
+  /// the synchronized FC attitude composed with the locked FC-board mount.
+  /// This rejects solve windows containing transient mounting flex even when
+  /// their terminal state and aggregate RMS look healthy.
+  double fc_window_attitude_max_residual_deg =
       std::numeric_limits<double>::infinity();
   double fc_terminal_position_residual_m =
       std::numeric_limits<double>::infinity();

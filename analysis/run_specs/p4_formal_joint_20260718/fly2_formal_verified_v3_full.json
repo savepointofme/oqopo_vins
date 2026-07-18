@@ -1,0 +1,17 @@
+{
+  "experiment_id": "p4_formal_verified_holdout_v3_full",
+  "flight_name": "fly2",
+  "method_name": "formal_joint_p4_verified_holdout_stride12",
+  "date": "20260718",
+  "status": "candidate",
+  "gps_csv": "C:/Users/baloney/Desktop/20260518_gsmq_d455_fly2/result/fc_rebuild_20260614/gps_refined_finealign.csv",
+  "vio_traj": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/verified_holdout_v3/full_runs/20260718_050151_p4_only_all/fly2/traj_nav.txt",
+  "vio_bias": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/verified_holdout_v3/full_runs/20260718_050151_p4_only_all/fly2/traj.txt.bias",
+  "diag_csv": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/verified_holdout_v3/full_runs/20260718_050151_p4_only_all/fly2/diag.csv",
+  "t0": 733.649778605,
+  "t1": 2299.639999952,
+  "alignment": {"mode": "start_heading", "course_window_s": 60.0},
+  "sampling": {"mode": "gps_update_after_vio", "max_delay_s": 0.2},
+  "segmentation": {"mode": "geometry"},
+  "notes": "Verified causal-holdout P4 fly2 full replay; P5 disabled, fixed stride 12, GPS evaluation only. Interval is identical to frozen global baseline comparison."
+}

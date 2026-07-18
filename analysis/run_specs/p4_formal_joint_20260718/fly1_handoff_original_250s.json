@@ -1,0 +1,17 @@
+{
+  "experiment_id": "p4_formal_handoff_ablation_20260718",
+  "flight_name": "fly1",
+  "method_name": "formal_joint_original_cov_guarded",
+  "date": "20260718",
+  "status": "candidate",
+  "gps_csv": "C:/Users/baloney/Desktop/20260517_gsmq_d455_fly1/result/fc_rebuild_20260614/gps_refined_finealign.csv",
+  "vio_traj": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/full_runs/20260718_021326_terminal_boundary_fly1/fly1/traj_nav.txt",
+  "vio_bias": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/full_runs/20260718_021326_terminal_boundary_fly1/fly1/traj.txt.bias",
+  "diag_csv": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/full_runs/20260718_021326_terminal_boundary_fly1/fly1/diag.csv",
+  "t0": 1054.993238821,
+  "t1": 1304.998971939,
+  "alignment": {"mode": "start_heading", "course_window_s": 60.0},
+  "sampling": {"mode": "gps_update_after_vio", "max_delay_s": 0.2},
+  "segmentation": {"mode": "geometry"},
+  "notes": "Original formal P4 handoff; full 15x15 covariance; guarded GPS-Z; fixed stride 12."
+}

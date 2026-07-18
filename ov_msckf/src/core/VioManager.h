@@ -586,6 +586,8 @@ public:
     double position_m = 0.0;
     double velocity_mps = 0.0;
     double attitude_deg = 0.0;
+    Eigen::Vector3d position_G = Eigen::Vector3d::Zero();
+    Eigen::Vector3d velocity_G = Eigen::Vector3d::Zero();
   };
   const VisualUpdateStateCorrection &
   get_latest_visual_update_state_correction() const {

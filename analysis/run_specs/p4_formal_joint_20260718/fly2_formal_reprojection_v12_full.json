@@ -1,0 +1,17 @@
+{
+  "experiment_id": "p4_formal_reprojection_v12_full",
+  "flight_name": "fly2",
+  "method_name": "formal_joint_p4_explicit_landmark_reprojection_stride12",
+  "date": "20260718",
+  "status": "candidate",
+  "gps_csv": "C:/Users/baloney/Desktop/20260518_gsmq_d455_fly2/result/fc_rebuild_20260614/gps_refined_finealign.csv",
+  "vio_traj": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/explicit_landmark_reprojection_raw_cov_v12/full_runs/20260718_092747_p4_only_all/fly2/traj_nav.txt",
+  "vio_bias": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/explicit_landmark_reprojection_raw_cov_v12/full_runs/20260718_092747_p4_only_all/fly2/traj.txt.bias",
+  "diag_csv": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/explicit_landmark_reprojection_raw_cov_v12/full_runs/20260718_092747_p4_only_all/fly2/diag.csv",
+  "t0": 733.649778605,
+  "t1": 2299.639999952,
+  "alignment": {"mode": "start_heading", "course_window_s": 60.0},
+  "sampling": {"mode": "gps_update_after_vio", "max_delay_s": 0.2},
+  "segmentation": {"mode": "geometry"},
+  "notes": "Formal P4 explicit landmark reprojection full replay on the frozen official common interval; terminal Schur marginal handoff; P5 disabled, fixed stride 12."
+}

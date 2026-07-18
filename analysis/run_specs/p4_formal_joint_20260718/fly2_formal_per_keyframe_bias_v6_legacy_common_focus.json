@@ -1,0 +1,17 @@
+{
+  "experiment_id": "p4_formal_per_keyframe_bias_v6_legacy_common_focus",
+  "flight_name": "fly2",
+  "method_name": "formal_joint_p4_per_keyframe_bias_stride12",
+  "date": "20260718",
+  "status": "candidate",
+  "gps_csv": "C:/Users/baloney/Desktop/20260518_gsmq_d455_fly2/result/fc_rebuild_20260614/gps_refined_finealign.csv",
+  "vio_traj": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/per_keyframe_bias_v6/focus_runs/20260718_064518_p4_only_all/fly2/traj_nav.txt",
+  "vio_bias": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/per_keyframe_bias_v6/focus_runs/20260718_064518_p4_only_all/fly2/traj.txt.bias",
+  "diag_csv": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/per_keyframe_bias_v6/focus_runs/20260718_064518_p4_only_all/fly2/diag.csv",
+  "t0": 826.089930773,
+  "t1": 899.987980843,
+  "alignment": {"mode": "start_heading", "course_window_s": 60.0},
+  "sampling": {"mode": "gps_update_after_vio", "max_delay_s": 0.2},
+  "segmentation": {"mode": "geometry"},
+  "notes": "V6 candidate evaluated on the exact previously frozen v5/global common interval."
+}
