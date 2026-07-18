@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "status": "SHADOW_FAILED",
+  "branch": "experiment/flex-level-shadow-20260719",
+  "base_commit": "b4da0eb54fef7081e0a355b3c5b03b3e31102fa0",
+  "data_identity": "desktop_frozen_fly1_fly4_oc_stride12",
+  "manifest": "analysis/manifests/flex_level_shadow_stride12_20260719.json",
+  "commands": {
+    "tests": "python -m unittest analysis.tests.test_flex_level_observer analysis.tests.test_flex_level_tv_fallback -v",
+    "primary": "python analysis/flex_level_shadow_validation.py --output-dir <new-output-dir>",
+    "fallback": "python analysis/flex_level_tv_fallback.py --primary-result-root <primary-output-dir> --output-dir <new-output-dir>"
+  },
+  "frozen_failed_v1": {
+    "root": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/flex_attitude_shadow_v1_true_stride12_20260718_233700",
+    "report_sha256": "34307a7c19748ed5cf05ac1f591ff1ff1991ca7aba0896d7431394c86ec5ef67",
+    "parameters_sha256": "9675cb6c81fac73fe5a0572c7599079559384f0616c0e32c837ea63953c1cbf8",
+    "modified": false
+  },
+  "primary_result": {
+    "root": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/flex_level_observer_shadow_stride12_final_20260719_022606",
+    "summary_sha256": "54a6b5a97d524e435d73b9533f137cbbfe82d07bc37b4d31e3b81ac2c43d8516",
+    "report_sha256": "d2134d3577b28c2a8a235d1c825fe6f907e47b6b6aedf06fabd7e5e04bedab1e",
+    "fly3_plot_sha256": "3170e5053b5e5a8c42423f0de57ee61d4d856d03b5c77ab95be205b2abb6163d",
+    "status": "SHADOW_FAILED"
+  },
+  "fallback_result": {
+    "root": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/flex_level_tv_fallback_stride12_20260719_022031",
+    "summary_sha256": "00380982020b232c6f31a7428fd82b4b1836a9dbf349996e95ede093b30395b6",
+    "report_sha256": "5d3e22288609f9d11996a3247d7c48d90c22e2cd22631ea5cf1d1291f215bc5e",
+    "fly3_plot_sha256": "ee3e0f3b02c5dd72e80b1aa890a3cc50ce3e2386a3805c4bc0330676f7895432",
+    "status": "SHADOW_FAILED",
+    "input_trace_identity": {
+      "note": "The fallback run used the pre-finalized primary directory. Its four observation traces are byte-identical to the final primary traces.",
+      "fly1_sha256": "80b1e1a16219d0b84d23745e4f2bd75b84e447aa97acb324b1b62fb54ff81a21",
+      "fly2_sha256": "d5f148242aa60399438ade21f7feef032e9e510f17149628c4460ef1d63eb291",
+      "fly3_sha256": "aa42e00abd8cebdbba97f2a2a852214e1a48dbfab0ab22a7afcb51269880f05d6",
+      "fly4_sha256": "50c703754c7972f682404e0fa2c4eb1dd65425cd8e965ef489122f8c7bb28772"
+    }
+  },
+  "interrupted_attempts": [
+    {
+      "root": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/flex_level_observer_shadow_stride12_20260719_015557",
+      "reason": "outer command timeout; partial artifacts retained"
+    },
+    {
+      "root": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/flex_level_observer_shadow_stride12_20260719_020100",
+      "reason": "final aggregation NameError after all four per-flight artifacts; retained"
+    },
+    {
+      "root": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/flex_level_observer_shadow_stride12_20260719_020946",
+      "reason": "complete algorithm result; superseded only by corrected missing-FC exact-hold serialization"
+    }
+  ],
+  "rosfree_integration_performed": false,
+  "formal_vio_state_modified": false,
+  "gps_pv_truth_used_online": false,
+  "fc_absolute_attitude_used_online": false
+}
