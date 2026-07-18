@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "data_identity": "desktop_frozen_fly1_fly4_oc_stride12",
+  "estimator_replayed": false,
+  "pair_cache_role": "existing_visual_gyro_quality_gate_only",
+  "pair_cache_root": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/flex_attitude_shadow_stride12_pair_cache_20260718",
+  "nominal_mount_calibration": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/fc_d455_four_fly_strict_audit_20260718_200000/per_flight_fixed/full_flight_fc_board_calibration.yaml",
+  "frozen_failed_comparison": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/flex_attitude_shadow_v1_true_stride12_20260718_233700",
+  "flights": {
+    "fly1": {
+      "run_dir": "C:/Users/baloney/Desktop/实验目录/_OPENVINS_ORGANIZED_20260625/01_final_locked_stride_sweep/stable_config_stride_validation_20260622/runs/fly1_oc_stride12",
+      "dataset_dir": "C:/Users/baloney/Desktop/20260517_gsmq_d455_fly1/d455_20260517_174810",
+      "fc_raw_csv": "C:/Users/baloney/Desktop/20260517_gsmq_d455_fly1/2026_05_17_19_12_14_1 - 副本.csv",
+      "fc_relative_offset_s": null,
+      "positive_windows_s": []
+    },
+    "fly2": {
+      "run_dir": "C:/Users/baloney/Desktop/实验目录/_OPENVINS_ORGANIZED_20260625/01_final_locked_stride_sweep/stable_config_stride_validation_20260622/runs/fly2_oc_stride12",
+      "dataset_dir": "C:/Users/baloney/Desktop/20260518_gsmq_d455_fly2/d455_20260517_184722",
+      "fc_raw_csv": "C:/Users/baloney/Desktop/20260518_gsmq_d455_fly2/d455_20260517_184722/2026_05_18_10_17_55_1_mems_fly2.csv",
+      "fc_relative_offset_s": 447.5,
+      "positive_windows_s": []
+    },
+    "fly3": {
+      "run_dir": "C:/Users/baloney/Desktop/实验目录/_OPENVINS_ORGANIZED_20260625/01_final_locked_stride_sweep/stable_config_stride_validation_20260622/runs/fly3_oc_stride12",
+      "dataset_dir": "C:/Users/baloney/Desktop/20260527_gsmq_d455_fly3/d455_20260526_174946",
+      "fc_raw_csv": "C:/Users/baloney/Desktop/20260527_gsmq_d455_fly3/d455_20260526_174946/2026_05_27_14_32_15_1 - 副本.csv",
+      "fc_relative_offset_s": 438.0,
+      "positive_windows_s": [[760.0, 800.0], [995.0, 1025.0]]
+    },
+    "fly4": {
+      "run_dir": "C:/Users/baloney/Desktop/实验目录/_OPENVINS_ORGANIZED_20260625/01_final_locked_stride_sweep/stable_config_stride_validation_20260622/runs/fly4_oc_stride12",
+      "dataset_dir": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/d455_20260527_090549",
+      "fc_raw_csv": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/2026_05_27_17_41_28_1_mems_fly7.csv",
+      "fc_relative_offset_s": -202.2,
+      "positive_windows_s": []
+    }
+  }
+}
