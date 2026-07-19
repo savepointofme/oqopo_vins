@@ -140,6 +140,17 @@ State::State(StateOptions &options) {
     current_id += _h_offset->size();
   }
 
+  // Experimental flex-aware FC relative-yaw factor state. It is deliberately
+  // independent of camera-IMU extrinsics and gyro bias.
+  _flex_yaw = std::make_shared<Vec>(1);
+  _flex_yaw->set_value(Eigen::Matrix<double, 1, 1>::Zero());
+  _flex_yaw->set_fej(Eigen::Matrix<double, 1, 1>::Zero());
+  if (options.use_flex_yaw_state) {
+    _flex_yaw->set_local_id(current_id);
+    _variables.push_back(_flex_yaw);
+    current_id += _flex_yaw->size();
+  }
+
   // Finally initialize our covariance to small value
   _Cov = std::pow(1e-3, 2) * Eigen::MatrixXd::Identity(current_id, current_id);
 
@@ -175,5 +186,9 @@ State::State(StateOptions &options) {
   }
   if (_options.use_gps_h_offset) {
     _Cov(_h_offset->id(), _h_offset->id()) = std::pow(_options.gps_h_offset_init_sigma, 2);
+  }
+  if (_options.use_flex_yaw_state) {
+    _Cov(_flex_yaw->id(), _flex_yaw->id()) =
+        std::pow(_options.flex_yaw_init_sigma, 2);
   }
 }

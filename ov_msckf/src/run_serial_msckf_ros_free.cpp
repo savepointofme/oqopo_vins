@@ -176,8 +176,10 @@ struct Args {
   std::string gt_path;
   std::string output_path = "traj_ros_free.txt";
   bool enable_flex_body_attitude = false;
+  bool enable_flex_aware_fc_yaw_update = false;
   std::string flex_fc_attitude_path;
   std::string flex_body_attitude_output_path;
+  std::string flex_fc_factor_diag_path;
   std::string init_from_fc_path;
   std::string video_path;
   std::string video_cam_path;    // [中文] 仅相机 + 光流轨迹视频 (cam0/cam1 并排, 带 TrackBase 历史线)
@@ -416,10 +418,14 @@ void print_help() {
                "  --output PATH         Output TUM trajectory (default: traj_ros_free.txt)\n"
                "  --enable-flex-body-attitude\n"
                "                        Enable output-only continuous yaw-flex shadow (default off).\n"
+               "  --enable-flex-aware-fc-yaw-update\n"
+               "                        Enable experimental EKF relative-yaw factor (default off).\n"
                "  --flex-fc-attitude PATH\n"
                "                        Camera-time FC attitude CSV; post-init input is relative SO(3) only.\n"
                "  --flex-body-attitude-output PATH\n"
                "                        Independent shadow CSV beside the original trajectory.\n"
+               "  --flex-fc-factor-diag PATH\n"
+               "                        Per-factor EKF residual/NIS/state diagnostic CSV.\n"
                "  --video PATH          Record dashboard to MP4\n"
                "  --video-cam PATH      Record camera-only (cam0/cam1 w/ optical-flow tracks) to MP4\n"
                "  --video-fps N         Video FPS (default 20)\n"
@@ -560,10 +566,14 @@ bool parse_args(int argc, char **argv, Args &a) {
     else if (s == "--output") a.output_path = next("--output");
     else if (s == "--enable-flex-body-attitude")
       a.enable_flex_body_attitude = true;
+    else if (s == "--enable-flex-aware-fc-yaw-update")
+      a.enable_flex_aware_fc_yaw_update = true;
     else if (s == "--flex-fc-attitude")
       a.flex_fc_attitude_path = next("--flex-fc-attitude");
     else if (s == "--flex-body-attitude-output")
       a.flex_body_attitude_output_path = next("--flex-body-attitude-output");
+    else if (s == "--flex-fc-factor-diag")
+      a.flex_fc_factor_diag_path = next("--flex-fc-factor-diag");
     else if (s == "--video") a.video_path = next("--video");
     else if (s == "--video-cam") a.video_cam_path = next("--video-cam");
     else if (s == "--video-fps") a.video_fps = std::atoi(next("--video-fps").c_str());
@@ -761,14 +771,25 @@ bool parse_args(int argc, char **argv, Args &a) {
     print_help();
     return false;
   }
-  if (a.enable_flex_body_attitude && a.flex_fc_attitude_path.empty()) {
-    std::cerr << "--enable-flex-body-attitude requires --flex-fc-attitude\n";
+  if ((a.enable_flex_body_attitude || a.enable_flex_aware_fc_yaw_update) &&
+      a.flex_fc_attitude_path.empty()) {
+    std::cerr << "flex shadow/factor requires --flex-fc-attitude\n";
     return false;
   }
   if (!a.enable_flex_body_attitude &&
-      (!a.flex_fc_attitude_path.empty() ||
-       !a.flex_body_attitude_output_path.empty())) {
-    std::cerr << "flex attitude paths require --enable-flex-body-attitude\n";
+      !a.flex_body_attitude_output_path.empty()) {
+    std::cerr << "--flex-body-attitude-output requires --enable-flex-body-attitude\n";
+    return false;
+  }
+  if (!a.enable_flex_aware_fc_yaw_update &&
+      !a.flex_fc_factor_diag_path.empty()) {
+    std::cerr << "--flex-fc-factor-diag requires --enable-flex-aware-fc-yaw-update\n";
+    return false;
+  }
+  if (!a.enable_flex_body_attitude &&
+      !a.enable_flex_aware_fc_yaw_update &&
+      !a.flex_fc_attitude_path.empty()) {
+    std::cerr << "--flex-fc-attitude requires a flex shadow/factor switch\n";
     return false;
   }
   return true;
@@ -1062,6 +1083,13 @@ int main(int argc, char **argv) {
                "(h_offset Vec(1) added to state, init_sigma=%.1fm walk_sigma=%.4fm/sqrt(s))\n" RESET,
                params.state_options.gps_h_offset_init_sigma,
                params.state_options.gps_h_offset_walk_sigma);
+  }
+  if (args.enable_flex_aware_fc_yaw_update) {
+    params.state_options.use_flex_yaw_state = true;
+    PRINT_INFO(CYAN "[FC-FLEX-FACTOR] enabled: relative SO(3) only; "
+                    "flex state sigma0=%.4fdeg walk=%.4fdeg/sqrt(s)\n" RESET,
+               params.state_options.flex_yaw_init_sigma * 180.0 / M_PI,
+               params.state_options.flex_yaw_walk_sigma * 180.0 / M_PI);
   }
   auto sys = std::make_shared<VioManager>(params);
   if (!args.visual_flow_curl_diag_path.empty() ||
@@ -1374,7 +1402,8 @@ int main(int argc, char **argv) {
     DatasetReaderEuroc::load_gt((root / "state_groundtruth_estimate0" / "data.csv").string(), gt);
   if (!args.gps_path.empty())
     DatasetReaderEuroc::load_gps(args.gps_path, gps);
-  if (args.enable_flex_body_attitude) {
+  if (args.enable_flex_body_attitude ||
+      args.enable_flex_aware_fc_yaw_update) {
     try {
       flex_fc_attitude =
           load_flex_fc_attitude_stream(args.flex_fc_attitude_path);
@@ -1383,8 +1412,8 @@ int main(int argc, char **argv) {
                   error.what());
       return EXIT_FAILURE;
     }
-    PRINT_INFO(CYAN "[FLEX-BODY] shadow enabled: FC rows=%zu "
-                    "range=[%.6f, %.6f]; estimator state feedback=disabled\n" RESET,
+    PRINT_INFO(CYAN "[FC-ATTITUDE] loaded rows=%zu range=[%.6f, %.6f]; "
+                    "post-init use is relative SO(3) only\n" RESET,
                flex_fc_attitude.size(), flex_fc_attitude.front().timestamp_s,
                flex_fc_attitude.back().timestamp_s);
   }
@@ -1527,6 +1556,48 @@ int main(int argc, char **argv) {
   double flex_last_processed_fc_time_s =
       std::numeric_limits<double>::quiet_NaN();
   bool flex_fc_valid_for_release = true;
+
+  std::ofstream flex_fc_factor_diag_out;
+  std::size_t flex_factor_fc_index = 0;
+  bool flex_factor_nominal_initialized = false;
+  bool flex_factor_have_anchor = false;
+  double flex_factor_anchor_time_s =
+      std::numeric_limits<double>::quiet_NaN();
+  Eigen::Matrix3d flex_factor_anchor_fc_R_BtoG =
+      Eigen::Matrix3d::Identity();
+  std::size_t flex_factor_accepted_count = 0;
+  std::size_t flex_factor_rejected_count = 0;
+  if (args.enable_flex_aware_fc_yaw_update) {
+    if (args.flex_fc_factor_diag_path.empty()) {
+      const fs::path trajectory_path(args.output_path);
+      args.flex_fc_factor_diag_path =
+          (trajectory_path.parent_path() / "flex_fc_relative_yaw_factor.csv")
+              .string();
+    }
+    const fs::path factor_diag_path(args.flex_fc_factor_diag_path);
+    if (!factor_diag_path.parent_path().empty())
+      fs::create_directories(factor_diag_path.parent_path());
+    flex_fc_factor_diag_out.open(args.flex_fc_factor_diag_path,
+                                 std::ofstream::out |
+                                     std::ofstream::trunc);
+    if (!flex_fc_factor_diag_out.is_open()) {
+      PRINT_ERROR(RED "[FC-FLEX-FACTOR] cannot open diagnostic: %s\n" RESET,
+                  args.flex_fc_factor_diag_path.c_str());
+      return EXIT_FAILURE;
+    }
+    flex_fc_factor_diag_out
+        << "# schema=rosfree_flex_aware_fc_relative_yaw_factor_v1\n"
+        << "# measurement=adjacent_processed_camera_endpoint_relative_SO3; "
+           "absolute_fc_yaw_not_used_after_nominal_mount\n"
+        << "anchor_time_s,current_time_s,decision,accepted,prediction_deg,"
+           "residual_deg,innovation_variance_rad2,nis,"
+           "flex_anchor_before_deg,flex_current_before_deg,"
+           "flex_current_after_deg,posterior_prediction_deg,"
+           "state_yaw_delta_deg,position_delta_norm_m,"
+           "velocity_delta_norm_mps,gyro_bias_delta_norm_radps,"
+           "accel_bias_delta_norm_mps2\n";
+    flex_fc_factor_diag_out << std::fixed << std::setprecision(9);
+  }
   if (args.enable_flex_body_attitude) {
     if (args.flex_body_attitude_output_path.empty()) {
       const fs::path trajectory_path(args.output_path);
@@ -1995,6 +2066,60 @@ int main(int argc, char **argv) {
           << (args.adaptive_stride ? adaptive_decision.recommended_stride : args.cam_subsample) << ","
           << (do_cam_feed ? 1 : 0) << "\n";
     }
+    bool flex_factor_initialization_queued = false;
+    bool flex_factor_update_queued = false;
+    if (args.enable_flex_aware_fc_yaw_update && do_cam_feed &&
+        sys->initialized()) {
+      constexpr double kMaximumFcEndpointBracketGapS = 0.45;
+      Eigen::Matrix3d current_fc_R_BtoG = Eigen::Matrix3d::Identity();
+      const bool fc_endpoint_valid = interpolate_flex_fc_attitude_at(
+          flex_fc_attitude, t_cam, kMaximumFcEndpointBracketGapS,
+          current_fc_R_BtoG, flex_factor_fc_index);
+      if (!fc_endpoint_valid) {
+        flex_factor_have_anchor = false;
+        ++flex_factor_rejected_count;
+        flex_fc_factor_diag_out
+            << "nan," << t_cam
+            << ",hold_invalid_fc_endpoint,0,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan\n";
+      } else if (!flex_factor_nominal_initialized) {
+        flex_factor_initialization_queued =
+            sys->queue_flex_relative_yaw_initialization(t_cam,
+                                                        current_fc_R_BtoG);
+        if (!flex_factor_initialization_queued) {
+          PRINT_ERROR(
+              RED "[FC-FLEX-FACTOR] failed to queue initialization at t=%.9f\n" RESET,
+              t_cam);
+          return EXIT_FAILURE;
+        }
+        flex_factor_anchor_time_s = t_cam;
+        flex_factor_anchor_fc_R_BtoG = current_fc_R_BtoG;
+        flex_factor_have_anchor = true;
+      } else if (!flex_factor_have_anchor) {
+        // Resume from a new endpoint without spanning an FC-invalid gap.
+        flex_factor_anchor_time_s = t_cam;
+        flex_factor_anchor_fc_R_BtoG = current_fc_R_BtoG;
+        flex_factor_have_anchor = true;
+        flex_fc_factor_diag_out
+            << t_cam << ',' << t_cam
+            << ",resume_after_fc_gap,0,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan\n";
+      } else {
+        const Eigen::Matrix3d fc_delta_R_current_to_previous =
+            current_fc_R_BtoG.transpose() *
+            flex_factor_anchor_fc_R_BtoG;
+        flex_factor_update_queued = sys->queue_flex_relative_yaw_factor(
+            flex_factor_anchor_time_s, t_cam,
+            fc_delta_R_current_to_previous);
+        if (!flex_factor_update_queued) {
+          PRINT_ERROR(
+              RED "[FC-FLEX-FACTOR] failed to queue update at t=%.9f\n" RESET,
+              t_cam);
+          return EXIT_FAILURE;
+        }
+        flex_factor_anchor_time_s = t_cam;
+        flex_factor_anchor_fc_R_BtoG = current_fc_R_BtoG;
+      }
+    }
+
     if (do_cam_feed) {
       sys->feed_measurement_camera(msg);
       processed_image_count++;
@@ -2005,6 +2130,57 @@ int main(int argc, char **argv) {
         camera_adaptive_stats.last_feed_time = t_cam;
     } else {
       skipped_image_count++;
+    }
+
+    if (flex_factor_initialization_queued) {
+      const auto &factor_diag =
+          sys->get_last_flex_relative_yaw_diagnostics();
+      if (!sys->flex_relative_yaw_factor_initialized() ||
+          std::fabs(factor_diag.current_timestamp_s - t_cam) > 1e-6 ||
+          std::string(factor_diag.decision) != "initialization_reset") {
+        PRINT_ERROR(
+            RED "[FC-FLEX-FACTOR] queued initialization was not consumed at t=%.9f\n" RESET,
+            t_cam);
+        return EXIT_FAILURE;
+      }
+      flex_factor_nominal_initialized = true;
+      flex_fc_factor_diag_out
+          << t_cam << ',' << t_cam
+          << ",initialization_reset,0,0,0,nan,nan,0,0,0,0,0,0,0,0,0\n";
+      PRINT_INFO(GREEN "[FC-FLEX-FACTOR] initialized pre-visual at t=%.9f; "
+                       "nominal mount frozen and flex=0\n" RESET,
+                 t_cam);
+    } else if (flex_factor_update_queued) {
+      const auto &factor_diag =
+          sys->get_last_flex_relative_yaw_diagnostics();
+      if (std::fabs(factor_diag.current_timestamp_s - t_cam) > 1e-6) {
+        PRINT_ERROR(
+            RED "[FC-FLEX-FACTOR] queued update was not consumed at t=%.9f\n" RESET,
+            t_cam);
+        return EXIT_FAILURE;
+      }
+      if (factor_diag.accepted)
+        ++flex_factor_accepted_count;
+      else
+        ++flex_factor_rejected_count;
+      constexpr double kRadToDeg = 180.0 / M_PI;
+      flex_fc_factor_diag_out
+          << factor_diag.anchor_timestamp_s << ','
+          << factor_diag.current_timestamp_s << ','
+          << factor_diag.decision << ','
+          << (factor_diag.accepted ? 1 : 0) << ','
+          << factor_diag.prediction_rad * kRadToDeg << ','
+          << factor_diag.residual_rad * kRadToDeg << ','
+          << factor_diag.innovation_variance << ',' << factor_diag.nis
+          << ',' << factor_diag.flex_anchor_before_rad * kRadToDeg
+          << ',' << factor_diag.flex_current_before_rad * kRadToDeg
+          << ',' << factor_diag.flex_current_after_rad * kRadToDeg
+          << ',' << factor_diag.posterior_prediction_rad * kRadToDeg
+          << ',' << factor_diag.state_yaw_delta_rad * kRadToDeg
+          << ',' << factor_diag.position_delta_norm_m
+          << ',' << factor_diag.velocity_delta_norm_mps
+          << ',' << factor_diag.gyro_bias_delta_norm_radps
+          << ',' << factor_diag.accel_bias_delta_norm_mps2 << '\n';
     }
     double dt_ms = 1000.0 * (cv::getTickCount() / cv::getTickFrequency() - t0);
 
@@ -2768,6 +2944,18 @@ int main(int argc, char **argv) {
                flex_body_observer.observed_flex_yaw_rad() * 180.0 / M_PI,
                flex_body_observer.filtered_flex_yaw_rad() * 180.0 / M_PI,
                flex_body_observer.output_flex_yaw_rad() * 180.0 / M_PI);
+  }
+  if (flex_fc_factor_diag_out.is_open()) {
+    flex_fc_factor_diag_out.flush();
+    if (!flex_fc_factor_diag_out.good()) {
+      PRINT_ERROR(RED "[FC-FLEX-FACTOR] diagnostic write failed: %s\n" RESET,
+                  args.flex_fc_factor_diag_path.c_str());
+      return EXIT_FAILURE;
+    }
+    flex_fc_factor_diag_out.close();
+    PRINT_INFO(GREEN "[FC-FLEX-FACTOR] diagnostic=%s accepted=%zu rejected_or_held=%zu\n" RESET,
+               args.flex_fc_factor_diag_path.c_str(),
+               flex_factor_accepted_count, flex_factor_rejected_count);
   }
   if (!args.camera_stride_audit_path.empty()) {
     std::vector<double> processed_dt;

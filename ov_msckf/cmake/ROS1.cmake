@@ -103,6 +103,7 @@ list(APPEND LIBRARY_SOURCES
         src/update/UpdaterGroundPlaneRange.cpp
         src/update/UpdaterGroundPlaneFeature.cpp
         src/update/UpdaterGroundPlaneFeatureV1.cpp
+        src/update/UpdaterFlexRelativeYaw.cpp
         src/update/VisualObservabilityPolicy.cpp
 )
 if (catkin_FOUND AND ENABLE_ROS)
@@ -206,6 +207,17 @@ target_link_libraries(test_flex_body_attitude_observer ${thirdparty_libraries})
 add_test(NAME test_flex_body_attitude_observer
   COMMAND test_flex_body_attitude_observer)
 install(TARGETS test_flex_body_attitude_observer
+        ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+        LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+        RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+add_executable(test_flex_relative_yaw_factor
+  src/test_flex_relative_yaw_factor.cpp)
+target_link_libraries(test_flex_relative_yaw_factor ov_msckf_lib ${thirdparty_libraries})
+add_test(NAME test_flex_relative_yaw_factor
+  COMMAND test_flex_relative_yaw_factor)
+install(TARGETS test_flex_relative_yaw_factor
         ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
         LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
         RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}

@@ -66,6 +66,7 @@
 
 #include "FCInitLoader.h"
 #include "VioManagerOptions.h"
+#include "update/UpdaterFlexRelativeYaw.h"
 
 namespace ov_core {
 struct ImuData;
@@ -91,6 +92,7 @@ class UpdaterZeroVelocity;
 class UpdaterGroundPlaneRange;
 class UpdaterGroundPlaneFeature;
 class UpdaterGroundPlaneFeatureV1;
+class UpdaterFlexRelativeYaw;
 class Propagator;
 class VisualResidualDiag;
 
@@ -485,6 +487,31 @@ public:
   /// [中文] 判断系统是否已初始化: 必须既完成初始化又至少做过一次更新。
   bool initialized() { return is_initialized_vio && timelastupdate != -1; }
 
+  /// Freeze the session nominal body-to-D455 mount at VIO initialization.
+  bool initialize_flex_relative_yaw_factor(
+      double timestamp, const Eigen::Matrix3d &R_BtoG);
+
+  /// Apply one FC relative-SO(3) factor between processed camera clones.
+  FlexRelativeYawDiagnostics feed_flex_relative_yaw_factor(
+      double anchor_timestamp, double current_timestamp,
+      const Eigen::Matrix3d &fc_delta_R_current_to_previous);
+
+  /// Queue the factor so it is consumed immediately after propagation+clone
+  /// and before any visual update at the current camera timestamp.
+  bool queue_flex_relative_yaw_initialization(
+      double current_timestamp, const Eigen::Matrix3d &R_BtoG);
+  bool queue_flex_relative_yaw_factor(
+      double anchor_timestamp, double current_timestamp,
+      const Eigen::Matrix3d &fc_delta_R_current_to_previous);
+  const FlexRelativeYawDiagnostics &get_last_flex_relative_yaw_diagnostics()
+      const {
+    return flex_relative_yaw_last_diagnostics_;
+  }
+  bool flex_relative_yaw_factor_initialized() const {
+    return updaterFlexRelativeYaw != nullptr &&
+           updaterFlexRelativeYaw->initialized();
+  }
+
   /// Timestamp that the system was initialized at
   double initialized_time() { return startup_time; }
 
@@ -734,6 +761,9 @@ protected:
   /// Stage B v1 — two-clone H, dry-run-first updater (optional, off by default)
   std::shared_ptr<UpdaterGroundPlaneFeatureV1> updaterGPlaneFeatureV1;
 
+  /// Experimental default-off flex-aware FC relative-yaw updater.
+  std::shared_ptr<UpdaterFlexRelativeYaw> updaterFlexRelativeYaw;
+
   /// This is the queue of measurement times that have come in since we starting doing initialization
   /// After we initialize, we will want to prop & update to the latest timestamp quickly
   /// [中文] 初始化期间稯积的相机帧时间戳队列; 初始化成功后会快速重放这些时刻
@@ -803,6 +833,15 @@ private:
 
   // Startup time of the filter
   double startup_time = -1;
+
+  double flex_yaw_last_process_noise_time_ = -1.0;
+  enum class PendingFlexRelativeYawKind { NONE, INITIALIZE, UPDATE };
+  PendingFlexRelativeYawKind pending_flex_relative_yaw_kind_ =
+      PendingFlexRelativeYawKind::NONE;
+  double pending_flex_anchor_timestamp_ = -1.0;
+  double pending_flex_current_timestamp_ = -1.0;
+  Eigen::Matrix3d pending_flex_rotation_ = Eigen::Matrix3d::Identity();
+  FlexRelativeYawDiagnostics flex_relative_yaw_last_diagnostics_;
 
   // Threads and their atomics
   // [中文] 异步初始化的状态标志:

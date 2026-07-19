@@ -52,6 +52,7 @@
 #include "update/UpdaterGroundPlaneRange.h"
 #include "update/UpdaterGroundPlaneFeature.h"
 #include "update/UpdaterGroundPlaneFeatureV1.h"
+#include "update/UpdaterFlexRelativeYaw.h"
 #include "update/UpdaterZeroVelocity.h"
 #include "update/VisualObservabilityPolicy.h"
 #include "update/VisualResidualDiag.h"
@@ -374,6 +375,8 @@ VioManager::VioManager(VioManagerOptions &params_) : thread_init_running(false),
 
   // Ground-plane pseudo-rangefinder updater (created on demand via feed method)
   updaterGPlaneRange = nullptr;
+  if (params.state_options.use_flex_yaw_state)
+    updaterFlexRelativeYaw = std::make_shared<UpdaterFlexRelativeYaw>();
 }
 
 VioManager::~VioManager() {
@@ -425,6 +428,68 @@ void VioManager::feed_measurement_imu(const ov_core::ImuData &message) {
   if (is_initialized_vio && updaterZUPT != nullptr && (!params.zupt_only_at_beginning || !has_moved_since_zupt)) {
     updaterZUPT->feed_imu(processed_message, oldest_time);
   }
+}
+
+bool VioManager::initialize_flex_relative_yaw_factor(
+    double timestamp, const Eigen::Matrix3d &R_BtoG) {
+  if (!is_initialized_vio || !params.state_options.use_flex_yaw_state ||
+      updaterFlexRelativeYaw == nullptr || !R_BtoG.allFinite())
+    return false;
+  const Eigen::Matrix3d R_ItoG = state->_imu->Rot().transpose();
+  updaterFlexRelativeYaw->reset_nominal_mount(
+      R_ItoG.transpose() * R_BtoG);
+  Eigen::Matrix<double, 1, 1> zero;
+  zero.setZero();
+  state->_flex_yaw->set_value(zero);
+  state->_flex_yaw->set_fej(zero);
+  for (auto &entry : state->_clones_flex_yaw) {
+    entry.second->set_value(zero);
+    entry.second->set_fej(zero);
+  }
+  flex_yaw_last_process_noise_time_ = timestamp;
+  return true;
+}
+
+FlexRelativeYawDiagnostics VioManager::feed_flex_relative_yaw_factor(
+    double anchor_timestamp, double current_timestamp,
+    const Eigen::Matrix3d &fc_delta_R_current_to_previous) {
+  if (updaterFlexRelativeYaw == nullptr) {
+    FlexRelativeYawDiagnostics diagnostics;
+    diagnostics.anchor_timestamp_s = anchor_timestamp;
+    diagnostics.current_timestamp_s = current_timestamp;
+    diagnostics.decision = "reject_disabled";
+    return diagnostics;
+  }
+  return updaterFlexRelativeYaw->update(
+      state, anchor_timestamp, current_timestamp,
+      fc_delta_R_current_to_previous);
+}
+
+bool VioManager::queue_flex_relative_yaw_initialization(
+    double current_timestamp, const Eigen::Matrix3d &R_BtoG) {
+  if (updaterFlexRelativeYaw == nullptr || !R_BtoG.allFinite() ||
+      !std::isfinite(current_timestamp))
+    return false;
+  pending_flex_relative_yaw_kind_ = PendingFlexRelativeYawKind::INITIALIZE;
+  pending_flex_anchor_timestamp_ = current_timestamp;
+  pending_flex_current_timestamp_ = current_timestamp;
+  pending_flex_rotation_ = R_BtoG;
+  return true;
+}
+
+bool VioManager::queue_flex_relative_yaw_factor(
+    double anchor_timestamp, double current_timestamp,
+    const Eigen::Matrix3d &fc_delta_R_current_to_previous) {
+  if (updaterFlexRelativeYaw == nullptr ||
+      !updaterFlexRelativeYaw->initialized() ||
+      !fc_delta_R_current_to_previous.allFinite() ||
+      !(current_timestamp > anchor_timestamp))
+    return false;
+  pending_flex_relative_yaw_kind_ = PendingFlexRelativeYawKind::UPDATE;
+  pending_flex_anchor_timestamp_ = anchor_timestamp;
+  pending_flex_current_timestamp_ = current_timestamp;
+  pending_flex_rotation_ = fc_delta_R_current_to_previous;
+  return true;
 }
 
 bool VioManager::configure_gps_alt_coupled_update(
@@ -2564,7 +2629,54 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
   // NOTE: if the state is already at the given time (can happen in sim)
   // NOTE: then no need to prop since we already are at the desired timestep
   if (state->_timestamp != message.timestamp) {
+    if (updaterFlexRelativeYaw != nullptr &&
+        updaterFlexRelativeYaw->initialized() &&
+        flex_yaw_last_process_noise_time_ >= 0.0) {
+      const double dt_flex =
+          message.timestamp - flex_yaw_last_process_noise_time_;
+      if (std::isfinite(dt_flex) && dt_flex > 0.0) {
+        const double sigma = params.state_options.flex_yaw_walk_sigma;
+        StateHelper::inject_flex_yaw_noise(state, sigma * sigma * dt_flex);
+        flex_yaw_last_process_noise_time_ = message.timestamp;
+      }
+    }
     propagator->propagate_and_clone(state, message.timestamp);
+  }
+
+  // FC relative-yaw is a camera-time factor. Consume it after the current
+  // clone exists and before visual residuals alter the clone/current-state
+  // correlation. This makes the current attitude correction causal for the
+  // next IMU propagation instead of redirecting it mainly into old clones.
+  if (pending_flex_relative_yaw_kind_ !=
+          PendingFlexRelativeYawKind::NONE &&
+      std::fabs(pending_flex_current_timestamp_ - message.timestamp) <= 1e-6) {
+    if (pending_flex_relative_yaw_kind_ ==
+        PendingFlexRelativeYawKind::INITIALIZE) {
+      const bool initialized = initialize_flex_relative_yaw_factor(
+          message.timestamp, pending_flex_rotation_);
+      flex_relative_yaw_last_diagnostics_ = {};
+      flex_relative_yaw_last_diagnostics_.anchor_timestamp_s =
+          message.timestamp;
+      flex_relative_yaw_last_diagnostics_.current_timestamp_s =
+          message.timestamp;
+      flex_relative_yaw_last_diagnostics_.decision =
+          initialized ? "initialization_reset" : "reject_initialization";
+    } else {
+      flex_relative_yaw_last_diagnostics_ = feed_flex_relative_yaw_factor(
+          pending_flex_anchor_timestamp_, pending_flex_current_timestamp_,
+          pending_flex_rotation_);
+    }
+    pending_flex_relative_yaw_kind_ = PendingFlexRelativeYawKind::NONE;
+  } else if (pending_flex_relative_yaw_kind_ !=
+                 PendingFlexRelativeYawKind::NONE &&
+             pending_flex_current_timestamp_ < message.timestamp - 1e-6) {
+    flex_relative_yaw_last_diagnostics_ = {};
+    flex_relative_yaw_last_diagnostics_.anchor_timestamp_s =
+        pending_flex_anchor_timestamp_;
+    flex_relative_yaw_last_diagnostics_.current_timestamp_s =
+        pending_flex_current_timestamp_;
+    flex_relative_yaw_last_diagnostics_.decision = "reject_stale_pending";
+    pending_flex_relative_yaw_kind_ = PendingFlexRelativeYawKind::NONE;
   }
   rT3 = boost::posix_time::microsec_clock::local_time();
 

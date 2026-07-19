@@ -149,6 +149,10 @@ public:
   /// Map between imaging times and clone poses (q_GtoIi, p_IiinG)
   std::map<double, std::shared_ptr<ov_type::PoseJPL>> _clones_IMU;
 
+  /// Experimental scalar body-to-D455 flex yaw and its camera-time clones.
+  std::shared_ptr<ov_type::Vec> _flex_yaw;
+  std::map<double, std::shared_ptr<ov_type::Vec>> _clones_flex_yaw;
+
   /// Our current set of SLAM features (3d positions)
   std::unordered_map<size_t, std::shared_ptr<ov_type::Landmark>> _features_SLAM;
 

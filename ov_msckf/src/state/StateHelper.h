@@ -427,6 +427,9 @@ public:
   /// Inject noise into the h_offset diagonal element (Architecture G random walk).
   static void inject_h_offset_noise(std::shared_ptr<State> state, double noise);
 
+  /// Inject random-walk variance into the experimental flex-yaw state.
+  static void inject_flex_yaw_noise(std::shared_ptr<State> state, double noise);
+
   /**
    * @brief Z-only EKF covariance update: only reduce P_zz, cross-terms unchanged.
    *

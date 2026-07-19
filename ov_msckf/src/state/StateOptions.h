@@ -89,6 +89,12 @@ struct StateOptions {
   double gps_h_offset_init_sigma = 5.0;   // initial uncertainty (m)
   double gps_h_offset_walk_sigma = 0.02;  // random walk std per sqrt(s) (m/sqrt(s))
 
+  // Experimental FC relative-yaw factor. Disabled by default and enabled only
+  // by the ROS-free runner's explicit CLI switch.
+  bool use_flex_yaw_state = false;
+  double flex_yaw_init_sigma = 0.10 * M_PI / 180.0;
+  double flex_yaw_walk_sigma = 0.02 * M_PI / 180.0;
+
   /// What representation our features are in (msckf features)
   ov_type::LandmarkRepresentation::Representation feat_rep_msckf = ov_type::LandmarkRepresentation::Representation::GLOBAL_3D;
 
@@ -132,6 +138,9 @@ struct StateOptions {
       parser->parse_config("max_msckf_in_update", max_msckf_in_update);
       parser->parse_config("num_aruco", max_aruco_features);
       parser->parse_config("max_cameras", num_cameras);
+      parser->parse_config("use_flex_yaw_state", use_flex_yaw_state, false);
+      parser->parse_config("flex_yaw_init_sigma", flex_yaw_init_sigma, false);
+      parser->parse_config("flex_yaw_walk_sigma", flex_yaw_walk_sigma, false);
 
       // Feature representations
       std::string rep1 = ov_type::LandmarkRepresentation::as_string(feat_rep_msckf);
@@ -176,6 +185,9 @@ struct StateOptions {
     PRINT_DEBUG("  - max_msckf_in_update: %d\n", max_msckf_in_update);
     PRINT_DEBUG("  - max_aruco: %d\n", max_aruco_features);
     PRINT_DEBUG("  - max_cameras: %d\n", num_cameras);
+    PRINT_DEBUG("  - use_flex_yaw_state: %d\n", use_flex_yaw_state);
+    PRINT_DEBUG("  - flex_yaw_init_sigma: %.6g rad\n", flex_yaw_init_sigma);
+    PRINT_DEBUG("  - flex_yaw_walk_sigma: %.6g rad/sqrt(s)\n", flex_yaw_walk_sigma);
     PRINT_DEBUG("  - feat_rep_msckf: %s\n", ov_type::LandmarkRepresentation::as_string(feat_rep_msckf).c_str());
     PRINT_DEBUG("  - feat_rep_slam: %s\n", ov_type::LandmarkRepresentation::as_string(feat_rep_slam).c_str());
     PRINT_DEBUG("  - feat_rep_aruco: %s\n", ov_type::LandmarkRepresentation::as_string(feat_rep_aruco).c_str());

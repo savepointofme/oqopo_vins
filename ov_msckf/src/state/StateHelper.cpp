@@ -1839,6 +1839,14 @@ void StateHelper::inject_h_offset_noise(std::shared_ptr<State> state, double noi
   state->_Cov(state->_h_offset->id(), state->_h_offset->id()) += noise;
 }
 
+void StateHelper::inject_flex_yaw_noise(std::shared_ptr<State> state,
+                                        double noise) {
+  if (!state->_flex_yaw || state->_flex_yaw->id() < 0 ||
+      !std::isfinite(noise) || noise <= 0.0)
+    return;
+  state->_Cov(state->_flex_yaw->id(), state->_flex_yaw->id()) += noise;
+}
+
 void StateHelper::ekf_update_zonly(std::shared_ptr<State> state, double R) {
   int pz_global = state->_imu->p()->id() + 2; // p_z = 3rd element of IMU position
   double P_pz = state->_Cov(pz_global, pz_global);
@@ -2495,6 +2503,17 @@ void StateHelper::augment_clone(std::shared_ptr<State> state, Eigen::Matrix<doub
   // Append the new clone to our clone vector
   state->_clones_IMU[state->_timestamp] = pose;
 
+  if (state->_options.use_flex_yaw_state) {
+    std::shared_ptr<Type> flextemp =
+        StateHelper::clone(state, state->_flex_yaw);
+    std::shared_ptr<Vec> flex = std::dynamic_pointer_cast<Vec>(flextemp);
+    if (flex == nullptr) {
+      PRINT_ERROR(RED "INVALID FLEX OBJECT RETURNED FROM STATEHELPER CLONE\n" RESET);
+      std::exit(EXIT_FAILURE);
+    }
+    state->_clones_flex_yaw[state->_timestamp] = flex;
+  }
+
   // If we are doing time calibration, then our clones are a function of the time offset
   // Logic is based on Mingyang Li and Anastasios I. Mourikis paper:
   // http://journals.sagepub.com/doi/pdf/10.1177/0278364913515286
@@ -2519,6 +2538,11 @@ void StateHelper::marginalize_old_clone(std::shared_ptr<State> state) {
     std::lock_guard<std::mutex> lock(state->_mutex_state);
     assert(marginal_time != INFINITY);
     StateHelper::marginalize(state, state->_clones_IMU.at(marginal_time));
+    auto flex_it = state->_clones_flex_yaw.find(marginal_time);
+    if (flex_it != state->_clones_flex_yaw.end()) {
+      StateHelper::marginalize(state, flex_it->second);
+      state->_clones_flex_yaw.erase(flex_it);
+    }
     // Note that the marginalizer should have already deleted the clone
     // Thus we just need to remove the pointer to it from our state
     state->_clones_IMU.erase(marginal_time);
