@@ -55,3 +55,77 @@ still being treated as flex.
 
 Authoritative comparison output:
 `C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/continuous_yaw_flex_rosfree_stride12_20260719_161121/xy_flex_three_condition_comparison_20260719_v2`.
+
+## Follow-up optimization
+
+Status: **FLEX_XY_OPTIMIZATION_FAILED**.
+
+### Two-timescale SO(3) observer
+
+The slow path absorbs the complete long-term VIO–FC level without a Huber
+clip. The fast path retains the original 12 s time constant, 1.5-degree Huber
+innovation, 0.25 deg/s rate limit, and 6-degree absolute limit. A common slow
+time constant was swept over `45/60/90/120/180/240 s`.
+
+- Maximin selection chose `45 s`.
+- Distance-weighted XY RMSE changed from `173.599 m` to `176.747 m`:
+  **1.81% worse**.
+- Worst flight was **48.26% worse**.
+- Only `1/4` flights improved and LOFO passed only `1/4` holdouts.
+
+Result directory:
+`C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/continuous_yaw_flex_rosfree_stride12_20260719_161121/two_timescale_sweep_v2_20260719/selection`.
+
+### Common positive correction gain
+
+The original scalar observer was held fixed and only one common physical gain
+was swept over `0.1/0.2/0.3/0.4/0.5/0.65/0.8`.
+
+- Maximin selection chose `gain=0.1`.
+- Aggregate XY RMSE improved **4.80%**.
+- fly1/fly3/fly4 improved, but fly2 regressed **0.57%**.
+- LOFO passed `3/4`; therefore the common-gain shadow failed.
+- Larger gains improve the aggregate more strongly but monotonically worsen
+  fly2. At gain `0.8`, aggregate improvement is `25.63%` while fly2 regresses
+  `6.95%`.
+
+Result directory:
+`C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/continuous_yaw_flex_rosfree_stride12_20260719_161121/scalar_gain_sweep_20260719/selection`.
+
+### Sign falsification
+
+Opposite gains `-0.1/-0.2/-0.4/-0.8` were evaluated with the identical GPS
+contract. The maximin result was `-0.1`: aggregate XY RMSE regressed **5.06%**,
+the worst flight regressed **8.35%**, and only `1/4` flights improved. The XY
+correction sign is not the cause of the cross-flight failure.
+
+### Gyro–posterior agreement gate
+
+Saved gyro bias was removed and D455 gyro was integrated over the same 5 Hz FC
+intervals as the VIO posterior. fly2 has the strongest posterior/gyro agreement
+of all four flights:
+
+- increment correlation: `0.861`;
+- final posterior cumulative residual: `28.58 deg`;
+- final gyro cumulative residual: `26.87 deg`.
+
+Nevertheless every positive XY correction gain worsens fly2. A gyro–posterior
+agreement gate would therefore accept, rather than suppress, the harmful fly2
+correction. It cannot make this model pass.
+
+Result directory:
+`C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/continuous_yaw_flex_rosfree_stride12_20260719_161121/gyro_vio_flex_agreement_20260719_v3`.
+
+### Final technical conclusion
+
+Body–D455 yaw flex changes the mapping between the D455 attitude and aircraft
+body attitude. It does not justify rotating already world-referenced VIO XY
+translation increments. Apart from a measured body/D455 translational lever
+arm, the sensor trajectory position is unchanged by this relative yaw. The
+gain, sign, two-timescale, and gyro-gate experiments all reject direct
+flex-to-XY correction as a cross-flight navigation model.
+
+The flex observer must remain output-only. A future navigation experiment must
+instead formulate FC-minus-flex as an explicit relative-yaw measurement with
+innovation covariance and consistent state/covariance feedback; it cannot be
+approximated by rotating the completed XY trajectory.

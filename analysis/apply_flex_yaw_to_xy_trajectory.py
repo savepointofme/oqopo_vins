@@ -50,6 +50,7 @@ def main() -> int:
     parser.add_argument("--flex-output", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--method-name", required=True)
+    parser.add_argument("--flex-gain", type=float, default=1.0)
     args = parser.parse_args()
     if args.output_dir.exists():
         raise RuntimeError(f"refusing to overwrite {args.output_dir}")
@@ -65,13 +66,12 @@ def main() -> int:
     if traj_times[0] < flex_times[0] - 1e-6 or traj_times[-1] > flex_times[-1] + 1e-6:
         raise RuntimeError("flex output does not cover trajectory")
 
-    flex_rad = np.radians(
-        np.interp(
-            traj_times,
-            flex_times,
-            flex.output_flex_yaw_deg.to_numpy(dtype=float),
-        )
+    source_flex_deg = np.interp(
+        traj_times,
+        flex_times,
+        flex.output_flex_yaw_deg.to_numpy(dtype=float),
     )
+    flex_rad = np.radians(args.flex_gain * source_flex_deg)
     positions = trajectory[["x", "y", "z"]].to_numpy(dtype=float)
     increments = np.diff(positions, axis=0)
     midpoint_flex = 0.5 * (flex_rad[:-1] + flex_rad[1:])
@@ -88,8 +88,13 @@ def main() -> int:
             "aircraft_body_qw",
         ]
     ].to_numpy(dtype=float)
-    shadow_at_traj = Slerp(flex_times, Rotation.from_quat(shadow_quaternions))(
+    source_shadow_at_traj = Slerp(flex_times, Rotation.from_quat(shadow_quaternions))(
         traj_times
+    )
+    source_shadow_rpy = source_shadow_at_traj.as_euler("xyz", degrees=True)
+    source_shadow_rpy[:, 2] += (1.0 - args.flex_gain) * source_flex_deg
+    shadow_at_traj = Rotation.from_euler(
+        "xyz", source_shadow_rpy, degrees=True
     ).as_quat()
     corrected = trajectory.copy()
     corrected[["x", "y", "z"]] = corrected_positions
@@ -113,7 +118,8 @@ def main() -> int:
         bias_columns = ["t", "vx", "vy", "vz", "bgx", "bgy", "bgz", "bax", "bay", "baz"]
         bias = read_numeric(args.bias, bias_columns)
         bias_flex = np.radians(
-            np.interp(
+            args.flex_gain
+            * np.interp(
                 bias.t.to_numpy(dtype=float),
                 flex_times,
                 flex.output_flex_yaw_deg.to_numpy(dtype=float),
@@ -138,6 +144,7 @@ def main() -> int:
     receipt = {
         "schema_version": 1,
         "method_name": args.method_name,
+        "flex_gain": args.flex_gain,
         "operation": "rotate_each_post_init_vio_xy_increment_by_negative_causal_flex_yaw",
         "source_traj": str(args.traj),
         "source_traj_sha256": sha256(args.traj),
