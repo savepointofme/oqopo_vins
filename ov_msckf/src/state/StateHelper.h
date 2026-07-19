@@ -86,7 +86,22 @@ public:
                                            //   (time-varying n defeats rank-1 Schur deflation; P indefinite).
                                            //   See constrained_yaw_nullspace_smoke_report.md.
                                            //   CLI exits with error. Unit tests in test_constrained_yaw_nullspace.cpp preserved.
+    FC_GYRO_GUARDED_VISUAL_YAW      = 14, // EXPERIMENTAL_ONLY: robust directional current-yaw gain guard
   };
+
+  struct FcGyroVisualYawGuardConfig {
+    double reference_error_tau_s = 5.0;
+    double reference_error_threshold_deg = 1.0;
+    double reference_innovation_clip_deg = 1.0;
+    double reference_min_dwell_s = 10.0;
+    double step_cap_deg = 0.0;
+  };
+
+  static void set_fc_gyro_visual_yaw_guard_config(
+      const FcGyroVisualYawGuardConfig &cfg);
+  static void reset_fc_gyro_visual_yaw_guard_state();
+  static void observe_fc_gyro_visual_yaw_reference_error(
+      double timestamp, double relative_yaw_error_deg, bool valid);
 
   // Thresholds for VISUAL_YAW_SCHMIDT_GUARDED mode (all configurable via CLI)
   struct SchmidtGuardConfig {
@@ -118,6 +133,11 @@ public:
     VisualYawUpdateMode mode = VisualYawUpdateMode::ORIGINAL;
     double dx_yaw_before_projection_deg = 0.0;
     double dx_yaw_after_projection_deg = 0.0;
+    double guard_reference_error_before_deg = 0.0;
+    double guard_reference_dwell_s = 0.0;
+    double guard_effective_scale = 1.0;
+    bool guard_directional_selected = false;
+    bool guard_step_capped = false;
   };
 
   struct SchmidtYawDiag {
@@ -229,6 +249,21 @@ public:
                         double visual_yaw_update_scale = 1.0,
                         double visual_global_yaw_oc_alpha = 0.0,
                         double visual_bgz_update_scale = 1.0);
+
+  /// Remove the current IMU local-gravity yaw row from a visual Kalman gain,
+  /// while preserving clone-relative orientation, roll/pitch, and every other
+  /// non-protected row. Used by hard_gyro_yaw before both mean and covariance
+  /// updates so visual history remains observable without steering propagated
+  /// yaw or gyro-bias z.
+  static void maskVisualYawGain(std::shared_ptr<State> state,
+                                Eigen::MatrixXd &K,
+                                bool protect_bg_z = true);
+
+  /// Scale only the current IMU local-gravity yaw component of a Kalman gain.
+  /// Clone-relative orientation and all other state rows are unchanged.
+  static void scaleVisualCurrentYawGain(std::shared_ptr<State> state,
+                                        Eigen::MatrixXd &K,
+                                        double scale);
 
   struct UpdateDiagnostics {
     bool valid = false;

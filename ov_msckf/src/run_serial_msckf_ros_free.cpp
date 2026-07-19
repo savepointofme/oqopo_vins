@@ -177,9 +177,18 @@ struct Args {
   std::string output_path = "traj_ros_free.txt";
   bool enable_flex_body_attitude = false;
   bool enable_flex_aware_fc_yaw_update = false;
+  bool enable_fc_gyro_visual_yaw_guard = false;
   std::string flex_fc_attitude_path;
   std::string flex_body_attitude_output_path;
   std::string flex_fc_factor_diag_path;
+  std::string fc_gyro_visual_yaw_diag_path;
+  double fc_gyro_agreement_deg = 0.35;
+  double fc_gyro_visual_yaw_scale = 0.95;
+  double fc_gyro_visual_yaw_reference_tau_s = 5.0;
+  double fc_gyro_visual_yaw_reference_threshold_deg = 1.0;
+  double fc_gyro_visual_yaw_reference_clip_deg = 1.0;
+  double fc_gyro_visual_yaw_reference_dwell_s = 10.0;
+  double fc_gyro_visual_yaw_step_cap_deg = 0.0;
   std::string init_from_fc_path;
   std::string video_path;
   std::string video_cam_path;    // [中文] 仅相机 + 光流轨迹视频 (cam0/cam1 并排, 带 TrackBase 历史线)
@@ -426,6 +435,16 @@ void print_help() {
                "                        Independent shadow CSV beside the original trajectory.\n"
                "  --flex-fc-factor-diag PATH\n"
                "                        Per-factor EKF residual/NIS/state diagnostic CSV.\n"
+               "  --enable-fc-gyro-visual-yaw-guard\n"
+               "                        Enable experimental robust directional visual-yaw guard.\n"
+               "  --fc-gyro-agreement-deg DEG            default 0.35\n"
+               "  --fc-gyro-visual-yaw-scale S            default 0.95\n"
+               "  --fc-gyro-visual-yaw-reference-tau-s S       default 5\n"
+               "  --fc-gyro-visual-yaw-reference-threshold-deg DEG  default 1.0\n"
+               "  --fc-gyro-visual-yaw-reference-clip-deg DEG   default 1.0\n"
+               "  --fc-gyro-visual-yaw-reference-dwell-s S      default 10\n"
+               "  --fc-gyro-visual-yaw-step-cap-deg DEG        default 0 (off)\n"
+               "  --fc-gyro-visual-yaw-diag PATH               per-frame guard diagnostic CSV\n"
                "  --video PATH          Record dashboard to MP4\n"
                "  --video-cam PATH      Record camera-only (cam0/cam1 w/ optical-flow tracks) to MP4\n"
                "  --video-fps N         Video FPS (default 20)\n"
@@ -460,7 +479,7 @@ void print_help() {
                "                         baseline = FEJ Jacobians + current-gauge OC, preserving current best recipe\n"
                "                         oc-fej = FEJ Jacobians + FEJ-gauge OC projection\n"
                "  --no-vio-yaw-update   Alias for --vio-yaw-update-scale 0.0\n"
-               "  --vio-yaw-update-mode M   original|per_block_scale|global_yaw_oc_projection|current_only_scale|hard_gyro_yaw|a_strict_yaw_dx0\n"
+               "  --vio-yaw-update-mode M   original|per_block_scale|global_yaw_oc_projection|current_only_scale|hard_gyro_yaw|fc_gyro_guarded_visual_yaw|a_strict_yaw_dx0\n"
                "                            visual_yaw_schmidt_current_gauge|visual_yaw_schmidt_fej_gauge\n"
                "  --vio-yaw-update-scale S  Scale visual yaw correction for *_scale modes (1=orig, 0=off)\n"
                "  --vio-global-yaw-oc-alpha A  H-projection alpha for global_yaw_oc_projection (0=orig, 1=full)\n"
@@ -568,12 +587,30 @@ bool parse_args(int argc, char **argv, Args &a) {
       a.enable_flex_body_attitude = true;
     else if (s == "--enable-flex-aware-fc-yaw-update")
       a.enable_flex_aware_fc_yaw_update = true;
+    else if (s == "--enable-fc-gyro-visual-yaw-guard")
+      a.enable_fc_gyro_visual_yaw_guard = true;
     else if (s == "--flex-fc-attitude")
       a.flex_fc_attitude_path = next("--flex-fc-attitude");
     else if (s == "--flex-body-attitude-output")
       a.flex_body_attitude_output_path = next("--flex-body-attitude-output");
     else if (s == "--flex-fc-factor-diag")
       a.flex_fc_factor_diag_path = next("--flex-fc-factor-diag");
+    else if (s == "--fc-gyro-agreement-deg")
+      a.fc_gyro_agreement_deg = std::atof(next("--fc-gyro-agreement-deg").c_str());
+    else if (s == "--fc-gyro-visual-yaw-scale")
+      a.fc_gyro_visual_yaw_scale = std::atof(next("--fc-gyro-visual-yaw-scale").c_str());
+    else if (s == "--fc-gyro-visual-yaw-reference-tau-s")
+      a.fc_gyro_visual_yaw_reference_tau_s = std::atof(next("--fc-gyro-visual-yaw-reference-tau-s").c_str());
+    else if (s == "--fc-gyro-visual-yaw-reference-threshold-deg")
+      a.fc_gyro_visual_yaw_reference_threshold_deg = std::atof(next("--fc-gyro-visual-yaw-reference-threshold-deg").c_str());
+    else if (s == "--fc-gyro-visual-yaw-reference-clip-deg")
+      a.fc_gyro_visual_yaw_reference_clip_deg = std::atof(next("--fc-gyro-visual-yaw-reference-clip-deg").c_str());
+    else if (s == "--fc-gyro-visual-yaw-reference-dwell-s")
+      a.fc_gyro_visual_yaw_reference_dwell_s = std::atof(next("--fc-gyro-visual-yaw-reference-dwell-s").c_str());
+    else if (s == "--fc-gyro-visual-yaw-step-cap-deg")
+      a.fc_gyro_visual_yaw_step_cap_deg = std::atof(next("--fc-gyro-visual-yaw-step-cap-deg").c_str());
+    else if (s == "--fc-gyro-visual-yaw-diag")
+      a.fc_gyro_visual_yaw_diag_path = next("--fc-gyro-visual-yaw-diag");
     else if (s == "--video") a.video_path = next("--video");
     else if (s == "--video-cam") a.video_cam_path = next("--video-cam");
     else if (s == "--video-fps") a.video_fps = std::atoi(next("--video-fps").c_str());
@@ -771,9 +808,10 @@ bool parse_args(int argc, char **argv, Args &a) {
     print_help();
     return false;
   }
-  if ((a.enable_flex_body_attitude || a.enable_flex_aware_fc_yaw_update) &&
+  if ((a.enable_flex_body_attitude || a.enable_flex_aware_fc_yaw_update ||
+       a.enable_fc_gyro_visual_yaw_guard) &&
       a.flex_fc_attitude_path.empty()) {
-    std::cerr << "flex shadow/factor requires --flex-fc-attitude\n";
+    std::cerr << "FC attitude feature requires --flex-fc-attitude\n";
     return false;
   }
   if (!a.enable_flex_body_attitude &&
@@ -786,8 +824,26 @@ bool parse_args(int argc, char **argv, Args &a) {
     std::cerr << "--flex-fc-factor-diag requires --enable-flex-aware-fc-yaw-update\n";
     return false;
   }
+  if (!a.enable_fc_gyro_visual_yaw_guard &&
+      !a.fc_gyro_visual_yaw_diag_path.empty()) {
+    std::cerr << "--fc-gyro-visual-yaw-diag requires --enable-fc-gyro-visual-yaw-guard\n";
+    return false;
+  }
+  if (a.enable_fc_gyro_visual_yaw_guard &&
+      (!(a.fc_gyro_agreement_deg > 0.0) ||
+       a.fc_gyro_visual_yaw_scale < 0.0 ||
+       a.fc_gyro_visual_yaw_scale > 1.0 ||
+       !(a.fc_gyro_visual_yaw_reference_tau_s > 0.0) ||
+       a.fc_gyro_visual_yaw_reference_threshold_deg < 0.0 ||
+       a.fc_gyro_visual_yaw_reference_clip_deg < 0.0 ||
+       a.fc_gyro_visual_yaw_reference_dwell_s < 0.0 ||
+       a.fc_gyro_visual_yaw_step_cap_deg < 0.0)) {
+    std::cerr << "invalid FC/gyro visual-yaw guard parameters\n";
+    return false;
+  }
   if (!a.enable_flex_body_attitude &&
       !a.enable_flex_aware_fc_yaw_update &&
+      !a.enable_fc_gyro_visual_yaw_guard &&
       !a.flex_fc_attitude_path.empty()) {
     std::cerr << "--flex-fc-attitude requires a flex shadow/factor switch\n";
     return false;
@@ -1083,6 +1139,33 @@ int main(int argc, char **argv) {
                "(h_offset Vec(1) added to state, init_sigma=%.1fm walk_sigma=%.4fm/sqrt(s))\n" RESET,
                params.state_options.gps_h_offset_init_sigma,
                params.state_options.gps_h_offset_walk_sigma);
+  }
+  if (args.enable_fc_gyro_visual_yaw_guard) {
+    params.vio_yaw_update_mode = "fc_gyro_guarded_visual_yaw";
+    params.vio_yaw_update_scale = 1.0;
+    StateHelper::FcGyroVisualYawGuardConfig guard_cfg;
+    guard_cfg.reference_error_tau_s =
+        args.fc_gyro_visual_yaw_reference_tau_s;
+    guard_cfg.reference_error_threshold_deg =
+        args.fc_gyro_visual_yaw_reference_threshold_deg;
+    guard_cfg.reference_innovation_clip_deg =
+        args.fc_gyro_visual_yaw_reference_clip_deg;
+    guard_cfg.reference_min_dwell_s =
+        args.fc_gyro_visual_yaw_reference_dwell_s;
+    guard_cfg.step_cap_deg = args.fc_gyro_visual_yaw_step_cap_deg;
+    StateHelper::set_fc_gyro_visual_yaw_guard_config(guard_cfg);
+    PRINT_WARNING(YELLOW "[FC-GYRO-YAW-GUARD] EXPERIMENTAL_ONLY: "
+                         "agreement=%.3f deg guarded_scale=%.3f "
+                         "reference_tau=%.1fs reference_threshold=%.3fdeg "
+                         "reference_clip=%.3fdeg dwell=%.1fs step_cap=%.3fdeg; "
+                         "FC invalid selects baseline gain\n" RESET,
+                  args.fc_gyro_agreement_deg,
+                  args.fc_gyro_visual_yaw_scale,
+                  args.fc_gyro_visual_yaw_reference_tau_s,
+                  args.fc_gyro_visual_yaw_reference_threshold_deg,
+                  args.fc_gyro_visual_yaw_reference_clip_deg,
+                  args.fc_gyro_visual_yaw_reference_dwell_s,
+                  args.fc_gyro_visual_yaw_step_cap_deg);
   }
   if (args.enable_flex_aware_fc_yaw_update) {
     params.state_options.use_flex_yaw_state = true;
@@ -1403,7 +1486,8 @@ int main(int argc, char **argv) {
   if (!args.gps_path.empty())
     DatasetReaderEuroc::load_gps(args.gps_path, gps);
   if (args.enable_flex_body_attitude ||
-      args.enable_flex_aware_fc_yaw_update) {
+      args.enable_flex_aware_fc_yaw_update ||
+      args.enable_fc_gyro_visual_yaw_guard) {
     try {
       flex_fc_attitude =
           load_flex_fc_attitude_stream(args.flex_fc_attitude_path);
@@ -1567,6 +1651,23 @@ int main(int argc, char **argv) {
       Eigen::Matrix3d::Identity();
   std::size_t flex_factor_accepted_count = 0;
   std::size_t flex_factor_rejected_count = 0;
+  std::ofstream fc_gyro_visual_yaw_diag_out;
+  std::size_t fc_gyro_guard_fc_index = 0;
+  bool fc_gyro_guard_nominal_initialized = false;
+  bool fc_gyro_guard_have_anchor = false;
+  double fc_gyro_guard_anchor_time_s =
+      std::numeric_limits<double>::quiet_NaN();
+  Eigen::Matrix3d fc_gyro_guard_anchor_R_BtoG =
+      Eigen::Matrix3d::Identity();
+  Eigen::Matrix3d fc_gyro_guard_nominal_M_BtoI =
+      Eigen::Matrix3d::Identity();
+  Eigen::Matrix3d fc_gyro_guard_initial_R_GtoI =
+      Eigen::Matrix3d::Identity();
+  Eigen::Matrix3d fc_gyro_guard_initial_R_BtoG =
+      Eigen::Matrix3d::Identity();
+  Eigen::Vector3d fc_gyro_guard_anchor_bg = Eigen::Vector3d::Zero();
+  std::size_t fc_gyro_guard_attenuated_count = 0;
+  std::size_t fc_gyro_guard_baseline_count = 0;
   if (args.enable_flex_aware_fc_yaw_update) {
     if (args.flex_fc_factor_diag_path.empty()) {
       const fs::path trajectory_path(args.output_path);
@@ -1597,6 +1698,33 @@ int main(int argc, char **argv) {
            "velocity_delta_norm_mps,gyro_bias_delta_norm_radps,"
            "accel_bias_delta_norm_mps2\n";
     flex_fc_factor_diag_out << std::fixed << std::setprecision(9);
+  }
+  if (args.enable_fc_gyro_visual_yaw_guard) {
+    if (args.fc_gyro_visual_yaw_diag_path.empty()) {
+      const fs::path trajectory_path(args.output_path);
+      args.fc_gyro_visual_yaw_diag_path =
+          (trajectory_path.parent_path() / "fc_gyro_visual_yaw_guard.csv").string();
+    }
+    const fs::path guard_diag_path(args.fc_gyro_visual_yaw_diag_path);
+    if (!guard_diag_path.parent_path().empty())
+      fs::create_directories(guard_diag_path.parent_path());
+    fc_gyro_visual_yaw_diag_out.open(
+        args.fc_gyro_visual_yaw_diag_path,
+        std::ofstream::out | std::ofstream::trunc);
+    if (!fc_gyro_visual_yaw_diag_out.is_open()) {
+      PRINT_ERROR(RED "[FC-GYRO-YAW-GUARD] cannot open diagnostic: %s\n" RESET,
+                  args.fc_gyro_visual_yaw_diag_path.c_str());
+      return EXIT_FAILURE;
+    }
+    fc_gyro_visual_yaw_diag_out
+        << "# schema=rosfree_fc_gyro_guarded_visual_yaw_v1\n"
+        << "# selector=relative_FC_SO3_vs_D455_gyro_minus_saved_bg; "
+           "absolute_fc_yaw_used_only_for_nominal_mount\n"
+        << "camera_time_s,status,fc_valid,gyro_valid,interval_s,"
+           "imu_fc_so3_error_deg,imu_fc_body_yaw_error_deg,"
+           "vio_fc_relative_yaw_error_deg,"
+           "selected_visual_yaw_gain_scale\n";
+    fc_gyro_visual_yaw_diag_out << std::fixed << std::setprecision(9);
   }
   if (args.enable_flex_body_attitude) {
     if (args.flex_body_attitude_output_path.empty()) {
@@ -1685,6 +1813,56 @@ int main(int argc, char **argv) {
   // active with --gps even when GPS is not fused into the EKF.
   long long last_diag_gps_i = -1;
   const double INF = std::numeric_limits<double>::infinity();
+  auto integrate_gyro_relative = [&](double begin_s, double end_s,
+                                     const Eigen::Vector3d &bias_g,
+                                     Eigen::Matrix3d &delta_R_current_to_previous) {
+    delta_R_current_to_previous.setIdentity();
+    if (!(end_s > begin_s) || imu.size() < 2)
+      return false;
+    auto gyro_at = [&](double timestamp_s, Eigen::Vector3d &gyro) {
+      auto upper = std::lower_bound(
+          imu.begin(), imu.end(), timestamp_s,
+          [](const DatasetReaderEuroc::ImuSample &sample, double value) {
+            return sample.timestamp < value;
+          });
+      if (upper == imu.begin() || upper == imu.end())
+        return false;
+      if (std::fabs(upper->timestamp - timestamp_s) < 1e-9) {
+        gyro = upper->gyro;
+        return gyro.allFinite();
+      }
+      const auto lower = std::prev(upper);
+      const double gap_s = upper->timestamp - lower->timestamp;
+      if (!(gap_s > 0.0) || gap_s > 0.02)
+        return false;
+      const double alpha = (timestamp_s - lower->timestamp) / gap_s;
+      gyro = (1.0 - alpha) * lower->gyro + alpha * upper->gyro;
+      return gyro.allFinite();
+    };
+
+    std::vector<double> knots;
+    knots.push_back(begin_s);
+    auto first = std::upper_bound(
+        imu.begin(), imu.end(), begin_s,
+        [](double value, const DatasetReaderEuroc::ImuSample &sample) {
+          return value < sample.timestamp;
+        });
+    for (auto it = first; it != imu.end() && it->timestamp < end_s; ++it)
+      knots.push_back(it->timestamp);
+    knots.push_back(end_s);
+    for (std::size_t k = 0; k + 1 < knots.size(); ++k) {
+      const double dt_s = knots[k + 1] - knots[k];
+      if (!(dt_s > 0.0) || dt_s > 0.02)
+        return false;
+      Eigen::Vector3d gyro0, gyro1;
+      if (!gyro_at(knots[k], gyro0) || !gyro_at(knots[k + 1], gyro1))
+        return false;
+      const Eigen::Vector3d omega = 0.5 * (gyro0 + gyro1) - bias_g;
+      delta_R_current_to_previous =
+          ov_core::exp_so3(-omega * dt_s) * delta_R_current_to_previous;
+    }
+    return delta_R_current_to_previous.allFinite();
+  };
   double t_init_done = -1; // [中文] 滤波器完成初始化的时刻
   std::deque<std::pair<double, Eigen::Vector3d>> vio_for_align;
   int frame_idx = 0;
@@ -2066,6 +2244,122 @@ int main(int argc, char **argv) {
           << (args.adaptive_stride ? adaptive_decision.recommended_stride : args.cam_subsample) << ","
           << (do_cam_feed ? 1 : 0) << "\n";
     }
+    bool fc_gyro_guard_advance_anchor = false;
+    Eigen::Matrix3d fc_gyro_guard_current_R_BtoG =
+        Eigen::Matrix3d::Identity();
+    if (args.enable_fc_gyro_visual_yaw_guard && do_cam_feed &&
+        sys->initialized()) {
+      auto state_before_camera = sys->get_state();
+      if (!fc_gyro_guard_nominal_initialized) {
+        Eigen::Matrix3d initial_fc_R_BtoG = Eigen::Matrix3d::Identity();
+        std::size_t initial_fc_index = fc_gyro_guard_fc_index;
+        const double state_time_s = state_before_camera->_timestamp;
+        if (interpolate_flex_fc_attitude_at(
+                flex_fc_attitude, state_time_s, 0.45,
+                initial_fc_R_BtoG, initial_fc_index)) {
+          fc_gyro_guard_nominal_M_BtoI =
+              state_before_camera->_imu->Rot() * initial_fc_R_BtoG;
+          fc_gyro_guard_initial_R_GtoI =
+              state_before_camera->_imu->Rot();
+          fc_gyro_guard_initial_R_BtoG = initial_fc_R_BtoG;
+          fc_gyro_guard_anchor_time_s = state_time_s;
+          fc_gyro_guard_anchor_R_BtoG = initial_fc_R_BtoG;
+          fc_gyro_guard_anchor_bg = state_before_camera->_imu->bias_g();
+          fc_gyro_guard_have_anchor = true;
+          fc_gyro_guard_nominal_initialized = true;
+        }
+      }
+
+      const bool fc_valid = interpolate_flex_fc_attitude_at(
+          flex_fc_attitude, t_cam, 0.45,
+          fc_gyro_guard_current_R_BtoG, fc_gyro_guard_fc_index);
+      bool gyro_valid = false;
+      double so3_error_deg = std::numeric_limits<double>::quiet_NaN();
+      double body_yaw_error_deg = std::numeric_limits<double>::quiet_NaN();
+      double vio_fc_relative_yaw_error_deg =
+          std::numeric_limits<double>::quiet_NaN();
+      double selected_scale = 1.0;
+      std::string guard_status = "baseline_invalid_fc";
+      if (fc_valid && fc_gyro_guard_nominal_initialized &&
+          fc_gyro_guard_have_anchor) {
+        Eigen::Matrix3d gyro_delta_R_current_to_previous =
+            Eigen::Matrix3d::Identity();
+        gyro_valid = integrate_gyro_relative(
+            fc_gyro_guard_anchor_time_s, t_cam,
+            fc_gyro_guard_anchor_bg, gyro_delta_R_current_to_previous);
+        if (gyro_valid) {
+          const Eigen::Matrix3d fc_delta_R_current_to_previous =
+              fc_gyro_guard_current_R_BtoG.transpose() *
+              fc_gyro_guard_anchor_R_BtoG;
+          const Eigen::Matrix3d fc_delta_R_I =
+              fc_gyro_guard_nominal_M_BtoI *
+              fc_delta_R_current_to_previous *
+              fc_gyro_guard_nominal_M_BtoI.transpose();
+          const Eigen::Vector3d error_so3 = ov_core::log_so3(
+              gyro_delta_R_current_to_previous * fc_delta_R_I.transpose());
+          const Eigen::Vector3d body_yaw_axis_I =
+              fc_gyro_guard_nominal_M_BtoI * Eigen::Vector3d::UnitZ();
+          so3_error_deg = error_so3.norm() * 180.0 / M_PI;
+          body_yaw_error_deg =
+              error_so3.dot(body_yaw_axis_I.normalized()) * 180.0 / M_PI;
+          const Eigen::Matrix3d predicted_R_GtoI =
+              gyro_delta_R_current_to_previous *
+              state_before_camera->_imu->Rot();
+          const Eigen::Matrix3d vio_delta_R_current_to_initial =
+              predicted_R_GtoI * fc_gyro_guard_initial_R_GtoI.transpose();
+          const Eigen::Matrix3d fc_delta_R_current_to_initial =
+              fc_gyro_guard_current_R_BtoG.transpose() *
+              fc_gyro_guard_initial_R_BtoG;
+          const Eigen::Matrix3d fc_delta_R_I_from_initial =
+              fc_gyro_guard_nominal_M_BtoI *
+              fc_delta_R_current_to_initial *
+              fc_gyro_guard_nominal_M_BtoI.transpose();
+          const Eigen::Vector3d vio_fc_relative_error_so3 = ov_core::log_so3(
+              vio_delta_R_current_to_initial *
+              fc_delta_R_I_from_initial.transpose());
+          vio_fc_relative_yaw_error_deg =
+              vio_fc_relative_error_so3.dot(body_yaw_axis_I.normalized()) *
+              180.0 / M_PI;
+          StateHelper::observe_fc_gyro_visual_yaw_reference_error(
+              t_cam, vio_fc_relative_yaw_error_deg, true);
+          if (so3_error_deg <= args.fc_gyro_agreement_deg) {
+            selected_scale = args.fc_gyro_visual_yaw_scale;
+            guard_status = "reference_eligible_fc_gyro_agree";
+            ++fc_gyro_guard_attenuated_count;
+          } else {
+            guard_status = "baseline_fc_gyro_disagree";
+            ++fc_gyro_guard_baseline_count;
+          }
+        } else {
+          guard_status = "baseline_invalid_gyro_interval";
+          ++fc_gyro_guard_baseline_count;
+        }
+        fc_gyro_guard_advance_anchor = true;
+      } else if (fc_valid && fc_gyro_guard_nominal_initialized) {
+        guard_status = "baseline_resume_after_gap";
+        fc_gyro_guard_advance_anchor = true;
+        ++fc_gyro_guard_baseline_count;
+      } else {
+        fc_gyro_guard_have_anchor = false;
+        ++fc_gyro_guard_baseline_count;
+      }
+      if (!gyro_valid) {
+        StateHelper::observe_fc_gyro_visual_yaw_reference_error(
+            t_cam, 0.0, false);
+      }
+      sys->set_vio_yaw_update_scale(selected_scale);
+      fc_gyro_visual_yaw_diag_out
+          << t_cam << ',' << guard_status << ',' << (fc_valid ? 1 : 0)
+          << ',' << (gyro_valid ? 1 : 0) << ',';
+      if (fc_gyro_guard_have_anchor)
+        fc_gyro_visual_yaw_diag_out << t_cam - fc_gyro_guard_anchor_time_s;
+      else
+        fc_gyro_visual_yaw_diag_out << "nan";
+      fc_gyro_visual_yaw_diag_out << ',' << so3_error_deg << ','
+          << body_yaw_error_deg << ',' << vio_fc_relative_yaw_error_deg
+          << ',' << selected_scale << '\n';
+    }
+
     bool flex_factor_initialization_queued = false;
     bool flex_factor_update_queued = false;
     if (args.enable_flex_aware_fc_yaw_update && do_cam_feed &&
@@ -2128,6 +2422,13 @@ int main(int argc, char **argv) {
         adaptive_raw_frames_since_feed = 0;
       if (args.camera_frame_adaptive)
         camera_adaptive_stats.last_feed_time = t_cam;
+      if (args.enable_fc_gyro_visual_yaw_guard &&
+          fc_gyro_guard_advance_anchor) {
+        fc_gyro_guard_anchor_time_s = t_cam;
+        fc_gyro_guard_anchor_R_BtoG = fc_gyro_guard_current_R_BtoG;
+        fc_gyro_guard_anchor_bg = sys->get_state()->_imu->bias_g();
+        fc_gyro_guard_have_anchor = true;
+      }
     } else {
       skipped_image_count++;
     }
@@ -2956,6 +3257,19 @@ int main(int argc, char **argv) {
     PRINT_INFO(GREEN "[FC-FLEX-FACTOR] diagnostic=%s accepted=%zu rejected_or_held=%zu\n" RESET,
                args.flex_fc_factor_diag_path.c_str(),
                flex_factor_accepted_count, flex_factor_rejected_count);
+  }
+  if (fc_gyro_visual_yaw_diag_out.is_open()) {
+    fc_gyro_visual_yaw_diag_out.flush();
+    if (!fc_gyro_visual_yaw_diag_out.good()) {
+      PRINT_ERROR(RED "[FC-GYRO-YAW-GUARD] diagnostic write failed: %s\n" RESET,
+                  args.fc_gyro_visual_yaw_diag_path.c_str());
+      return EXIT_FAILURE;
+    }
+    fc_gyro_visual_yaw_diag_out.close();
+    PRINT_INFO(GREEN "[FC-GYRO-YAW-GUARD] diagnostic=%s attenuated=%zu baseline=%zu\n" RESET,
+               args.fc_gyro_visual_yaw_diag_path.c_str(),
+               fc_gyro_guard_attenuated_count,
+               fc_gyro_guard_baseline_count);
   }
   if (!args.camera_stride_audit_path.empty()) {
     std::vector<double> processed_dt;

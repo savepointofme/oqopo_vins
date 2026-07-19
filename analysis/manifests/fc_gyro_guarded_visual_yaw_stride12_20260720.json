@@ -1,0 +1,78 @@
+{
+  "out_dir": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/consistent_gyro_yaw_stride12_20260720/four_flight_baseline_vs_reference_guard",
+  "primary_condition": "reference_error_guard_thr1p0_dwell10_scale0p95",
+  "runs": [
+    {
+      "flight_name": "fly1", "method_name": "baseline_stride12",
+      "gps": "D:/vscode_dir/open_vins_flex_baseline_20260719/config/d455_fly1/fc_gps_cam_time.csv",
+      "vio_traj": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/continuous_yaw_flex_rosfree_stride12_20260719_161121/full_smoothed_fly1_fly2/fly1/traj.txt",
+      "vio_bias": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/continuous_yaw_flex_rosfree_stride12_20260719_161121/full_smoothed_fly1_fly2/fly1/traj.txt.bias",
+      "vio_diag": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/continuous_yaw_flex_rosfree_stride12_20260719_161121/full_smoothed_fly1_fly2/fly1/diag.csv",
+      "vio_yaw_diag": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/continuous_yaw_flex_rosfree_stride12_20260719_161121/full_smoothed_fly1_fly2/fly1/vio_yaw_diag.csv",
+      "t0": 934.2, "t1": 1644.8
+    },
+    {
+      "flight_name": "fly1", "method_name": "reference_error_guard_thr1p0_dwell10_scale0p95",
+      "gps": "D:/vscode_dir/open_vins_flex_baseline_20260719/config/d455_fly1/fc_gps_cam_time.csv",
+      "vio_traj": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/consistent_gyro_yaw_stride12_20260720/fly1_reference_error_guard_thr1p0_dwell10_scale0p95/traj.txt",
+      "vio_bias": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/consistent_gyro_yaw_stride12_20260720/fly1_reference_error_guard_thr1p0_dwell10_scale0p95/traj.txt.bias",
+      "vio_diag": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/consistent_gyro_yaw_stride12_20260720/fly1_reference_error_guard_thr1p0_dwell10_scale0p95/diag.csv",
+      "vio_yaw_diag": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/consistent_gyro_yaw_stride12_20260720/fly1_reference_error_guard_thr1p0_dwell10_scale0p95/vio_yaw_diag.csv",
+      "t0": 934.2, "t1": 1644.8
+    },
+    {
+      "flight_name": "fly2", "method_name": "baseline_stride12",
+      "gps": "C:/Users/baloney/Desktop/20260518_gsmq_d455_fly2/result/fc_rebuild_20260525/gps_from_mems_offset447p5_cam_time.csv",
+      "vio_traj": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/continuous_yaw_flex_rosfree_stride12_20260719_161121/full_smoothed_fly1_fly2/fly2/traj.txt",
+      "vio_bias": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/continuous_yaw_flex_rosfree_stride12_20260719_161121/full_smoothed_fly1_fly2/fly2/traj.txt.bias",
+      "vio_diag": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/continuous_yaw_flex_rosfree_stride12_20260719_161121/full_smoothed_fly1_fly2/fly2/diag.csv",
+      "vio_yaw_diag": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/continuous_yaw_flex_rosfree_stride12_20260719_161121/full_smoothed_fly1_fly2/fly2/vio_yaw_diag.csv",
+      "t0": 704.2, "t1": 846.8
+    },
+    {
+      "flight_name": "fly2", "method_name": "reference_error_guard_thr1p0_dwell10_scale0p95",
+      "gps": "C:/Users/baloney/Desktop/20260518_gsmq_d455_fly2/result/fc_rebuild_20260525/gps_from_mems_offset447p5_cam_time.csv",
+      "vio_traj": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/consistent_gyro_yaw_stride12_20260720/fly2_reference_error_guard_thr1p0_dwell10_scale0p95/traj.txt",
+      "vio_bias": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/consistent_gyro_yaw_stride12_20260720/fly2_reference_error_guard_thr1p0_dwell10_scale0p95/traj.txt.bias",
+      "vio_diag": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/consistent_gyro_yaw_stride12_20260720/fly2_reference_error_guard_thr1p0_dwell10_scale0p95/diag.csv",
+      "vio_yaw_diag": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/consistent_gyro_yaw_stride12_20260720/fly2_reference_error_guard_thr1p0_dwell10_scale0p95/vio_yaw_diag.csv",
+      "t0": 704.2, "t1": 846.8
+    },
+    {
+      "flight_name": "fly3", "method_name": "baseline_stride12",
+      "gps": "C:/Users/baloney/Desktop/20260527_gsmq_d455_fly3/result/fc_rebuild_20260527/gps_from_mems_offset438p0_cam_time.csv",
+      "vio_traj": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/continuous_yaw_flex_rosfree_stride12_20260719_161121/full_smoothed_fly3_fly4/fly3/traj.txt",
+      "vio_bias": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/continuous_yaw_flex_rosfree_stride12_20260719_161121/full_smoothed_fly3_fly4/fly3/traj.txt.bias",
+      "vio_diag": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/continuous_yaw_flex_rosfree_stride12_20260719_161121/full_smoothed_fly3_fly4/fly3/diag.csv",
+      "vio_yaw_diag": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/continuous_yaw_flex_rosfree_stride12_20260719_161121/full_smoothed_fly3_fly4/fly3/vio_yaw_diag.csv",
+      "t0": 622.2, "t1": 1406.2
+    },
+    {
+      "flight_name": "fly3", "method_name": "reference_error_guard_thr1p0_dwell10_scale0p95",
+      "gps": "C:/Users/baloney/Desktop/20260527_gsmq_d455_fly3/result/fc_rebuild_20260527/gps_from_mems_offset438p0_cam_time.csv",
+      "vio_traj": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/consistent_gyro_yaw_stride12_20260720/fly3_reference_error_guard_thr1p0_dwell10_scale0p95/traj.txt",
+      "vio_bias": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/consistent_gyro_yaw_stride12_20260720/fly3_reference_error_guard_thr1p0_dwell10_scale0p95/traj.txt.bias",
+      "vio_diag": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/consistent_gyro_yaw_stride12_20260720/fly3_reference_error_guard_thr1p0_dwell10_scale0p95/diag.csv",
+      "vio_yaw_diag": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/consistent_gyro_yaw_stride12_20260720/fly3_reference_error_guard_thr1p0_dwell10_scale0p95/vio_yaw_diag.csv",
+      "t0": 622.2, "t1": 1406.2
+    },
+    {
+      "flight_name": "fly4", "method_name": "baseline_stride12",
+      "gps": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/fc_rebuild_20260528/gps_from_mems_offsetm202p2_cam_time.csv",
+      "vio_traj": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/continuous_yaw_flex_rosfree_stride12_20260719_161121/full_smoothed_fly3_fly4/fly4/traj.txt",
+      "vio_bias": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/continuous_yaw_flex_rosfree_stride12_20260719_161121/full_smoothed_fly3_fly4/fly4/traj.txt.bias",
+      "vio_diag": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/continuous_yaw_flex_rosfree_stride12_20260719_161121/full_smoothed_fly3_fly4/fly4/diag.csv",
+      "vio_yaw_diag": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/continuous_yaw_flex_rosfree_stride12_20260719_161121/full_smoothed_fly3_fly4/fly4/vio_yaw_diag.csv",
+      "t0": 928.6, "t1": 2436.2
+    },
+    {
+      "flight_name": "fly4", "method_name": "reference_error_guard_thr1p0_dwell10_scale0p95",
+      "gps": "C:/Users/baloney/Desktop/20260528_gsmq_d455_fly4/result/fc_rebuild_20260528/gps_from_mems_offsetm202p2_cam_time.csv",
+      "vio_traj": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/consistent_gyro_yaw_stride12_20260720/fly4_reference_error_guard_thr1p0_dwell10_scale0p95/traj.txt",
+      "vio_bias": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/consistent_gyro_yaw_stride12_20260720/fly4_reference_error_guard_thr1p0_dwell10_scale0p95/traj.txt.bias",
+      "vio_diag": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/consistent_gyro_yaw_stride12_20260720/fly4_reference_error_guard_thr1p0_dwell10_scale0p95/diag.csv",
+      "vio_yaw_diag": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/consistent_gyro_yaw_stride12_20260720/fly4_reference_error_guard_thr1p0_dwell10_scale0p95/vio_yaw_diag.csv",
+      "t0": 928.6, "t1": 2436.2
+    }
+  ]
+}

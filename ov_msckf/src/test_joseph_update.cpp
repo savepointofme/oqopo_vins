@@ -78,6 +78,7 @@
 #include "core/VioManagerOptions.h"
 #include "state/State.h"
 #include "state/StateHelper.h"
+#include "utils/quat_ops.h"
 
 using namespace ov_msckf;
 using namespace ov_type;
@@ -1013,6 +1014,90 @@ static TestResult test_T19_nasa_real_state_injection(std::mt19937 &rng) {
 }
 
 // ---------------------------------------------------------------------------
+// T20: hard gyro-yaw protection masks the local-gravity gain direction before
+// both mean and covariance updates. At identity attitude local gravity is +z.
+// ---------------------------------------------------------------------------
+static TestResult test_T20_visual_yaw_gain_mask(std::mt19937 &rng) {
+  (void)rng;
+  TestResult r;
+  r.name = "T20 visual yaw gain mask protects current yaw/bg_z only";
+
+  VioManagerOptions params;
+  params.state_options.num_cameras = 0;
+  params.state_options.max_clone_size = 1;
+  params.state_options.max_slam_features = 0;
+  auto state = std::make_shared<State>(params.state_options);
+  state->_timestamp = 1.0;
+  StateHelper::augment_clone(state, Eigen::Vector3d::Zero());
+  const int N = (int)StateHelper::get_full_covariance(state).rows();
+  Eigen::MatrixXd K = Eigen::MatrixXd::Zero(N, 4);
+  for (int row = 0; row < N; ++row) {
+    for (int col = 0; col < K.cols(); ++col)
+      K(row, col) = 0.01 * (1 + row + 3 * col);
+  }
+  const Eigen::MatrixXd before = K;
+  const int q_id = state->_imu->q()->id();
+  const int bg_id = state->_imu->bg()->id();
+  const int clone_q_id = state->_clones_IMU.at(1.0)->q()->id();
+
+  Eigen::MatrixXd scaled = before;
+  StateHelper::scaleVisualCurrentYawGain(state, scaled, 0.25);
+  check(r, (scaled.row(q_id + 2) - 0.25 * before.row(q_id + 2)).norm() < 1e-14,
+        "guarded current yaw gain did not receive requested scale");
+  check(r, (scaled.block(clone_q_id, 0, 3, scaled.cols()) -
+            before.block(clone_q_id, 0, 3, before.cols())).norm() < 1e-14,
+        "guarded scale changed clone-relative orientation gain");
+  check(r, (scaled.block(bg_id, 0, 3, scaled.cols()) -
+            before.block(bg_id, 0, 3, before.cols())).norm() < 1e-14,
+        "guarded scale changed gyro-bias gain");
+
+  StateHelper::maskVisualYawGain(state, K, true);
+
+  check(r, K.row(q_id + 2).norm() < 1e-14,
+        "current local-gravity yaw gain row was not zero");
+  check(r, K.row(bg_id + 2).norm() < 1e-14,
+        "bg_z gain row was not zero");
+  check(r, (K.row(q_id + 0) - before.row(q_id + 0)).norm() < 1e-14,
+        "roll gain row changed at identity attitude");
+  check(r, (K.row(q_id + 1) - before.row(q_id + 1)).norm() < 1e-14,
+        "pitch gain row changed at identity attitude");
+  check(r, (K.block(clone_q_id, 0, 3, K.cols()) -
+            before.block(clone_q_id, 0, 3, K.cols())).norm() < 1e-14,
+        "clone-relative orientation gain rows changed");
+  const int p_id = state->_imu->p()->id();
+  check(r, (K.block(p_id, 0, 3, K.cols()) -
+            before.block(p_id, 0, 3, K.cols())).norm() < 1e-14,
+        "position gain rows changed");
+  const int v_id = state->_imu->v()->id();
+  check(r, (K.block(v_id, 0, 3, K.cols()) -
+            before.block(v_id, 0, 3, K.cols())).norm() < 1e-14,
+        "velocity gain rows changed");
+
+  // Repeat the scale check at a genuinely tilted attitude. Yaw is the local
+  // representation of global gravity, not a fixed error-state z row.
+  Eigen::VectorXd imu_value = Eigen::VectorXd::Zero(16);
+  const Eigen::Matrix3d tilted_R_GtoI =
+      (Eigen::AngleAxisd(0.31, Eigen::Vector3d::UnitX()) *
+       Eigen::AngleAxisd(-0.24, Eigen::Vector3d::UnitY()) *
+       Eigen::AngleAxisd(0.73, Eigen::Vector3d::UnitZ())).toRotationMatrix();
+  imu_value.head<4>() = ov_core::rot_2_quat(tilted_R_GtoI);
+  state->_imu->set_value(imu_value);
+  Eigen::MatrixXd tilted = before;
+  StateHelper::scaleVisualCurrentYawGain(state, tilted, 0.25);
+  const Eigen::Vector3d gravity_local =
+      (tilted_R_GtoI * Eigen::Vector3d::UnitZ()).normalized();
+  const Eigen::Matrix3d expected_projection = Eigen::Matrix3d::Identity() -
+      0.75 * gravity_local * gravity_local.transpose();
+  check(r, (tilted.block(q_id, 0, 3, tilted.cols()) -
+            expected_projection * before.block(q_id, 0, 3, before.cols())).norm() < 1e-13,
+        "tilted-attitude guard did not scale the local-gravity yaw component");
+  check(r, (tilted.block(clone_q_id, 0, 3, tilted.cols()) -
+            before.block(clone_q_id, 0, 3, before.cols())).norm() < 1e-14,
+        "tilted-attitude guard changed clone orientation gain");
+  return r;
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 int main(int argc, char **argv) {
@@ -1041,6 +1126,7 @@ int main(int argc, char **argv) {
   results.push_back(test_T17_nasa_beta_monotonic(rng));
   results.push_back(test_T18_nasa_psd_loewner(rng));
   results.push_back(test_T19_nasa_real_state_injection(rng));
+  results.push_back(test_T20_visual_yaw_gain_mask(rng));
 
   int passed = 0, failed = 0;
   std::cout << "\n=== josephCovUpdate / EKFUpdateJoseph Gate 1 Tests ===\n";

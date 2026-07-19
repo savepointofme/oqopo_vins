@@ -444,6 +444,8 @@ Eigen::MatrixXd project_for_update_diag_local(
     return project_global_yaw_from_H_local(state, H_order, H, alpha, true);
   if (mode == StateHelper::VisualYawUpdateMode::HARD_GYRO_YAW)
     return project_global_yaw_from_H_local(state, H_order, H, 1.0, false);
+  if (mode == StateHelper::VisualYawUpdateMode::FC_GYRO_GUARDED_VISUAL_YAW)
+    return project_global_yaw_from_H_local(state, H_order, H, 1.0, false);
   return H;
 }
 
@@ -1921,7 +1923,8 @@ void UpdaterSLAM::update(std::shared_ptr<State> state, std::vector<std::shared_p
     const bool oc_projection_applied =
         update_mode == StateHelper::VisualYawUpdateMode::GLOBAL_YAW_OC_PROJECTION ||
         update_mode == StateHelper::VisualYawUpdateMode::GLOBAL_YAW_OC_FEJ_PROJECTION ||
-        update_mode == StateHelper::VisualYawUpdateMode::HARD_GYRO_YAW;
+        update_mode == StateHelper::VisualYawUpdateMode::HARD_GYRO_YAW ||
+        update_mode == StateHelper::VisualYawUpdateMode::FC_GYRO_GUARDED_VISUAL_YAW;
     const bool fej_used =
         update_mode == StateHelper::VisualYawUpdateMode::GLOBAL_YAW_OC_FEJ_PROJECTION;
     const bool final_ekf_uses_projected = vop_active || oc_projection_applied;

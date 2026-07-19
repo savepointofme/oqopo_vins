@@ -44,6 +44,60 @@ namespace {
 
 StateHelper::YawDxProjectionDiag last_yaw_dx_projection_diag;
 
+StateHelper::FcGyroVisualYawGuardConfig fc_gyro_yaw_guard_config;
+double fc_gyro_yaw_guard_reference_error_deg = 0.0;
+double fc_gyro_yaw_guard_reference_timestamp =
+    std::numeric_limits<double>::quiet_NaN();
+bool fc_gyro_yaw_guard_reference_valid = false;
+double fc_gyro_yaw_guard_reference_dwell_start =
+    std::numeric_limits<double>::quiet_NaN();
+
+struct FcGyroYawGuardDecision {
+  double bias_before_deg = 0.0;
+  double effective_scale = 1.0;
+  double reference_dwell_s = 0.0;
+  bool directional_selected = false;
+  bool step_capped = false;
+};
+
+FcGyroYawGuardDecision fc_gyro_yaw_guard_decision(
+    double timestamp, double raw_yaw_step_deg, double agreement_scale,
+    bool commit_evidence) {
+  (void)timestamp;
+  (void)commit_evidence;
+  FcGyroYawGuardDecision out;
+  const double error_before = fc_gyro_yaw_guard_reference_error_deg;
+  out.bias_before_deg = error_before;
+  if (std::isfinite(fc_gyro_yaw_guard_reference_dwell_start)) {
+    out.reference_dwell_s =
+        std::max(0.0, timestamp - fc_gyro_yaw_guard_reference_dwell_start);
+  }
+  agreement_scale = std::max(0.0, std::min(1.0, agreement_scale));
+  // The repository injects the left attitude error as Exp(-dtheta)R, so a
+  // positive state-yaw correction moves Log(R_fc^-1 R_vio) yaw negative.
+  // Attenuate only if this update would increase the magnitude of the causal,
+  // low-passed VIO-vs-FC relative-yaw error.
+  const double error_after = error_before - raw_yaw_step_deg;
+  if (fc_gyro_yaw_guard_reference_valid &&
+      agreement_scale < 1.0 - 1e-12 &&
+      std::fabs(error_before) >=
+          fc_gyro_yaw_guard_config.reference_error_threshold_deg &&
+      out.reference_dwell_s + 1e-9 >=
+          fc_gyro_yaw_guard_config.reference_min_dwell_s &&
+      std::fabs(error_after) > std::fabs(error_before)) {
+    out.effective_scale = agreement_scale;
+    out.directional_selected = true;
+  }
+  if (fc_gyro_yaw_guard_config.step_cap_deg > 0.0 &&
+      std::fabs(raw_yaw_step_deg) > fc_gyro_yaw_guard_config.step_cap_deg) {
+    out.effective_scale = std::min(
+        out.effective_scale,
+        fc_gyro_yaw_guard_config.step_cap_deg / std::fabs(raw_yaw_step_deg));
+    out.step_capped = true;
+  }
+  return out;
+}
+
 Eigen::Matrix3d yaw_projection_matrix(const Eigen::Matrix3d &R_GtoI, double scale) {
   scale = std::max(0.0, std::min(1.0, scale));
   Eigen::Vector3d g_local = R_GtoI * Eigen::Vector3d::UnitZ();
@@ -358,6 +412,24 @@ void remove_yaw_dx_component(Eigen::VectorXd &dx, const std::shared_ptr<Type> &q
   dx.segment(q_var->id(), 3) = (P_no_yaw * dx.segment(q_var->id(), 3)).eval();
 }
 
+void scale_yaw_gain_component(Eigen::MatrixXd &K,
+                              const std::shared_ptr<Type> &q_var,
+                              const Eigen::Matrix3d &R_GtoI,
+                              double scale) {
+  if (q_var == nullptr || q_var->id() < 0 || q_var->id() + 3 > K.rows())
+    return;
+  Eigen::Vector3d g_local = R_GtoI * Eigen::Vector3d::UnitZ();
+  const double n = g_local.norm();
+  if (n < 1e-12)
+    return;
+  g_local /= n;
+  scale = std::max(0.0, std::min(1.0, scale));
+  const Eigen::Matrix3d P_no_yaw = Eigen::Matrix3d::Identity() -
+      (1.0 - scale) * g_local * g_local.transpose();
+  K.block(q_var->id(), 0, 3, K.cols()) =
+      (P_no_yaw * K.block(q_var->id(), 0, 3, K.cols())).eval();
+}
+
 double yaw_dx_component_deg(std::shared_ptr<State> state, const Eigen::VectorXd &dx) {
   const auto &q_var = state->_imu->q();
   if (q_var == nullptr || q_var->id() < 0 || q_var->id() + 3 > dx.rows())
@@ -482,6 +554,94 @@ double extract_imu_yaw_rad(std::shared_ptr<State> state) {
 }
 
 } // namespace
+
+void StateHelper::maskVisualYawGain(std::shared_ptr<State> state,
+                                    Eigen::MatrixXd &K,
+                                    bool protect_bg_z) {
+  if (state == nullptr || K.rows() != state->_Cov.rows())
+    return;
+  scale_yaw_gain_component(K, state->_imu->q(), state->_imu->Rot(), 0.0);
+  if (protect_bg_z && state->_imu->bg() != nullptr) {
+    const int bgz_row = state->_imu->bg()->id() + 2;
+    if (bgz_row >= 0 && bgz_row < K.rows())
+      K.row(bgz_row).setZero();
+  }
+}
+
+void StateHelper::scaleVisualCurrentYawGain(std::shared_ptr<State> state,
+                                            Eigen::MatrixXd &K,
+                                            double scale) {
+  if (state == nullptr || K.rows() != state->_Cov.rows())
+    return;
+  scale_yaw_gain_component(K, state->_imu->q(), state->_imu->Rot(), scale);
+}
+
+void StateHelper::set_fc_gyro_visual_yaw_guard_config(
+    const FcGyroVisualYawGuardConfig &cfg) {
+  fc_gyro_yaw_guard_config = cfg;
+  fc_gyro_yaw_guard_config.reference_error_tau_s =
+      std::max(1e-6, fc_gyro_yaw_guard_config.reference_error_tau_s);
+  fc_gyro_yaw_guard_config.reference_error_threshold_deg =
+      std::max(0.0, fc_gyro_yaw_guard_config.reference_error_threshold_deg);
+  fc_gyro_yaw_guard_config.reference_innovation_clip_deg = std::max(
+      0.0, fc_gyro_yaw_guard_config.reference_innovation_clip_deg);
+  fc_gyro_yaw_guard_config.reference_min_dwell_s =
+      std::max(0.0, fc_gyro_yaw_guard_config.reference_min_dwell_s);
+  fc_gyro_yaw_guard_config.step_cap_deg =
+      std::max(0.0, fc_gyro_yaw_guard_config.step_cap_deg);
+  reset_fc_gyro_visual_yaw_guard_state();
+}
+
+void StateHelper::reset_fc_gyro_visual_yaw_guard_state() {
+  fc_gyro_yaw_guard_reference_error_deg = 0.0;
+  fc_gyro_yaw_guard_reference_timestamp =
+      std::numeric_limits<double>::quiet_NaN();
+  fc_gyro_yaw_guard_reference_valid = false;
+  fc_gyro_yaw_guard_reference_dwell_start =
+      std::numeric_limits<double>::quiet_NaN();
+}
+
+void StateHelper::observe_fc_gyro_visual_yaw_reference_error(
+    double timestamp, double relative_yaw_error_deg, bool valid) {
+  if (!valid || !std::isfinite(timestamp) ||
+      !std::isfinite(relative_yaw_error_deg)) {
+    fc_gyro_yaw_guard_reference_valid = false;
+    fc_gyro_yaw_guard_reference_dwell_start =
+        std::numeric_limits<double>::quiet_NaN();
+    return;
+  }
+  const double previous_filtered_error =
+      fc_gyro_yaw_guard_reference_error_deg;
+  if (!std::isfinite(fc_gyro_yaw_guard_reference_timestamp) ||
+      timestamp + 1e-9 < fc_gyro_yaw_guard_reference_timestamp) {
+    fc_gyro_yaw_guard_reference_error_deg = relative_yaw_error_deg;
+  } else {
+    const double dt = timestamp - fc_gyro_yaw_guard_reference_timestamp;
+    const double alpha = 1.0 - std::exp(
+        -std::max(0.0, dt) /
+        fc_gyro_yaw_guard_config.reference_error_tau_s);
+    const double clip = std::max(
+        0.0, fc_gyro_yaw_guard_config.reference_innovation_clip_deg);
+    const double innovation = std::max(
+        -clip, std::min(clip, relative_yaw_error_deg -
+                              fc_gyro_yaw_guard_reference_error_deg));
+    fc_gyro_yaw_guard_reference_error_deg += alpha * innovation;
+  }
+  fc_gyro_yaw_guard_reference_timestamp = timestamp;
+  const bool above_threshold =
+      std::fabs(fc_gyro_yaw_guard_reference_error_deg) >=
+      fc_gyro_yaw_guard_config.reference_error_threshold_deg;
+  const bool sign_consistent =
+      previous_filtered_error * fc_gyro_yaw_guard_reference_error_deg > 0.0;
+  if (!above_threshold) {
+    fc_gyro_yaw_guard_reference_dwell_start =
+        std::numeric_limits<double>::quiet_NaN();
+  } else if (!std::isfinite(fc_gyro_yaw_guard_reference_dwell_start) ||
+             !sign_consistent) {
+    fc_gyro_yaw_guard_reference_dwell_start = timestamp;
+  }
+  fc_gyro_yaw_guard_reference_valid = true;
+}
 
 void StateHelper::reset_last_yaw_dx_projection_diag() {
   last_yaw_dx_projection_diag = YawDxProjectionDiag();
@@ -636,6 +796,8 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
   // String "dso_increment_ortho" now redirects to GLOBAL_YAW_OC_FEJ_PROJECTION in VioManager.
   } else if (visual_yaw_update_mode == VisualYawUpdateMode::HARD_GYRO_YAW) {
     H_eff = project_global_yaw_from_H(state, H_order, H_id, H, 1.0, /*use_fej=*/false);
+  } else if (visual_yaw_update_mode == VisualYawUpdateMode::FC_GYRO_GUARDED_VISUAL_YAW) {
+    H_eff = project_global_yaw_from_H(state, H_order, H_id, H, 1.0, /*use_fej=*/false);
   } else if (visual_yaw_update_mode == VisualYawUpdateMode::A_STRICT_YAW_DX0) {
     H_eff = project_per_block_yaw_from_H(state, H_order, H_id, H, 0.0, false);
   } else if (visual_yaw_update_mode == VisualYawUpdateMode::PER_BLOCK_SCALE ||
@@ -698,7 +860,33 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
     }
   }
 
-  if (bgz_row_scaled) {
+  // The old hard_gyro_yaw path zeroed yaw only in dx after updating P with
+  // the unmasked optimal K. That made the nominal state and covariance
+  // describe different filters. Mask the gain first so the same protection is
+  // used by both the mean and the Joseph-form covariance update.
+  double hard_gyro_yaw_dx_before_deg = 0.0;
+  const bool hard_gyro_yaw_gain_masked =
+      visual_yaw_update_mode == VisualYawUpdateMode::HARD_GYRO_YAW;
+  bool guarded_yaw_gain_scaled = false;
+  FcGyroYawGuardDecision guard_decision;
+  if (hard_gyro_yaw_gain_masked) {
+    hard_gyro_yaw_dx_before_deg = yaw_dx_component_deg(state, K * res);
+    StateHelper::maskVisualYawGain(state, K, true);
+  } else if (visual_yaw_update_mode ==
+             VisualYawUpdateMode::FC_GYRO_GUARDED_VISUAL_YAW) {
+    hard_gyro_yaw_dx_before_deg = yaw_dx_component_deg(state, K * res);
+    guard_decision = fc_gyro_yaw_guard_decision(
+        state->_timestamp, hard_gyro_yaw_dx_before_deg,
+        visual_yaw_update_scale, true);
+    guarded_yaw_gain_scaled =
+        guard_decision.effective_scale < 1.0 - 1e-12;
+    if (guarded_yaw_gain_scaled) {
+      StateHelper::scaleVisualCurrentYawGain(
+          state, K, guard_decision.effective_scale);
+    }
+  }
+
+  if (bgz_row_scaled || hard_gyro_yaw_gain_masked || guarded_yaw_gain_scaled) {
     // K no longer equals M_a S^{-1}, so the standard form P -= K M_a^T is invalid
     // (non-symmetric, goes non-PSD).  Use the gain-agnostic consistent form
     //   P+ = P - K' M_a^T - M_a K'^T + K' S K'^T
@@ -732,13 +920,26 @@ void StateHelper::EKFUpdate(std::shared_ptr<State> state, const std::vector<std:
   Eigen::VectorXd dx = K * res;
   last_yaw_dx_projection_diag.valid = true;
   last_yaw_dx_projection_diag.mode = visual_yaw_update_mode;
-  last_yaw_dx_projection_diag.dx_yaw_before_projection_deg = yaw_dx_component_deg(state, dx);
-  if (visual_yaw_update_mode == VisualYawUpdateMode::HARD_GYRO_YAW) {
-    zero_visual_yaw_dx(state, dx, true);
-  } else if (visual_yaw_update_mode == VisualYawUpdateMode::A_STRICT_YAW_DX0) {
+  last_yaw_dx_projection_diag.dx_yaw_before_projection_deg =
+      (hard_gyro_yaw_gain_masked || guarded_yaw_gain_scaled) ? hard_gyro_yaw_dx_before_deg
+                                : yaw_dx_component_deg(state, dx);
+  if (visual_yaw_update_mode == VisualYawUpdateMode::A_STRICT_YAW_DX0) {
     zero_visual_yaw_dx(state, dx, false);
   }
   last_yaw_dx_projection_diag.dx_yaw_after_projection_deg = yaw_dx_component_deg(state, dx);
+  if (visual_yaw_update_mode ==
+      VisualYawUpdateMode::FC_GYRO_GUARDED_VISUAL_YAW) {
+    last_yaw_dx_projection_diag.guard_reference_error_before_deg =
+        guard_decision.bias_before_deg;
+    last_yaw_dx_projection_diag.guard_reference_dwell_s =
+        guard_decision.reference_dwell_s;
+    last_yaw_dx_projection_diag.guard_effective_scale =
+        guard_decision.effective_scale;
+    last_yaw_dx_projection_diag.guard_directional_selected =
+        guard_decision.directional_selected;
+    last_yaw_dx_projection_diag.guard_step_capped =
+        guard_decision.step_capped;
+  }
 
   // CONSTRAINED_YAW_NULLSPACE: post-update rank-1 constraint nᵀδx=0 (Simon & Chia 2002).
   // Runs AFTER the standard EKF P update (P is P_new here), modifying both dx and P.
@@ -877,6 +1078,8 @@ StateHelper::UpdateDiagnostics StateHelper::compute_update_diagnostics(
     H_eff = project_global_yaw_from_H(state, H_order, H_id, H, visual_global_yaw_oc_alpha, true);
   } else if (visual_yaw_update_mode == VisualYawUpdateMode::HARD_GYRO_YAW) {
     H_eff = project_global_yaw_from_H(state, H_order, H_id, H, 1.0, false);
+  } else if (visual_yaw_update_mode == VisualYawUpdateMode::FC_GYRO_GUARDED_VISUAL_YAW) {
+    H_eff = project_global_yaw_from_H(state, H_order, H_id, H, 1.0, false);
   } else if (visual_yaw_update_mode == VisualYawUpdateMode::A_STRICT_YAW_DX0) {
     H_eff = project_per_block_yaw_from_H(state, H_order, H_id, H, 0.0, false);
   } else if (visual_yaw_update_mode == VisualYawUpdateMode::PER_BLOCK_SCALE ||
@@ -968,11 +1171,18 @@ StateHelper::UpdateDiagnostics StateHelper::compute_update_diagnostics(
     if (bgz_row >= 0 && bgz_row < (int)K.rows())
       K.row(bgz_row) *= visual_bgz_update_scale;
   }
+  if (visual_yaw_update_mode == VisualYawUpdateMode::HARD_GYRO_YAW)
+    StateHelper::maskVisualYawGain(state, K, true);
+  else if (visual_yaw_update_mode == VisualYawUpdateMode::FC_GYRO_GUARDED_VISUAL_YAW) {
+    const double raw_yaw_step_deg = yaw_dx_component_deg(state, K * res);
+    const auto decision = fc_gyro_yaw_guard_decision(
+        state->_timestamp, raw_yaw_step_deg, visual_yaw_update_scale, false);
+    StateHelper::scaleVisualCurrentYawGain(
+        state, K, decision.effective_scale);
+  }
 
   Eigen::VectorXd dx = K * res;
-  if (visual_yaw_update_mode == VisualYawUpdateMode::HARD_GYRO_YAW) {
-    zero_visual_yaw_dx(state, dx, true);
-  } else if (visual_yaw_update_mode == VisualYawUpdateMode::A_STRICT_YAW_DX0) {
+  if (visual_yaw_update_mode == VisualYawUpdateMode::A_STRICT_YAW_DX0) {
     zero_visual_yaw_dx(state, dx, false);
   }
 
@@ -1069,6 +1279,8 @@ Eigen::VectorXd StateHelper::compute_update_dx(std::shared_ptr<State> state,
     H_eff = project_global_yaw_from_H(state, H_order, H_id, H, visual_global_yaw_oc_alpha, true);
   } else if (visual_yaw_update_mode == VisualYawUpdateMode::HARD_GYRO_YAW) {
     H_eff = project_global_yaw_from_H(state, H_order, H_id, H, 1.0, false);
+  } else if (visual_yaw_update_mode == VisualYawUpdateMode::FC_GYRO_GUARDED_VISUAL_YAW) {
+    H_eff = project_global_yaw_from_H(state, H_order, H_id, H, 1.0, false);
   } else if (visual_yaw_update_mode == VisualYawUpdateMode::A_STRICT_YAW_DX0) {
     H_eff = project_per_block_yaw_from_H(state, H_order, H_id, H, 0.0, false);
   } else if (visual_yaw_update_mode == VisualYawUpdateMode::PER_BLOCK_SCALE ||
@@ -1101,11 +1313,18 @@ Eigen::VectorXd StateHelper::compute_update_dx(std::shared_ptr<State> state,
     if (bgz_row >= 0 && bgz_row < (int)K.rows())
       K.row(bgz_row) *= visual_bgz_update_scale;
   }
+  if (visual_yaw_update_mode == VisualYawUpdateMode::HARD_GYRO_YAW)
+    StateHelper::maskVisualYawGain(state, K, true);
+  else if (visual_yaw_update_mode == VisualYawUpdateMode::FC_GYRO_GUARDED_VISUAL_YAW) {
+    const double raw_yaw_step_deg = yaw_dx_component_deg(state, K * res);
+    const auto decision = fc_gyro_yaw_guard_decision(
+        state->_timestamp, raw_yaw_step_deg, visual_yaw_update_scale, false);
+    StateHelper::scaleVisualCurrentYawGain(
+        state, K, decision.effective_scale);
+  }
 
   Eigen::VectorXd dx = K * res;
-  if (visual_yaw_update_mode == VisualYawUpdateMode::HARD_GYRO_YAW) {
-    zero_visual_yaw_dx(state, dx, true);
-  } else if (visual_yaw_update_mode == VisualYawUpdateMode::A_STRICT_YAW_DX0) {
+  if (visual_yaw_update_mode == VisualYawUpdateMode::A_STRICT_YAW_DX0) {
     zero_visual_yaw_dx(state, dx, false);
   }
   return dx;

@@ -142,6 +142,8 @@ StateHelper::VisualYawUpdateMode visual_yaw_mode_from_string(const std::string &
     return StateHelper::VisualYawUpdateMode::CURRENT_ONLY_SCALE;
   if (mode == "hard_gyro_yaw" || mode == "gyro_yaw_only")
     return StateHelper::VisualYawUpdateMode::HARD_GYRO_YAW;
+  if (mode == "fc_gyro_guarded_visual_yaw")
+    return StateHelper::VisualYawUpdateMode::FC_GYRO_GUARDED_VISUAL_YAW;
   if (mode == "a_strict_yaw_dx0" || mode == "strict_yaw_dx0")
     return StateHelper::VisualYawUpdateMode::A_STRICT_YAW_DX0;
   if (mode == "visual_yaw_schmidt_current_gauge")
@@ -1544,6 +1546,7 @@ void VioManager::set_vio_yaw_update_diag_path(const std::string &path) {
   of_vio_yaw_update_diag
       << "timestamp,update_type,yaw_before_deg,yaw_after_deg,delta_yaw_update_deg,"
       << "dx_yaw_before_projection_deg,dx_yaw_after_projection_deg,dx_yaw_projection_valid,"
+      << "guard_reference_error_before_deg,guard_reference_dwell_s,guard_effective_scale,guard_directional_selected,guard_step_capped,"
       << "cumsum_delta_yaw_update_deg,vio_yaw_update_mode,vio_yaw_update_scale,"
       << "vio_global_yaw_oc_alpha,bg_z,num_features,chi2,"
       << "accepted,rejected,tracking_feature_count\n";
@@ -2102,6 +2105,11 @@ void VioManager::log_vio_yaw_update(double timestamp, const std::string &update_
                          << dx_diag.dx_yaw_before_projection_deg << ","
                          << dx_diag.dx_yaw_after_projection_deg << ","
                          << (dx_diag.valid ? 1 : 0) << ","
+                         << dx_diag.guard_reference_error_before_deg << ","
+                         << dx_diag.guard_reference_dwell_s << ","
+                         << dx_diag.guard_effective_scale << ","
+                         << (dx_diag.guard_directional_selected ? 1 : 0) << ","
+                         << (dx_diag.guard_step_capped ? 1 : 0) << ","
                          << vio_yaw_update_diag_cumsum_deg << ","
                          << params.vio_yaw_update_mode << "," << params.vio_yaw_update_scale << ","
                          << params.vio_global_yaw_oc_alpha << "," << bg_z << ","

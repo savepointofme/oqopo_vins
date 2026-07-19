@@ -1,0 +1,19 @@
+{
+  "experiment_id": "fc_gyro_guarded_visual_yaw_stride12_20260720",
+  "flight_name": "fly1",
+  "method_name": "fc_gyro_guard_scale0p5_gate0p35deg",
+  "date": "20260720",
+  "status": "partial",
+  "gps_csv": "D:/vscode_dir/open_vins_flex_baseline_20260719/config/d455_fly1/fc_gps_cam_time.csv",
+  "vio_traj": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/consistent_gyro_yaw_stride12_20260720/fly1_fc_gyro_guard_full_v1/traj.txt",
+  "vio_bias": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/consistent_gyro_yaw_stride12_20260720/fly1_fc_gyro_guard_full_v1/traj.txt.bias",
+  "diag_csv": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/consistent_gyro_yaw_stride12_20260720/fly1_fc_gyro_guard_full_v1/diag.csv",
+  "vio_yaw_diag": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/consistent_gyro_yaw_stride12_20260720/fly1_fc_gyro_guard_full_v1/vio_yaw_diag.csv",
+  "t0": 934.2,
+  "t1": 1644.8,
+  "alignment": {"mode": "start_heading", "course_window_s": 60.0},
+  "sampling": {"mode": "gps_update_after_vio", "max_delay_s": 0.2},
+  "segmentation": {"mode": "four_side_lap"},
+  "velocity_source": "flight_controller_raw",
+  "notes": "Frozen stride-12 inputs; FC relative SO(3) versus D455 gyro-bg gates only current visual yaw gain. No GPS P/V or truth online. Headless because this is an unattended full replay."
+}
