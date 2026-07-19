@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "data_identity": "desktop_frozen_fly1_fly4_oc_stride12",
+  "baseline_commit": "f8664c8ac7b9cf1bc80c734d6db453eb3b28ee7a",
+  "flights": {
+    "fly1": {
+      "run_dir": "C:/Users/baloney/Desktop/实验目录/_OPENVINS_ORGANIZED_20260625/01_final_locked_stride_sweep/stable_config_stride_validation_20260622/runs/fly1_oc_stride12"
+    },
+    "fly2": {
+      "run_dir": "C:/Users/baloney/Desktop/实验目录/_OPENVINS_ORGANIZED_20260625/01_final_locked_stride_sweep/stable_config_stride_validation_20260622/runs/fly2_oc_stride12"
+    },
+    "fly3": {
+      "run_dir": "C:/Users/baloney/Desktop/实验目录/_OPENVINS_ORGANIZED_20260625/01_final_locked_stride_sweep/stable_config_stride_validation_20260622/runs/fly3_oc_stride12",
+      "positive_windows_s": [[760.0, 800.0], [995.0, 1025.0]]
+    },
+    "fly4": {
+      "run_dir": "C:/Users/baloney/Desktop/实验目录/_OPENVINS_ORGANIZED_20260625/01_final_locked_stride_sweep/stable_config_stride_validation_20260622/runs/fly4_oc_stride12"
+    }
+  }
+}

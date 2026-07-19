@@ -1784,6 +1784,35 @@ three-condition comparison figures.
 
 
 def write_comparison_report(run_table: pd.DataFrame, aggregate: pd.DataFrame, out: Path, package: str) -> None:
+    legacy_conditions = {
+        "cond1_nogpsz",
+        "cond2_gpsz_original",
+        "cond3_oc_gpsz",
+    }
+    available_conditions = set(run_table["condition"].astype(str))
+    if not legacy_conditions.issubset(available_conditions):
+        text = f"""# Multi-Condition Flight Comparison
+
+## 1. Manifest
+
+`{package}`
+
+## 2. Per-flight global results
+
+{run_table.to_markdown(index=False)}
+
+## 3. Aggregate results
+
+{aggregate.to_markdown(index=False)}
+
+## 4. Notes
+
+- GPS is the evaluation reference, not perfect ground truth.
+- Every condition uses the same per-flight time window and start-only alignment.
+- Detailed segment, straight-leg, turn, aligned-sample, and plot outputs are retained alongside this report.
+"""
+        (out / "METHOD_COMPARISON_ANALYSIS.md").write_text(text, encoding="utf-8")
+        return
     oc = run_table[run_table["condition"].str.contains("cond3")]
     nonoc = run_table[run_table["condition"].str.contains("cond2")]
     nogpsz = run_table[run_table["condition"].str.contains("cond1")]

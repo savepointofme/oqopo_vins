@@ -199,6 +199,18 @@ install(TARGETS test_joseph_update
         RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
+# Output-only ROS-free yaw-flex observer tests (no estimator state feedback).
+add_executable(test_flex_body_attitude_observer
+  src/test_flex_body_attitude_observer.cpp)
+target_link_libraries(test_flex_body_attitude_observer ${thirdparty_libraries})
+add_test(NAME test_flex_body_attitude_observer
+  COMMAND test_flex_body_attitude_observer)
+install(TARGETS test_flex_body_attitude_observer
+        ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+        LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+        RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
 # Gate 2: Constrained-yaw-nullspace rank-1 projection unit tests (pure Eigen, no pipeline).
 # Some experiment snapshots contain the target declaration but not its source;
 # keep those snapshots configurable while emitting an explicit warning.

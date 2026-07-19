@@ -40,7 +40,10 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <sstream>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <boost/filesystem.hpp>
 #include <opencv2/opencv.hpp>
@@ -64,6 +67,7 @@
 #include "ros_free/DiagLogger.h"
 #include "ros_free/DiagMetrics.h"
 #include "ros_free/DiagPrinter.h"
+#include "ros_free/FlexBodyAttitudeObserver.h"
 #include "ros_free/TrajectoryAligner.h"
 #include "ros_free/VizDashboard.h"
 #include "utils/quat_ops.h"
@@ -76,12 +80,104 @@ namespace {
 std::atomic<bool> g_stop{false};
 void on_sigint(int) { g_stop.store(true); }
 
+struct FlexFcAttitudeSample {
+  double timestamp_s = std::numeric_limits<double>::quiet_NaN();
+  Eigen::Matrix3d R_BtoG = Eigen::Matrix3d::Identity();
+  bool valid = false;
+};
+
+std::vector<std::string> split_csv_row(const std::string &line) {
+  std::vector<std::string> columns;
+  std::stringstream stream(line);
+  std::string column;
+  while (std::getline(stream, column, ','))
+    columns.push_back(column);
+  return columns;
+}
+
+std::vector<FlexFcAttitudeSample>
+load_flex_fc_attitude_stream(const std::string &path) {
+  std::ifstream input(path);
+  if (!input.is_open())
+    throw std::runtime_error("cannot open flex FC attitude stream: " + path);
+  std::vector<FlexFcAttitudeSample> samples;
+  std::string line;
+  std::size_t line_number = 0;
+  while (std::getline(input, line)) {
+    ++line_number;
+    if (line.empty() || line.front() == '#')
+      continue;
+    const auto columns = split_csv_row(line);
+    if (!columns.empty() && columns.front() == "camera_time_s")
+      continue;
+    if (columns.size() != 6)
+      throw std::runtime_error("flex FC CSV line " +
+                               std::to_string(line_number) +
+                               " must have six columns");
+    FlexFcAttitudeSample sample;
+    try {
+      sample.timestamp_s = std::stod(columns[0]);
+      const Eigen::Quaterniond quaternion(
+          std::stod(columns[4]), std::stod(columns[1]),
+          std::stod(columns[2]), std::stod(columns[3]));
+      if (!std::isfinite(quaternion.norm()) || quaternion.norm() < 1e-12)
+        throw std::runtime_error("invalid quaternion norm");
+      sample.R_BtoG = quaternion.normalized().toRotationMatrix();
+      sample.valid = std::stoi(columns[5]) != 0;
+    } catch (const std::exception &error) {
+      throw std::runtime_error("invalid flex FC CSV line " +
+                               std::to_string(line_number) + ": " +
+                               error.what());
+    }
+    if (!std::isfinite(sample.timestamp_s))
+      throw std::runtime_error("non-finite flex FC timestamp at line " +
+                               std::to_string(line_number));
+    if (!samples.empty() &&
+        sample.timestamp_s <= samples.back().timestamp_s)
+      throw std::runtime_error(
+          "flex FC timestamps must be strictly increasing at line " +
+          std::to_string(line_number));
+    samples.push_back(sample);
+  }
+  if (samples.size() < 2)
+    throw std::runtime_error("flex FC attitude stream has fewer than two rows");
+  return samples;
+}
+
+bool interpolate_flex_fc_attitude_at(
+    const std::vector<FlexFcAttitudeSample> &samples, double timestamp_s,
+    double maximum_bracket_gap_s, Eigen::Matrix3d &R_BtoG,
+    std::size_t &first_sample_after) {
+  const auto upper = std::upper_bound(
+      samples.begin(), samples.end(), timestamp_s,
+      [](double timestamp, const FlexFcAttitudeSample &sample) {
+        return timestamp < sample.timestamp_s;
+      });
+  if (upper == samples.begin() || upper == samples.end())
+    return false;
+  const auto lower = upper - 1;
+  const double gap = upper->timestamp_s - lower->timestamp_s;
+  if (!lower->valid || !upper->valid || !(gap > 0.0) ||
+      gap > maximum_bracket_gap_s)
+    return false;
+  const double alpha = std::max(
+      0.0, std::min(1.0, (timestamp_s - lower->timestamp_s) / gap));
+  const Eigen::Quaterniond q_lower(lower->R_BtoG);
+  const Eigen::Quaterniond q_upper(upper->R_BtoG);
+  R_BtoG = q_lower.slerp(alpha, q_upper).normalized().toRotationMatrix();
+  first_sample_after = static_cast<std::size_t>(upper - samples.begin());
+  return true;
+}
+
 struct Args {
   std::string config_path;
   std::string dataset_dir;
   std::string gps_path;
   std::string gt_path;
   std::string output_path = "traj_ros_free.txt";
+  bool enable_flex_body_attitude = false;
+  std::string flex_fc_attitude_path;
+  std::string flex_body_attitude_output_path;
   std::string init_from_fc_path;
   std::string video_path;
   std::string video_cam_path;    // [中文] 仅相机 + 光流轨迹视频 (cam0/cam1 并排, 带 TrackBase 历史线)
@@ -318,6 +414,12 @@ void print_help() {
                "  --init-ba-sigma MPS2  Initial accel-bias stddev (default 1.0)\n"
                "  --gt PATH             ASL 17-col ground truth CSV\n"
                "  --output PATH         Output TUM trajectory (default: traj_ros_free.txt)\n"
+               "  --enable-flex-body-attitude\n"
+               "                        Enable output-only continuous yaw-flex shadow (default off).\n"
+               "  --flex-fc-attitude PATH\n"
+               "                        Camera-time FC attitude CSV; post-init input is relative SO(3) only.\n"
+               "  --flex-body-attitude-output PATH\n"
+               "                        Independent shadow CSV beside the original trajectory.\n"
                "  --video PATH          Record dashboard to MP4\n"
                "  --video-cam PATH      Record camera-only (cam0/cam1 w/ optical-flow tracks) to MP4\n"
                "  --video-fps N         Video FPS (default 20)\n"
@@ -456,6 +558,12 @@ bool parse_args(int argc, char **argv, Args &a) {
     else if (s == "--gps") a.gps_path = next("--gps");
     else if (s == "--gt") a.gt_path = next("--gt");
     else if (s == "--output") a.output_path = next("--output");
+    else if (s == "--enable-flex-body-attitude")
+      a.enable_flex_body_attitude = true;
+    else if (s == "--flex-fc-attitude")
+      a.flex_fc_attitude_path = next("--flex-fc-attitude");
+    else if (s == "--flex-body-attitude-output")
+      a.flex_body_attitude_output_path = next("--flex-body-attitude-output");
     else if (s == "--video") a.video_path = next("--video");
     else if (s == "--video-cam") a.video_cam_path = next("--video-cam");
     else if (s == "--video-fps") a.video_fps = std::atoi(next("--video-fps").c_str());
@@ -651,6 +759,16 @@ bool parse_args(int argc, char **argv, Args &a) {
   }
   if (a.config_path.empty() || a.dataset_dir.empty()) {
     print_help();
+    return false;
+  }
+  if (a.enable_flex_body_attitude && a.flex_fc_attitude_path.empty()) {
+    std::cerr << "--enable-flex-body-attitude requires --flex-fc-attitude\n";
+    return false;
+  }
+  if (!a.enable_flex_body_attitude &&
+      (!a.flex_fc_attitude_path.empty() ||
+       !a.flex_body_attitude_output_path.empty())) {
+    std::cerr << "flex attitude paths require --enable-flex-body-attitude\n";
     return false;
   }
   return true;
@@ -1242,6 +1360,7 @@ int main(int argc, char **argv) {
   std::vector<DatasetReaderEuroc::CamEntry> cam0, cam1;
   std::vector<DatasetReaderEuroc::GtSample> gt;
   std::vector<DatasetReaderEuroc::GpsSample> gps;
+  std::vector<FlexFcAttitudeSample> flex_fc_attitude;
 
   if (!DatasetReaderEuroc::load_imu((root / "imu0" / "data.csv").string(), imu))
     return EXIT_FAILURE;
@@ -1255,6 +1374,20 @@ int main(int argc, char **argv) {
     DatasetReaderEuroc::load_gt((root / "state_groundtruth_estimate0" / "data.csv").string(), gt);
   if (!args.gps_path.empty())
     DatasetReaderEuroc::load_gps(args.gps_path, gps);
+  if (args.enable_flex_body_attitude) {
+    try {
+      flex_fc_attitude =
+          load_flex_fc_attitude_stream(args.flex_fc_attitude_path);
+    } catch (const std::exception &error) {
+      PRINT_ERROR(RED "[FLEX-BODY] input rejected: %s\n" RESET,
+                  error.what());
+      return EXIT_FAILURE;
+    }
+    PRINT_INFO(CYAN "[FLEX-BODY] shadow enabled: FC rows=%zu "
+                    "range=[%.6f, %.6f]; estimator state feedback=disabled\n" RESET,
+               flex_fc_attitude.size(), flex_fc_attitude.front().timestamp_s,
+               flex_fc_attitude.back().timestamp_s);
+  }
 
   // [中文] 应用 GPS 时间偏移 (config: gps_time_offset, 单位秒, 默认 0).
   // 用于数据集 GPS 时间戳与 IMU 不对齐的情况 (例如 jc82 18r.bag,
@@ -1381,6 +1514,51 @@ int main(int argc, char **argv) {
   std::ofstream debug_out(args.output_path + ".bias");
   debug_out << "# t_cam vx vy vz bg_x bg_y bg_z ba_x ba_y ba_z\n";
   debug_out << std::fixed << std::setprecision(6);
+
+  std::ofstream flex_body_attitude_out;
+  FlexBodyAttitudeObserver flex_body_observer;
+  std::size_t flex_fc_index = 0;
+  std::size_t flex_valid_update_count = 0;
+  std::size_t flex_invalid_sample_count = 0;
+  Eigen::Matrix3d flex_last_fc_R_BtoG = Eigen::Matrix3d::Identity();
+  Eigen::Matrix3d flex_last_camera_R_ItoG = Eigen::Matrix3d::Identity();
+  double flex_last_camera_time_s =
+      std::numeric_limits<double>::quiet_NaN();
+  double flex_last_processed_fc_time_s =
+      std::numeric_limits<double>::quiet_NaN();
+  bool flex_fc_valid_for_release = true;
+  if (args.enable_flex_body_attitude) {
+    if (args.flex_body_attitude_output_path.empty()) {
+      const fs::path trajectory_path(args.output_path);
+      args.flex_body_attitude_output_path =
+          (trajectory_path.parent_path() / "aircraft_body_attitude.csv").string();
+    }
+    const fs::path flex_output_path(args.flex_body_attitude_output_path);
+    if (!flex_output_path.parent_path().empty())
+      fs::create_directories(flex_output_path.parent_path());
+    flex_body_attitude_out.open(args.flex_body_attitude_output_path,
+                                std::ofstream::out | std::ofstream::trunc);
+    if (!flex_body_attitude_out.is_open()) {
+      PRINT_ERROR(RED "[FLEX-BODY] cannot open output: %s\n" RESET,
+                  args.flex_body_attitude_output_path.c_str());
+      return EXIT_FAILURE;
+    }
+    flex_body_attitude_out
+        << "# schema=rosfree_continuous_yaw_flex_body_attitude_v1\n"
+        << "# shadow_output_only=true; estimator_state_feedback=false\n"
+        << "# initialization=simultaneous_FC_D455_nominal_mount_and_zero_flex\n"
+        << "# post_init_fc_input=adjacent_relative_SO3_only\n"
+        << "# tau_s=12; huber_delta_deg=1.5; max_rate_deg_s=0.25; "
+           "max_abs_flex_deg=6; max_filter_dt_s=0.45\n"
+        << "camera_time_s,status,fc_updates_this_frame,last_fc_sample_time_s,"
+           "observed_flex_yaw_deg,observer_target_flex_yaw_deg,"
+           "output_flex_yaw_deg,output_flex_rate_deg_s,"
+           "d455_qx,d455_qy,d455_qz,d455_qw,"
+           "aircraft_body_qx,aircraft_body_qy,aircraft_body_qz,"
+           "aircraft_body_qw,d455_nominal_body_yaw_deg,"
+           "aircraft_body_yaw_deg\n";
+    flex_body_attitude_out << std::fixed << std::setprecision(9);
+  }
 
   AdaptiveStrideController adaptive_stride_controller;
   std::ofstream adaptive_stride_out;
@@ -1949,6 +2127,122 @@ int main(int argc, char **argv) {
       Eigen::Vector3d p_wi = state->_imu->pos();
       Eigen::Vector3d v_wi = state->_imu->vel();
 
+      // Output-only shadow path: it has no estimator state setter and never
+      // touches propagation, projection, P/V, bias, covariance, or extrinsics.
+      if (args.enable_flex_body_attitude) {
+        std::string flex_status = "hold_no_fc_sample";
+        std::size_t frame_fc_updates = 0;
+        if (!flex_body_observer.initialized()) {
+          Eigen::Matrix3d initial_fc_R_BtoG = Eigen::Matrix3d::Identity();
+          constexpr double kMaximumInitialFcBracketGapS = 0.45;
+          if (!interpolate_flex_fc_attitude_at(
+                  flex_fc_attitude, t_cam,
+                  kMaximumInitialFcBracketGapS, initial_fc_R_BtoG,
+                  flex_fc_index)) {
+            PRINT_ERROR(RED "[FLEX-BODY] FC stream does not validly bracket "
+                            "VIO initialization t=%.9f within %.3fs\n" RESET,
+                        t_cam, kMaximumInitialFcBracketGapS);
+            return EXIT_FAILURE;
+          }
+          flex_body_observer.reset_at_initialization(
+              t_cam, R_wi, initial_fc_R_BtoG);
+          flex_last_fc_R_BtoG = initial_fc_R_BtoG;
+          flex_last_camera_R_ItoG = R_wi;
+          flex_last_camera_time_s = t_cam;
+          flex_last_processed_fc_time_s = t_cam;
+          flex_fc_valid_for_release = true;
+          flex_status = "initialization_reset";
+          PRINT_INFO(GREEN "[FLEX-BODY] initialized at t=%.9f with "
+                           "observed=0 filtered=0; pre-init FC excluded\n" RESET,
+                     t_cam);
+        } else {
+          while (flex_fc_index < flex_fc_attitude.size() &&
+                 flex_fc_attitude[flex_fc_index].timestamp_s <=
+                     t_cam + 1e-9) {
+            const auto &sample = flex_fc_attitude[flex_fc_index];
+            flex_last_processed_fc_time_s = sample.timestamp_s;
+            if (sample.timestamp_s <= flex_last_camera_time_s + 1e-9) {
+              ++flex_fc_index;
+              continue;
+            }
+            const double camera_gap = t_cam - flex_last_camera_time_s;
+            const double alpha =
+                camera_gap > 0.0
+                    ? std::max(0.0, std::min(
+                          1.0, (sample.timestamp_s - flex_last_camera_time_s) /
+                                   camera_gap))
+                    : 1.0;
+            const Eigen::Quaterniond q_previous(
+                flex_last_camera_R_ItoG);
+            const Eigen::Quaterniond q_current(R_wi);
+            const Eigen::Matrix3d sample_R_ItoG =
+                q_previous.slerp(alpha, q_current)
+                    .normalized()
+                    .toRotationMatrix();
+            if (sample.valid) {
+              const Eigen::Matrix3d fc_delta_R_current_to_previous =
+                  sample.R_BtoG.transpose() * flex_last_fc_R_BtoG;
+              flex_body_observer.update(
+                  sample.timestamp_s, sample_R_ItoG,
+                  fc_delta_R_current_to_previous, true);
+              flex_last_fc_R_BtoG = sample.R_BtoG;
+              flex_fc_valid_for_release = true;
+              ++frame_fc_updates;
+              ++flex_valid_update_count;
+              flex_status = "updated_body_yaw_so3_log";
+            } else {
+              flex_body_observer.update(
+                  sample.timestamp_s, sample_R_ItoG,
+                  Eigen::Matrix3d::Identity(), false);
+              ++flex_invalid_sample_count;
+              flex_fc_valid_for_release = false;
+              if (frame_fc_updates == 0)
+                flex_status = "hold_invalid_fc";
+            }
+            ++flex_fc_index;
+          }
+          if (flex_fc_index >= flex_fc_attitude.size() &&
+              frame_fc_updates == 0 && flex_status == "hold_no_fc_sample") {
+            flex_status = "hold_fc_stream_exhausted";
+            flex_fc_valid_for_release = false;
+          }
+          flex_last_camera_R_ItoG = R_wi;
+          flex_last_camera_time_s = t_cam;
+        }
+
+        const auto flex_release = flex_body_observer.release_output(
+            t_cam, flex_fc_valid_for_release);
+
+        const Eigen::Matrix3d nominal_body_R_BtoG =
+            flex_body_observer.nominal_body_attitude(R_wi);
+        const Eigen::Matrix3d shadow_body_R_BtoG =
+            flex_body_observer.aircraft_body_attitude(R_wi);
+        const Eigen::Quaterniond d455_quaternion(R_wi);
+        const Eigen::Quaterniond body_quaternion(shadow_body_R_BtoG);
+        flex_body_attitude_out
+            << t_cam << ',' << flex_status << ',' << frame_fc_updates << ',';
+        if (std::isfinite(flex_last_processed_fc_time_s))
+          flex_body_attitude_out << flex_last_processed_fc_time_s;
+        else
+          flex_body_attitude_out << "nan";
+        flex_body_attitude_out
+            << ',' << flex_body_observer.observed_flex_yaw_rad() * 180.0 / M_PI
+            << ',' << flex_body_observer.filtered_flex_yaw_rad() * 180.0 / M_PI
+            << ',' << flex_body_observer.output_flex_yaw_rad() * 180.0 / M_PI
+            << ',' << flex_release.applied_rate_rad_s * 180.0 / M_PI << ','
+            << d455_quaternion.x() << ',' << d455_quaternion.y() << ','
+            << d455_quaternion.z() << ',' << d455_quaternion.w() << ','
+            << body_quaternion.x() << ',' << body_quaternion.y() << ','
+            << body_quaternion.z() << ',' << body_quaternion.w() << ','
+            << FlexBodyAttitudeObserver::yaw_from_R_to_G(
+                   nominal_body_R_BtoG) *
+                   180.0 / M_PI
+            << ',' << FlexBodyAttitudeObserver::yaw_from_R_to_G(
+                   shadow_body_R_BtoG) *
+                   180.0 / M_PI
+            << '\n';
+      }
+
       vio_for_align.push_back({t_cam, p_wi});
       while (vio_for_align.size() > 5000)
         vio_for_align.pop_front();
@@ -2458,6 +2752,23 @@ int main(int argc, char **argv) {
   }
 
   out.close();
+  if (flex_body_attitude_out.is_open()) {
+    flex_body_attitude_out.flush();
+    if (!flex_body_attitude_out.good()) {
+      PRINT_ERROR(RED "[FLEX-BODY] output write failed: %s\n" RESET,
+                  args.flex_body_attitude_output_path.c_str());
+      return EXIT_FAILURE;
+    }
+    flex_body_attitude_out.close();
+    PRINT_INFO(GREEN "[FLEX-BODY] output=%s valid_updates=%zu "
+                     "invalid_samples=%zu final_observed=%+.6fdeg "
+                     "final_target=%+.6fdeg final_output=%+.6fdeg\n" RESET,
+               args.flex_body_attitude_output_path.c_str(),
+               flex_valid_update_count, flex_invalid_sample_count,
+               flex_body_observer.observed_flex_yaw_rad() * 180.0 / M_PI,
+               flex_body_observer.filtered_flex_yaw_rad() * 180.0 / M_PI,
+               flex_body_observer.output_flex_yaw_rad() * 180.0 / M_PI);
+  }
   if (!args.camera_stride_audit_path.empty()) {
     std::vector<double> processed_dt;
     for (size_t i = 1; i < processed_image_timestamps.size(); ++i)

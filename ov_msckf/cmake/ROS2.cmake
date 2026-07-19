@@ -110,6 +110,15 @@ ament_target_dependencies(test_sim_repeat ${ament_libraries})
 target_link_libraries(test_sim_repeat ov_msckf_lib ${thirdparty_libraries})
 install(TARGETS test_sim_repeat DESTINATION lib/${PROJECT_NAME})
 
+# Output-only ROS-free yaw-flex observer tests (no estimator state feedback).
+add_executable(test_flex_body_attitude_observer
+  src/test_flex_body_attitude_observer.cpp)
+ament_target_dependencies(test_flex_body_attitude_observer ${ament_libraries})
+target_link_libraries(test_flex_body_attitude_observer ${thirdparty_libraries})
+add_test(NAME test_flex_body_attitude_observer
+  COMMAND test_flex_body_attitude_observer)
+install(TARGETS test_flex_body_attitude_observer DESTINATION lib/${PROJECT_NAME})
+
 add_executable(test_imu_filter src/test_imu_filter.cpp)
 ament_target_dependencies(test_imu_filter ${ament_libraries})
 target_link_libraries(test_imu_filter ov_msckf_lib ${thirdparty_libraries})
