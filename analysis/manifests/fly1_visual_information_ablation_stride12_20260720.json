@@ -1,0 +1,62 @@
+{
+  "out_dir": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/visual_information_ablation_stride12_20260720/fly1_comparison",
+  "primary_condition": "reference_error_guard_thr1p0_dwell10_scale0p95",
+  "runs": [
+    {
+      "flight_name": "fly1", "method_name": "baseline_numpts400_noise1p0",
+      "gps": "D:/vscode_dir/open_vins_flex_baseline_20260719/config/d455_fly1/fc_gps_cam_time.csv",
+      "vio_traj": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/continuous_yaw_flex_rosfree_stride12_20260719_161121/full_smoothed_fly1_fly2/fly1/traj.txt",
+      "vio_bias": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/continuous_yaw_flex_rosfree_stride12_20260719_161121/full_smoothed_fly1_fly2/fly1/traj.txt.bias",
+      "t0": 934.2, "t1": 1644.8
+    },
+    {
+      "flight_name": "fly1", "method_name": "reference_error_guard_thr1p0_dwell10_scale0p95",
+      "gps": "D:/vscode_dir/open_vins_flex_baseline_20260719/config/d455_fly1/fc_gps_cam_time.csv",
+      "vio_traj": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/consistent_gyro_yaw_stride12_20260720/fly1_reference_error_guard_thr1p0_dwell10_scale0p95/traj.txt",
+      "vio_bias": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/consistent_gyro_yaw_stride12_20260720/fly1_reference_error_guard_thr1p0_dwell10_scale0p95/traj.txt.bias",
+      "t0": 934.2, "t1": 1644.8
+    },
+    {
+      "flight_name": "fly1", "method_name": "numpts350",
+      "gps": "D:/vscode_dir/open_vins_flex_baseline_20260719/config/d455_fly1/fc_gps_cam_time.csv",
+      "vio_traj": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/visual_information_ablation_stride12_20260720/fly1_numpts350_v2/traj.txt",
+      "vio_bias": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/visual_information_ablation_stride12_20260720/fly1_numpts350_v2/traj.txt.bias",
+      "t0": 934.2, "t1": 1644.8
+    },
+    {
+      "flight_name": "fly1", "method_name": "numpts300",
+      "gps": "D:/vscode_dir/open_vins_flex_baseline_20260719/config/d455_fly1/fc_gps_cam_time.csv",
+      "vio_traj": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/visual_information_ablation_stride12_20260720/fly1_numpts300_v2/traj.txt",
+      "vio_bias": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/visual_information_ablation_stride12_20260720/fly1_numpts300_v2/traj.txt.bias",
+      "t0": 934.2, "t1": 1644.8
+    },
+    {
+      "flight_name": "fly1", "method_name": "numpts200",
+      "gps": "D:/vscode_dir/open_vins_flex_baseline_20260719/config/d455_fly1/fc_gps_cam_time.csv",
+      "vio_traj": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/visual_information_ablation_stride12_20260720/fly1_numpts200_v2/traj.txt",
+      "vio_bias": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/visual_information_ablation_stride12_20260720/fly1_numpts200_v2/traj.txt.bias",
+      "t0": 934.2, "t1": 1644.8
+    },
+    {
+      "flight_name": "fly1", "method_name": "visual_noise_scale1p10",
+      "gps": "D:/vscode_dir/open_vins_flex_baseline_20260719/config/d455_fly1/fc_gps_cam_time.csv",
+      "vio_traj": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/visual_information_ablation_stride12_20260720/fly1_noise1p1_v2/traj.txt",
+      "vio_bias": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/visual_information_ablation_stride12_20260720/fly1_noise1p1_v2/traj.txt.bias",
+      "t0": 934.2, "t1": 1644.8
+    },
+    {
+      "flight_name": "fly1", "method_name": "visual_noise_scale1p25",
+      "gps": "D:/vscode_dir/open_vins_flex_baseline_20260719/config/d455_fly1/fc_gps_cam_time.csv",
+      "vio_traj": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/visual_information_ablation_stride12_20260720/fly1_noise1p25_v2/traj.txt",
+      "vio_bias": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/visual_information_ablation_stride12_20260720/fly1_noise1p25_v2/traj.txt.bias",
+      "t0": 934.2, "t1": 1644.8
+    },
+    {
+      "flight_name": "fly1", "method_name": "visual_noise_scale1p50",
+      "gps": "D:/vscode_dir/open_vins_flex_baseline_20260719/config/d455_fly1/fc_gps_cam_time.csv",
+      "vio_traj": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/visual_information_ablation_stride12_20260720/fly1_noise1p5_v2/traj.txt",
+      "vio_bias": "C:/Users/baloney/Desktop/实验目录/P4_formal_joint_20260718/visual_information_ablation_stride12_20260720/fly1_noise1p5_v2/traj.txt.bias",
+      "t0": 934.2, "t1": 1644.8
+    }
+  ]
+}

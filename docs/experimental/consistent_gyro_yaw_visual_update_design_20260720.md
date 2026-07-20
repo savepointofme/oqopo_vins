@@ -40,6 +40,31 @@ The historical update audit also falsifies a spike-only explanation. The
 accepted fly1 MSCKF yaw steps sum to 5.247 deg. A 0.05 deg/update clip still
 leaves 4.442 deg, so most of the error is many small same-direction updates.
 
+## Uniform visual-information ablation
+
+Reducing visual information globally was tested as an alternative to the
+directional guard on the complete frozen fly1 window. Each run changed exactly
+one configuration concept; no guard was enabled.
+
+| condition | XY RMSE [m] | final XY [m] | yaw/course RMSE [deg] |
+|---|---:|---:|---:|
+| frozen baseline: 400 points, noise 1.0x | 158.177 | 165.872 | 1.524 |
+| directional guard | **155.243** | **146.935** | **1.465** |
+| 350 points | 180.775 | 220.102 | 1.513 |
+| 300 points | 184.338 | 245.764 | 2.030 |
+| 200 points | 183.732 | 205.171 | 1.645 |
+| visual pixel sigma 1.10x | 163.222 | 175.210 | 1.662 |
+| visual pixel sigma 1.25x | 166.520 | 151.856 | 1.479 |
+| visual pixel sigma 1.50x | 178.777 | 168.794 | 1.619 |
+
+All six uniform reductions fail the fly1 XY gate, so they were not promoted to
+four-flight replay. Fewer points change the spatial/track subset and remove
+necessary translation and relative-rotation information. Uniformly larger
+measurement noise also weakens useful visual constraints; `1.25x` slightly
+improves yaw RMSE but still worsens XY RMSE by `5.27%`. This supports selective
+directional attenuation rather than a global feature-count or confidence
+reduction.
+
 ## Guarded bounded-feedback candidate
 
 Keep the frozen global-yaw OC measurement model and all clone-relative
